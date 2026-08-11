@@ -17,8 +17,8 @@ and `cat` once instead of learning five clients.
                     │
                    VFS  ── cache ── notify / watcher
                     │
-        ┌───────────┼───────────┬───────────┐
-     graph-mail  graph-chat  github/rss   exec ──► any program, any language
+    ┌───────────┬───┴───────┬────────────┬───────────┐
+ graph-mail  graph-chat  ado-boards  github/rss   exec ──► any program, any language
 ```
 
 ## Packages
@@ -27,7 +27,7 @@ and `cat` once instead of learning five clients.
 |---|---|
 | `@mscomms/core` | Paths, naming, the provider contract, the VFS engine, query language, cache, config, notifications, watches |
 | `@mscomms/cli` | The shell, commands, completion, formatting |
-| `@mscomms/provider-*` | memory, rss, github, graph, exec |
+| `@mscomms/provider-*` | memory, rss, github, graph, ado, exec |
 
 No third-party runtime dependencies anywhere. For a program that reads corporate mail,
 every transitive package is another party who can change what it does, and the parsing this

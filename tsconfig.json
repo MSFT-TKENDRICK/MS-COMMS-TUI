@@ -6,6 +6,7 @@
     { "path": "packages/provider-rss" },
     { "path": "packages/provider-github" },
     { "path": "packages/provider-graph" },
+    { "path": "packages/provider-ado" },
     { "path": "packages/provider-exec" },
     { "path": "packages/cli" }
   ]

@@ -15,6 +15,7 @@
     "packages/provider-rss",
     "packages/provider-github",
     "packages/provider-graph",
+    "packages/provider-ado",
     "packages/provider-exec"
   ],
   "scripts": {

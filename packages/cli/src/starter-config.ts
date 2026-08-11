@@ -20,8 +20,8 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     // Delete this once you have a real source configured.
     {
       "path": "/demo",
-      "provider": "memory",
-      "options": { "dataset": "sample" },
+      "type": "memory",
+      "options": { "fixture": "mail" },
     },
 
     // --- Outlook mail via Microsoft Graph -------------------------------------
@@ -30,7 +30,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/mail",
-    //   "provider": "graph-mail",
+    //   "type": "graph-mail",
     //   "options": {
     //     // Optional. Defaults to the Microsoft Graph Command Line Tools client,
     //     // which is a first-party public client available in most tenants.
@@ -48,7 +48,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/teams",
-    //   "provider": "graph-chat",
+    //   "type": "graph-chat",
     //   "options": { "pageSize": 50 },
     // },
 
@@ -57,7 +57,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/github",
-    //   "provider": "github",
+    //   "type": "github",
     //   "options": {
     //     "repos": ["octocat/hello-world"],
     //     // Or, instead of repos, everything assigned to you:
@@ -65,11 +65,34 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   },
     // },
 
+    // --- Azure DevOps boards --------------------------------------------------
+    // Projects, teams, boards and columns become folders; work items become
+    // files, so "what is in Active" is \`ls\` rather than a query. Every project
+    // also gets an "Assigned to me" folder.
+    //
+    // Uses AZURE_DEVOPS_EXT_PAT (or AZURE_DEVOPS_PAT) if one is set, and signs
+    // in interactively if not. A token needs only the "Work items (read)" scope.
+    //
+    // {
+    //   "path": "/ado",
+    //   "type": "ado-boards",
+    //   "options": {
+    //     "organization": "contoso",
+    //     // For Azure DevOps Server, give the full collection URL instead:
+    //     // "orgUrl": "https://tfs.contoso.example/tfs/DefaultCollection",
+    //
+    //     // Listing projects also skips discovery, so a token scoped to one
+    //     // project is enough. Omit to show everything you can see.
+    //     // "projects": ["Contoso"],
+    //     // "boards": ["Stories"],
+    //   },
+    // },
+
     // --- RSS and Atom feeds ---------------------------------------------------
     //
     // {
     //   "path": "/news",
-    //   "provider": "rss",
+    //   "type": "rss",
     //   "options": {
     //     "feeds": [
     //       { "name": "GitHub Blog", "url": "https://github.blog/feed/" },
@@ -80,12 +103,14 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     // --- Anything else, in any language ---------------------------------------
     // The exec provider speaks line-delimited JSON over stdin and stdout, so a
     // source can be a shell script, a Python file, or a compiled binary.
+    // "command" is always an array: a string would have to be split by a shell,
+    // and shell-splitting a path you did not write is how injection bugs happen.
     // See docs/PLUGINS.md for the protocol.
     //
     // {
     //   "path": "/custom",
-    //   "provider": "exec",
-    //   "options": { "command": "python3", "args": ["~/bin/my-feed.py"] },
+    //   "type": "exec",
+    //   "options": { "command": ["python3", "~/bin/my-feed.py"] },
     // },
   ],
 
@@ -105,11 +130,13 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
   // ---------------------------------------------------------------------------
   "watches": [
     // {
+    //   "id": "inbox",
     //   "path": "/mail/Inbox",
     //   "query": "is:unread",
-    //   "intervalSeconds": 120,
-    //   "notify": true,
+    //   "intervalMs": 120000,
     //   "label": "Inbox",
+    //   // Also notify when something already seen changes, not just on arrival.
+    //   "includeUpdates": false,
     // },
   ],
 
