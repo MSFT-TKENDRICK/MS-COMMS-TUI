@@ -164,6 +164,14 @@ async function harness(): Promise<Harness> {
       stdin.write(keys);
       for (let i = 0; i < 4; i += 1) await new Promise((r) => setImmediate(r));
       await new Promise((r) => setTimeout(r, 15));
+      // Path completion has to reach the VFS, and under a loaded test runner that round
+      // trip can take longer than a fixed sleep. Waiting for the terminal to go quiet
+      // instead keeps the fast case fast without making the test a race on CPU time.
+      for (let idle = 0, waited = 0; idle < 2 && waited < 2000; waited += 10) {
+        const before = raw.length + out.length;
+        await new Promise((r) => setTimeout(r, 10));
+        idle = raw.length + out.length === before ? idle + 1 : 0;
+      }
     },
   };
 }

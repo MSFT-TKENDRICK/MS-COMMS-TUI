@@ -15,6 +15,7 @@
 
 import { TtlCache, type CacheStats } from './cache.js';
 import { VfsError, toVfsError } from './errors.js';
+import { GraphSpace, treeGraphSource, type GraphSourceEntry } from './graph.js';
 import { NameAllocator, sanitizeSegment } from './naming.js';
 import {
   evaluateQuery,
@@ -183,6 +184,49 @@ export class Vfs {
     this.#mounts.clear();
     this.#dirCache.clear();
     this.#docCache.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // Graph view
+  // -------------------------------------------------------------------------
+
+  /**
+   * Every mount, as one graph.
+   *
+   * Built fresh on each call rather than cached, so a mount added mid-session is
+   * projectable without a restart, and a mount that has gone away stops appearing.
+   *
+   * A provider that declares `graph` supplies its own typed nodes and edges. Everything
+   * else is wrapped in {@link treeGraphSource}, which exposes exactly the graph its tree
+   * already implies. That fallback is what makes "write a projection over all your
+   * sources" true of sources whose authors never heard of projections — including
+   * `exec` plugins written in Python.
+   */
+  graphSpace(): GraphSpace {
+    const entries: GraphSourceEntry[] = [];
+    for (const mount of this.mounts) {
+      const declared =
+        mount.provider.capabilities.has('graph') && mount.provider.graph !== undefined
+          ? mount.provider.graph
+          : undefined;
+      entries.push({
+        alias: mount.id,
+        mountId: mount.id,
+        mountPath: mount.path,
+        source:
+          declared ??
+          treeGraphSource(
+            this,
+            {
+              id: mount.id,
+              path: mount.path,
+              ...(mount.description === undefined ? {} : { description: mount.description }),
+            },
+            { supportsSearch: mount.provider.capabilities.has('search') },
+          ),
+      });
+    }
+    return new GraphSpace(entries);
   }
 
   // -------------------------------------------------------------------------

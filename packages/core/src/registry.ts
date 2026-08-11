@@ -17,6 +17,7 @@
  */
 
 import { VfsError } from './errors.js';
+import type { GraphSpace } from './graph.js';
 import type { Logger, Provider, ProviderContext, ProviderPlugin, StateStore } from './provider.js';
 import { NULL_LOGGER } from './logging.js';
 import type { AppConfig, MountConfig } from './config.js';
@@ -178,6 +179,21 @@ export interface MountBuilderOptions {
   readonly stateFor: (mountId: string) => StateStore;
   readonly cacheDirFor: (mountId: string) => string;
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * The live graph space, for providers that compose the others.
+   *
+   * Passed as a function because mounts are built in order: a projection mounted second
+   * would otherwise capture a mount table that does not yet contain the third mount, and
+   * would then be silently missing a source. Resolving on use removes the ordering
+   * requirement from the user's config entirely.
+   */
+  readonly graphSpace?: () => GraphSpace | Promise<GraphSpace>;
+  /**
+   * Directory the config was loaded from. Mount options that name a file (a projection's
+   * `queryFile`, for instance) resolve against it, so a config and its companion files
+   * can be moved or checked in together.
+   */
+  readonly configDir?: string;
 }
 
 export interface BuiltMount {
@@ -215,6 +231,8 @@ export async function buildMounts(
         state: options.stateFor(mountId),
         cacheDir: options.cacheDirFor(mountId),
         secret: (ref) => resolveSecret(ref, options.env ?? process.env),
+        ...(options.configDir === undefined ? {} : { configDir: options.configDir }),
+        ...(options.graphSpace === undefined ? {} : { graph: options.graphSpace }),
       };
 
       const provider: Provider = await plugin.create(validated, context);

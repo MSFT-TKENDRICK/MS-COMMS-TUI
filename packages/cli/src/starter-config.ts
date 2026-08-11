@@ -20,8 +20,8 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     // Delete this once you have a real source configured.
     {
       "path": "/demo",
-      "provider": "memory",
-      "options": { "dataset": "sample" },
+      "type": "memory",
+      "options": { "fixture": "mail" },
     },
 
     // --- Outlook mail via Microsoft Graph -------------------------------------
@@ -30,7 +30,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/mail",
-    //   "provider": "graph-mail",
+    //   "type": "graph-mail",
     //   "options": {
     //     // Optional. Defaults to the Microsoft Graph Command Line Tools client,
     //     // which is a first-party public client available in most tenants.
@@ -48,7 +48,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/teams",
-    //   "provider": "graph-chat",
+    //   "type": "graph-chat",
     //   "options": { "pageSize": 50 },
     // },
 
@@ -57,7 +57,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/github",
-    //   "provider": "github",
+    //   "type": "github",
     //   "options": {
     //     "repos": ["octocat/hello-world"],
     //     // Or, instead of repos, everything assigned to you:
@@ -69,7 +69,7 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/news",
-    //   "provider": "rss",
+    //   "type": "rss",
     //   "options": {
     //     "feeds": [
     //       { "name": "GitHub Blog", "url": "https://github.blog/feed/" },
@@ -84,8 +84,26 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // {
     //   "path": "/custom",
-    //   "provider": "exec",
-    //   "options": { "command": "python3", "args": ["~/bin/my-feed.py"] },
+    //   "type": "exec",
+    //   "options": { "command": ["python3", "~/bin/my-feed.py"] },
+    // },
+
+    // --- A tree of your own shape ---------------------------------------------
+    // A projection is not a source. It reorganizes the mounts above into a
+    // different tree, described as a GraphQL query over all of them at once, and
+    // mounts the result as ordinary folders you can ls, cat, find and complete.
+    //
+    // Try the query at the prompt first: \`schema\` shows what you can select and
+    // \`graphql '{ all { name source } }'\` runs one. See docs/PROJECTIONS.md.
+    //
+    // {
+    //   "path": "/by-person",
+    //   "type": "projection",
+    //   "options": {
+    //     "query": "{ all @flatten @group(by: \\"author\\") { name mtime } }",
+    //     // Or, once it outgrows a single line, keep it next to this file:
+    //     // "queryFile": "./by-person.graphql",
+    //   },
     // },
   ],
 
