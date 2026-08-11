@@ -1,6 +1,9 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Scratch directories the test suite writes into. Regenerated on every run.
+.test-tmp/
 .env
 .env.*
 !.env.example
