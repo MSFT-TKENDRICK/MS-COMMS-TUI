@@ -318,7 +318,7 @@ export class Watcher {
     if (changes.length > 1) {
       await this.#notifier.notify({
         title: `${label}: ${String(changes.length)} updates`,
-        body: summarize(primary.node) + (changes.length > 1 ? ` and ${String(changes.length - 1)} more` : ''),
+        body: summarize(primary) + (changes.length > 1 ? ` and ${String(changes.length - 1)} more` : ''),
         key: `watch:${spec.id}`,
         path: vpath.join(spec.path, primary.node?.name ?? ''),
         source: label,
@@ -328,7 +328,7 @@ export class Watcher {
 
     await this.#notifier.notify({
       title: label,
-      body: summarize(primary.node),
+      body: summarize(primary),
       key: `watch:${spec.id}:${primary.node?.id ?? primary.path}`,
       path: primary.node?.path ?? vpath.join(spec.path, primary.node?.name ?? ''),
       source: label,
@@ -346,8 +346,33 @@ export class Watcher {
   }
 }
 
-function summarize(node: VNode | undefined): string {
-  if (node === undefined) return 'Something changed.';
-  const author = node.author === undefined ? '' : `${node.author}: `;
-  return `${author}${node.title}`.slice(0, 200);
+/**
+ * What the notification says.
+ *
+ * This used to take only the node, and fall back to "Something changed." whenever there
+ * wasn't one. That fallback fired constantly in practice, because `node` is optional on
+ * ChangeEvent while `type` and `path` are required — so a provider that implements `poll`
+ * exactly as documented, returning `{type, path, at}`, produced a notification that said
+ * nothing at all. Every external plugin hit this.
+ *
+ * "Something changed" is the notification equivalent of an unlabelled button. Since the
+ * change always carries a type and a path, say those instead: the name is what the user
+ * recognises, and the verb is what tells them whether to care.
+ */
+function summarize(change: ChangeEvent | undefined): string {
+  if (change === undefined) return 'Something changed.';
+
+  const node = change.node;
+  if (node !== undefined) {
+    const author = node.author === undefined ? '' : `${node.author}: `;
+    return `${author}${node.title}`.slice(0, 200);
+  }
+
+  // `path` is provider-relative, and the last segment is the part a person recognises.
+  const name = change.path.split('/').filter((part) => part !== '').pop() ?? change.path;
+  if (name === '') return 'Something changed.';
+
+  const verb =
+    change.type === 'created' ? 'New' : change.type === 'deleted' ? 'Removed' : 'Updated';
+  return `${verb}: ${name}`.slice(0, 200);
 }

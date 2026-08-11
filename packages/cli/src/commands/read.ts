@@ -13,6 +13,7 @@ import {
   flagNumber,
   flagString,
   modeFrom,
+  quoteCorrection,
   type Command,
 } from './types.js';
 
@@ -30,6 +31,8 @@ export const catCommand: Command = {
     'tags, because a screen reader reads those tags aloud one by one.',
   ].join('\n'),
   args: ['node'],
+  maxPositional: 1,
+  correction: quoteCorrection('cat'),
   flags: [
     { name: 'raw', description: 'Do not wrap the body to the terminal width.' },
     { name: 'headers', description: 'Print only the headers, not the body.', aliases: ['h'] },
@@ -76,6 +79,8 @@ export const statCommand: Command = {
     'are different.',
   ].join('\n'),
   args: ['node'],
+  maxPositional: 1,
+  correction: quoteCorrection('stat'),
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const token = args.positional[0];
@@ -126,6 +131,8 @@ export const actionsCommand: Command = {
     'Actions come from the source itself, so mail offers different verbs from GitHub\n' +
     'issues. Run one with `do <action> <item>`.',
   args: ['node'],
+  maxPositional: 1,
+  correction: quoteCorrection('actions'),
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const token = args.positional[0];
@@ -158,6 +165,8 @@ export const doCommand: Command = {
   group: 'read',
   summary: 'Run an action on an item, for example marking it read.',
   usage: 'do <action> [path|number] [--param value ...]',
+  maxPositional: 2,
+  correction: quoteCorrection('do', { before: 1 }),
   detail:
     'Destructive actions ask for confirmation unless you pass `--yes`. In a non-interactive\n' +
     'shell they refuse outright rather than guessing, because a script that silently\n' +
@@ -213,6 +222,8 @@ export const attachmentsCommand: Command = {
   summary: 'List the attachments on an item.',
   usage: 'attachments [path|number]',
   args: ['node'],
+  maxPositional: 1,
+  correction: quoteCorrection('attachments'),
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const token = args.positional[0];
@@ -247,6 +258,8 @@ export const saveCommand: Command = {
   group: 'read',
   summary: 'Write an attachment, or an item\'s text, to a file on disk.',
   usage: 'save <path|number> [attachment-number] [--to file]',
+  maxPositional: 2,
+  correction: quoteCorrection('save', { trailingNumber: true }),
   detail:
     'With no attachment number, saves the item\'s text. Attachment filenames from the\n' +
     'network are never trusted: any directory component is stripped, so a message cannot\n' +
@@ -334,6 +347,8 @@ export const urlCommand: Command = {
     'Prints the link instead of launching a browser. Launching one steals focus, which is\n' +
     'disorienting with a screen reader, and it does not work over SSH at all.',
   args: ['node'],
+  maxPositional: 1,
+  correction: quoteCorrection('url'),
   async run(session, args) {
     const token = args.positional[0];
     if (token === undefined) throw new Error('Which item? Try `url 1`.');
@@ -362,6 +377,7 @@ export const parentCommand: Command = {
   group: 'navigate',
   summary: 'Go up one folder.',
   usage: 'up',
+  maxPositional: 0,
   async run(session) {
     const parent = vpath.dirname(session.cwd);
     session.setCwd(parent);

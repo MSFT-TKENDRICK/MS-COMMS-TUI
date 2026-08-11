@@ -10,7 +10,7 @@
  */
 
 import type { Session } from '../session.js';
-import type { OutputMode } from '../format.js';
+import { sanitizeForDisplay, type OutputMode } from '../format.js';
 
 export interface CommandArgs {
   /** Positional arguments, in order, with flags removed. */
@@ -50,6 +50,25 @@ export interface Command {
   readonly usage: string;
   /** What each positional argument completes as. The last entry repeats. */
   readonly args?: readonly ArgKind[];
+  /**
+   * How many positional arguments the command can actually use.
+   *
+   * Opt-in, because plenty of commands are legitimately variadic (`cat 1 2 3`) and a
+   * blanket rule would break them. Declare it on any command that reads a fixed number
+   * of positionals and would otherwise discard the rest in silence.
+   *
+   * Silently dropping an argument is the most dangerous failure this program can have.
+   * `find /blog deploy` used to ignore `deploy`, search for nothing in particular, and
+   * print "(empty)" — which the user reads as "there are no matching messages". A wrong
+   * answer indistinguishable from a right one is far worse than an error, and worse
+   * again for someone who cannot glance back at what they typed.
+   */
+  readonly maxPositional?: number;
+  /**
+   * Turn a line that had too many positionals into the line the user probably meant.
+   * Returned verbatim in the error, so it must be a runnable command.
+   */
+  correction?(positional: readonly string[]): string | undefined;
   readonly flags?: readonly CommandFlag[];
   readonly examples?: readonly string[];
   readonly group: 'navigate' | 'read' | 'search' | 'watch' | 'system';
@@ -86,6 +105,92 @@ export class CommandTable {
   byGroup(group: Command['group']): readonly Command[] {
     return this.all.filter((command) => command.group === group);
   }
+}
+
+/**
+ * The correction to offer a command whose argument was typed unquoted.
+ *
+ * Extra positionals almost always mean one thing here: the user typed a name containing
+ * spaces without quoting it. This program is *about* messages, and message subjects are
+ * mostly spaces — `cat FY26 budget review.txt` is the natural thing to type and the
+ * commonest mistake anyone will make with it.
+ *
+ * Answering that with "no such file: FY26" is technically true and useless. Answering it
+ * with the exact quoted line that would have worked turns a dead end into the moment the
+ * user learns the quoting rule, without having to go and read anything.
+ *
+ * `before` is how many leading positionals are *not* part of the spaced name, so `do`
+ * (`do <action> <node>`) passes 1 and gets `do read "FY26 budget"` rather than the
+ * nonsense `do "read FY26 budget"`. `trailingNumber` says a bare integer at the end is a
+ * real argument rather than part of the name, which is what `save <node> [attachment]`
+ * needs — but only when it really is an integer, so `save FY26 budget report.pdf` still
+ * quotes the whole thing.
+ *
+ * It declines whenever the evidence contradicts the theory. `cd /blog /archive` is two
+ * separate paths, not one name with a space in it, and suggesting `cd "/blog /archive"`
+ * would send the user to a second failure wearing the costume of an answer. Likewise
+ * `save 1 2 3` is someone using item numbers, not a subject that lost its quotes. A wrong
+ * suggestion is worse than none, so those fall through to the usage line instead.
+ */
+export function quoteCorrection(
+  name: string,
+  options: { readonly before?: number; readonly trailingNumber?: boolean } = {},
+): (positional: readonly string[]) => string | undefined {
+  const before = options.before ?? 0;
+  return (positional) => {
+    const head = positional.slice(0, before);
+    let rest = positional.slice(before);
+
+    const tail: string[] = [];
+    const last = rest[rest.length - 1];
+    if (options.trailingNumber === true && rest.length > 1 && last !== undefined && /^\d+$/.test(last)) {
+      tail.push(last);
+      rest = rest.slice(0, -1);
+    }
+
+    if (rest.length < 2) return undefined;
+
+    // A run of bare numbers is never a name that lost its quotes — `save 1 2 3` is
+    // someone using item numbers, and suggesting `save "1 2" 3` is gibberish. Same for
+    // arguments that begin with `/` or `-`: those are separate paths and flags, not words
+    // in a subject. In all of these the honest answer is the usage line.
+    const allNumbers = rest.every((v) => /^\d+$/.test(v));
+    const separateThings = rest.slice(1).some((v) => v.startsWith('/') || v.startsWith('-'));
+    if (allNumbers || separateThings) return undefined;
+
+    return [name, ...head, `"${rest.join(' ')}"`, ...tail].join(' ');
+  };
+}
+
+/**
+ * The message to print when a line carries more positionals than the command can use, or
+ * undefined when the line is fine.
+ *
+ * This lives here rather than in the dispatcher because a command line reaches `run` by
+ * two independent routes — the shell's dispatcher and the one-shot `mscomms cd /a /b`
+ * path — and a guard installed on only one of them is worse than no guard at all: it
+ * teaches the user a rule that then fails to hold. The check belongs to the command, so
+ * it is defined next to the field it enforces and both routes call it.
+ *
+ * It names the correction rather than only the rule. "cat takes at most 1 argument" is
+ * true and unhelpful; `cat "FY26 budget review.txt"` can be acted on without going to
+ * read the help, which matters most for the user who has to listen to it.
+ */
+export function surplusMessage(
+  command: Command,
+  positional: readonly string[],
+): string | undefined {
+  const max = command.maxPositional;
+  if (max === undefined || positional.length <= max) return undefined;
+
+  const extra = positional.slice(max).map((value) => sanitizeForDisplay(value));
+  const listed = extra.map((value) => `"${value}"`).join(', ');
+  const noun = extra.length === 1 ? 'argument' : 'arguments';
+
+  const base = `\`${command.name}\` does not take the extra ${noun} ${listed}.`;
+  const fix = command.correction?.(positional);
+  if (fix !== undefined) return `${base} Did you mean: ${fix}`;
+  return `${base}\nUsage: ${command.usage}`;
 }
 
 // ---------------------------------------------------------------------------

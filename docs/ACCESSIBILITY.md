@@ -254,6 +254,60 @@ The prompt should answer:
 
 Debug traces belong in logs, not in the interactive speech path.
 
+## Refusing rather than half-doing
+
+A command that quietly uses part of what was typed is the worst failure mode this
+program has, because through speech it is indistinguishable from success.
+`cd /mail/Inbox /archive` used to print `/mail/Inbox` and exit zero, having thrown
+away half the line. Nothing announced that anything had been discarded.
+
+Commands therefore declare `maxPositional`, and `surplusMessage` in
+`packages/cli/src/commands/types.ts` refuses the line instead of running it.
+The guard is called from both the shell dispatcher and the one-shot `argv` path,
+because a rule that holds in only one of them teaches the user something false.
+
+The refusal names the fix, not only the rule. Message subjects are mostly spaces, so
+the commonest mistake anyone will make with this program is `cat FY26 budget review`,
+and the useful answer is `cat "FY26 budget review"` — the exact line that would have
+worked. That turns a dead end into the moment the quoting rule is learned, without
+having to go and read anything.
+
+It declines to guess when the evidence contradicts the guess. Two absolute paths are
+two things, not one name with a space in it, so `cd /a /b` gets the usage line rather
+than a suggested `cd "/a /b"` that would fail a second time. A wrong suggestion is
+worse than none: it costs another round trip and it teaches the wrong lesson.
+
+## Never answering "nothing found" when the question was misread
+
+`find /blog deploy` used to join both words into the query, search for titles
+containing `/blog`, and report `(empty)`. A false negative is the most damaging
+answer available here, because the user concludes the message does not exist and
+stops looking.
+
+`find` and `grep` now split path from query on evidence rather than on shape: a word
+is only treated as a folder when it actually resolves to one. `find` tests the
+leading word, `grep` the trailing one, matching where each declares its path.
+
+The inference is always spoken:
+
+```
+> find /blog deploy
+Searching /blog for "deploy". Use `-q` to search from here instead.
+```
+
+An inference the user cannot hear is one they cannot correct.
+
+## Flags mean the same thing everywhere
+
+`is:reply` must not mean "is a reply to something" in one mount and "has comments"
+in another. The GitHub provider originally reused the well-known `reply` flag for
+issues with comments, which both broke cross-mount queries and implied a reply
+action it does not offer. It emits `discussed` instead. Providers may invent flags
+freely; they may not redefine the shared ones.
+
+Empty metadata fields are omitted rather than rendered blank, because a row that
+reads aloud as "assignees, nothing" is pure noise to listen to.
+
 ## Security as accessibility
 
 Remote-controlled text is hostile input.
@@ -320,21 +374,106 @@ Do not use these as primary shortcuts:
 | `Ctrl+W` | Common terminal or shell close/delete behavior |
 | `Ctrl+D` | EOF / closes stdin |
 
+A note on `Ctrl+C`, since the pane does bind it and that looks like a violation: the rule is
+*don't repurpose* a reserved key, not *don't respond* to one. Binding `Ctrl+C` to "save this
+draft" would be a violation. Binding it to "stop and get me out of here" is the meaning the
+user already expects, so honouring it is compliance. The distinction that matters is whether
+a user's existing muscle memory produces the outcome they predicted.
+
 Arrow keys may be used for optional TUI navigation, but there must be an
 alternative that does not require screen-reader browse-mode gymnastics.
 
-## Full-screen TUI policy
+### Keys in the full-screen pane
 
-The TUI is allowed only as an opt-in visual enhancement.
+Every one of these has a typed equivalent in the line shell; none is the only route to a
+capability.
+
+| Key | Does | Typed equivalent |
+|---|---|---|
+| `Up` / `Down`, or `k` / `j` | Move the selection | `ls`, then a number |
+| `Left`, `h`, or `Backspace` | Go to the parent folder | `cd ..` |
+| `Right`, `l`, or `Enter` | Open the selection | `cd <name>` or `cat <n>` |
+| `Home` / `End` | First / last item | — |
+| `PageUp` / `PageDown` | Move by a screen | — |
+| `Tab` | Switch between list and preview | — |
+| `/` | Start filtering | `find -q ...` |
+| `Enter` while filtering | Keep the filter, return to browsing | — |
+| `Escape` while filtering | Clear the filter | — |
+| `Escape` while browsing | Quit | `quit` |
+| `r` | Refresh, bypassing the cache | `refresh` |
+| `:` | Run any command | the shell itself |
+| `?` | Help | `help` |
+| `q` | Quit | `quit` |
+| `Ctrl+C` | Quit — **from any mode, including mid-filter** | — |
+
+Letters are never text unless you have explicitly entered a text mode with `/` or `:`.
+An earlier draft let any unbound letter start a filter, on the theory that typing a name
+should just work. It was removed: because `q`, `r` and `hjkl` are bindings, the real rule
+was "any letter except six", and a user filtering for *quarterly* would press `q` and watch
+the program exit. One sentence with no exceptions beats a convenience with six. `/` is
+named in the footer of every frame, so it is advertised rather than assumed.
+
+Arrow keys and vim-style `hjkl` are both accepted, so neither a hand on the arrow cluster nor
+a hand on the home row is the wrong hand. Quitting is always safe: nothing in this program
+holds an unsaved draft, and exiting prints where you were.
+
+## Full-screen pane policy — and how the shipped pane complies
+
+The pane (`--tui`) is allowed only as an opt-in visual enhancement.
 It must not be the only way to perform a command.
 Every command must remain available through the line shell.
 
-The TUI must avoid reserved keys.
+It must avoid reserved keys.
 It must provide `?` help.
 It must avoid claiming that colour, selection bars, or panels are accessible just
 because they are visible.
 If it uses an alternate screen, documentation must say that scrollback review is
 not available in that mode.
+
+What was built against that policy, and why each choice was made:
+
+**It is opt-in, and it refuses rather than degrades.** `--tui` with `--announce` or
+`--plain` exits 2 and explains the contradiction, instead of silently picking a winner.
+A user who has put `announce = true` in their config has stated a need; quietly overriding
+it would be worse than declining. It also refuses when stdout is not a terminal, because a
+repainting UI in a pipe produces garbage.
+
+**It adds no capability.** `:` opens a command line that runs the *same* dispatcher as the
+line shell — this is not a claim in a doc, it is a shared `Dispatcher` class that both call.
+That means the help screen's promise ("adds no capability of its own") cannot rot: if a
+command exists in the shell, it exists here.
+
+**Ctrl+C works from every mode.** This was a real bug found in testing. The check originally
+lived in the browse-mode branch, so while typing a filter — where `q` is correctly a literal
+letter — there was no mode-independent way out. "Press Escape" is not an answer for someone
+who doesn't know that. Ctrl+C is the one key every terminal user already knows, so it is now
+checked before mode dispatch, and it is the only Ctrl binding in the program.
+
+**It narrates position first.** The status line leads with "3 of 17" before the item's name,
+because ordinal position is precisely the information a sighted user gets for free from a
+scrollbar and a screen-reader user does not get at all.
+
+**Selection is a glyph, not a colour.** The selected row is marked `> ` and unread is `*`.
+Colour only tracks which pane has focus, and never carries information by itself. The marker
+stays put when focus moves to the preview, so "where was I" survives a pane switch.
+
+**It leaves a trace.** On exit it restores the terminal, then prints the working directory to
+stdout and the selection to stderr. An alternate-screen session normally vanishes without a
+record; this way the session ends with something you can read, and the directory you ended in
+is a value you can pipe.
+
+**It refuses to split below 60 columns.** Two 28-column panes are two unusable panes. Below
+the threshold it shows one list, full width.
+
+**Held keys are dropped, not queued.** While an effect is in flight, further keys are
+discarded. Queuing makes a held-down arrow key fire a burst of navigation that resolves after
+the user has stopped moving, which is disorienting for anyone and actively misleading when a
+screen reader is announcing each landing.
+
+One thing the pane cannot fix: a lone Escape byte followed quickly by a letter is
+indistinguishable from Alt+letter at the terminal protocol level. That ambiguity is in the
+protocol, not in this program, and it is the reason Escape is never the *only* way out of
+anything.
 
 ## Testing checklist
 

@@ -27,11 +27,12 @@
 import { createInterface, type Interface } from 'node:readline';
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { isVfsError, vpath } from '@mscomms/core';
+import { vpath } from '@mscomms/core';
 import { Completer } from './completion.js';
+import { Dispatcher } from './dispatch.js';
 import { relativeTime, sanitizeForDisplay } from './format.js';
 import type { Session } from './session.js';
-import { parseLine, type CommandTable } from './commands/types.js';
+import type { CommandTable } from './commands/types.js';
 
 export interface ShellOptions {
   readonly session: Session;
@@ -46,12 +47,14 @@ export class Shell {
   readonly #session: Session;
   readonly #table: CommandTable;
   readonly #completer: Completer;
+  readonly #dispatcher: Dispatcher;
   readonly #historyFile: string;
   #rl: Interface | undefined;
 
   constructor(private readonly options: ShellOptions) {
     this.#session = options.session;
     this.#table = options.table;
+    this.#dispatcher = new Dispatcher(options.table);
     this.#completer = new Completer({
       session: options.session,
       table: options.table,
@@ -76,10 +79,19 @@ export class Shell {
     // the interactive path is deliberately left exactly as it was.
     const promptStream = process.stdout.isTTY === true ? process.stdout : process.stderr;
 
+    // Terminal-ness must be read off the stream readline is actually given, not off
+    // `process.stdin` regardless. They are the same thing in production, but when an
+    // input is injected the two can disagree — and `terminal` is what decides whether
+    // Tab reaches the completer at all. Deriving it from the wrong stream meant the
+    // completion path could not be exercised end to end, which is exactly the kind of
+    // gap that lets a headline feature ship untested.
+    const input = this.options.input ?? process.stdin;
+    const isTty = (input as { isTTY?: boolean }).isTTY === true;
+
     const rl = createInterface({
-      input: this.options.input ?? process.stdin,
+      input,
       output: this.options.output ?? promptStream,
-      terminal: process.stdin.isTTY === true,
+      terminal: isTty,
       historySize: 500,
       history,
       // readline calls this on Tab. It must be synchronous and fast; see completion.ts.
@@ -148,75 +160,7 @@ export class Shell {
    * prompt is noise at best; through speech it is thirty seconds of unreadable file paths.
    */
   async #execute(line: string): Promise<void> {
-    const session = this.#session;
-
-    // `!` escapes to a raw path, for the rare case where a path collides with a command.
-    const source = line.startsWith('!') ? `cd ${line.slice(1)}` : line;
-
-    const head = source.split(/\s+/)[0] ?? '';
-    const command = this.#table.get(head);
-
-    if (command === undefined) {
-      // A bare path or number is a `cd` if it is a folder, otherwise a `cat`. This makes
-      // the common case — "show me that" — a single token.
-      await this.#implicit(source);
-      return;
-    }
-
-    const { args } = parseLine(source, command);
-    try {
-      await command.run(session, args);
-    } catch (error) {
-      this.#reportError(error);
-    }
-  }
-
-  async #implicit(source: string): Promise<void> {
-    const session = this.#session;
-    const token = source.trim();
-    try {
-      const path = session.resolveToken(token);
-      const node = await session.vfs.stat(path);
-      const command = this.#table.get(node.kind === 'dir' ? 'cd' : 'cat');
-      await command?.run(session, { positional: [token], flags: {}, raw: source });
-    } catch (error) {
-      // Distinguish "you typed a bad command" from "that path does not exist" — they need
-      // completely different advice.
-      if (isVfsError(error) && error.code === 'ENOENT' && !token.includes('/')) {
-        const suggestion = this.#suggestCommand(token);
-        session.writeError(
-          `I do not know the command "${sanitizeForDisplay(token)}".${suggestion === undefined ? '' : ` Did you mean \`${suggestion}\`?`} Type \`help\` for the list.\n`,
-        );
-        return;
-      }
-      this.#reportError(error);
-    }
-  }
-
-  #suggestCommand(input: string): string | undefined {
-    let best: string | undefined;
-    let bestScore = Infinity;
-    for (const name of this.#table.names) {
-      const score = editDistance(input.toLowerCase(), name);
-      if (score < bestScore) {
-        bestScore = score;
-        best = name;
-      }
-    }
-    return bestScore <= Math.max(2, Math.floor(input.length / 3)) ? best : undefined;
-  }
-
-  #reportError(error: unknown): void {
-    const session = this.#session;
-    if (isVfsError(error)) {
-      session.writeError(`${error.message}\n`);
-      if (error.hint !== undefined) session.writeError(`${error.hint}\n`);
-      if (error.retryAfter !== undefined) {
-        session.writeError(`Try again in about ${String(error.retryAfter)} seconds.\n`);
-      }
-      return;
-    }
-    session.writeError(`${error instanceof Error ? error.message : String(error)}\n`);
+    await this.#dispatcher.execute(this.#session, line);
   }
 
   /**

@@ -27,7 +27,8 @@ import { graphMailPlugin, graphChatPlugin } from '@mscomms/provider-graph';
 import { execPlugin } from '@mscomms/provider-exec';
 import { Session } from './session.js';
 import { Shell } from './shell.js';
-import { CommandTable, parseLine, tokenize } from './commands/types.js';
+import { Tui } from './tui/app.js';
+import { CommandTable, parseLine, surplusMessage, tokenize } from './commands/types.js';
 import { navigationCommands } from './commands/navigate.js';
 import { readCommands } from './commands/read.js';
 import { searchCommands } from './commands/search.js';
@@ -63,7 +64,7 @@ export function builtinRegistry(logger: Logger = NULL_LOGGER): PluginRegistry {
   return registry;
 }
 
-interface GlobalFlags {
+export interface GlobalFlags {
   readonly help: boolean;
   readonly version: boolean;
   readonly shell: boolean;
@@ -72,19 +73,23 @@ interface GlobalFlags {
   readonly mode: OutputMode | undefined;
   readonly verbose: boolean;
   readonly noConfig: boolean;
+  readonly tui: boolean;
   readonly rest: readonly string[];
 }
 
-function parseGlobals(argv: readonly string[]): GlobalFlags {
+/** Exported for tests: flag *position* is a contract, and it was silently broken once. */
+export function parseGlobals(argv: readonly string[]): GlobalFlags {
   let help = false;
   let version = false;
   let shell = false;
   let init = false;
   let verbose = false;
   let noConfig = false;
+  let tui = false;
   let configPath: string | undefined;
   let mode: OutputMode | undefined;
   const rest: string[] = [];
+  const modeFlags: string[] = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] as string;
@@ -100,6 +105,9 @@ function parseGlobals(argv: readonly string[]): GlobalFlags {
       case '--shell':
       case '-i':
         shell = true;
+        break;
+      case '--tui':
+        tui = true;
         break;
       case 'init':
         // Only a subcommand when it is the very first word.
@@ -119,26 +127,37 @@ function parseGlobals(argv: readonly string[]): GlobalFlags {
         break;
       case '--json':
         mode = 'json';
-        rest.push(arg);
+        modeFlags.push(arg);
         break;
       case '--tsv':
         mode = 'tsv';
-        rest.push(arg);
+        modeFlags.push(arg);
         break;
       case '--announce':
         mode = 'announce';
-        rest.push(arg);
+        modeFlags.push(arg);
         break;
       case '--plain':
         mode = 'plain';
-        rest.push(arg);
+        modeFlags.push(arg);
         break;
       default:
         rest.push(arg);
     }
   }
 
-  return { help, version, shell, init, configPath, mode, verbose, noConfig, rest };
+  // Mode flags are both global (they set the session's output mode) and local (the command's
+  // own parser expects to see them). They used to be pushed in place, which meant
+  // `mscomms --json ls /mail` put `--json` in the command-name slot and reported "there is no
+  // command called --json" — while the same flag written after the command worked fine. A
+  // flag's meaning must not depend on where in the line it appears, so they are appended
+  // after the command instead. They are all boolean, so position carries no other meaning.
+  //
+  // When there is no command at all, `mode` alone carries the intent to the shell, and
+  // appending would invent a command out of a flag.
+  if (rest.length > 0) rest.push(...modeFlags);
+
+  return { help, version, shell, init, configPath, mode, verbose, noConfig, tui, rest };
 }
 
 const VERSION = '0.1.0';
@@ -155,6 +174,8 @@ Global options:
   -c, --config <file>   use a specific config file
       --no-config       ignore config files entirely
   -i, --shell           force the interactive shell
+      --tui             full-screen two-pane view (opt-in; the line shell is the default
+                        because it works with screen readers, and does everything this does)
       --json            machine-readable output
       --tsv             tab-separated output
       --announce        one spoken sentence per item
@@ -235,6 +256,13 @@ export async function main(options: CliOptions): Promise<number> {
   try {
     await session.start();
 
+    // The full-screen view is opt-in and never inferred. `--tui` with a command still runs
+    // the command: someone scripting `mscomms ls --tui` wants the listing, not a pane.
+    if (globals.tui && globals.rest.length === 0) {
+      const tui = new Tui({ session, table });
+      return await tui.run();
+    }
+
     // No arguments, or an explicit --shell: interactive.
     if (globals.rest.length === 0 || globals.shell) {
       const shell = new Shell({ session, table });
@@ -270,6 +298,14 @@ async function runOneShot(
   // Re-quote so the shared parser sees exactly what the shell would have seen.
   const line = globals.rest.map(quoteArg).join(' ');
   const { args } = parseLine(line, command);
+
+  // The same arity guard the shell applies. `mscomms cd /a /b` must not quietly mean
+  // `mscomms cd /a` just because it came in through argv instead of a prompt.
+  const surplus = surplusMessage(command, args.positional);
+  if (surplus !== undefined) {
+    writeError(`${surplus}\n`);
+    return 2;
+  }
 
   try {
     await command.run(session, args);

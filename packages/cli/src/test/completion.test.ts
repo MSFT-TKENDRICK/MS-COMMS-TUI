@@ -147,7 +147,9 @@ const REVIEW = '2026-08-11 FY26 budget review.txt';
 const ROLLUP = '2026-08-11 FY26 budget rollup.txt';
 const DEPLOY = '2026-08-11 Deployment window moved.txt';
 
-async function harness(options: { readonly maxDisplayed?: number } = {}): Promise<Harness> {
+async function harness(
+  options: { readonly maxDisplayed?: number; readonly warm?: boolean } = {},
+): Promise<Harness> {
   const registry = new PluginRegistry(NULL_LOGGER);
   registry.register(memoryPlugin);
 
@@ -178,10 +180,12 @@ async function harness(options: { readonly maxDisplayed?: number } = {}): Promis
   await session.start();
 
   // Warm the cache. Completion is deliberately cache-only — it must never make a network
-  // call on a keystroke — so a completer talking to a cold cache correctly offers nothing.
-  // Every real session has run `ls` before the user reaches for Tab.
-  await session.vfs.list('/mail', { limit: 25 });
-  await session.vfs.list('/mail/Inbox', { limit: 25 });
+  // call on a keystroke — so a completer talking to a cold cache has nothing to offer and
+  // must say why. Every real session has run `ls` before the user reaches for Tab.
+  if (options.warm !== false) {
+    await session.vfs.list('/mail', { limit: 25 });
+    await session.vfs.list('/mail/Inbox', { limit: 25 });
+  }
 
   let buffer = '';
   const completer = new Completer({
@@ -276,17 +280,71 @@ describe('command completion', () => {
     assert.ok((cat[1] as string).length > 10);
   });
 
-  it('offers nothing for an unknown command, rather than guessing', async () => {
+  it('offers nothing for an unknown command, rather than guessing — but says so', async () => {
     const h = await harness();
     const [completions] = h.complete('zzzz');
-    assert.deepEqual(completions, []);
-    assert.equal(h.printed(), '');
+    assert.deepEqual(completions, [], 'still refuses to guess a command the user did not type');
+    // This assertion used to require silence. Silence was wrong: through speech it is
+    // indistinguishable from a broken key, and the user has no way to tell whether to
+    // keep typing or give up.
+    assert.match(h.printed(), /No command matches "zzzz"/);
   });
 
   it('does not complete arguments of an unknown command', async () => {
     const h = await harness();
     const [completions] = h.complete('zzzz /ma');
     assert.deepEqual(completions, []);
+  });
+});
+
+describe('completion never answers with silence', () => {
+  /**
+   * The rule these tests defend: pressing Tab always produces an observable result.
+   *
+   * A completion that returns nothing and prints nothing is, to a screen reader user,
+   * exactly the same experience as a key that is not wired up. There is no cursor to
+   * watch, no list that flickers, no colour that changes — the only channel is text, so
+   * if nothing is written then nothing happened as far as the user can tell. That
+   * ambiguity is worse than an unhelpful answer, because it gives no basis for deciding
+   * what to do next.
+   */
+
+  it('explains an empty or unvisited folder by naming the command that fixes it', async () => {
+    const h = await harness({ warm: false });
+    const [completions] = h.complete('cd /mail/Inb');
+
+    assert.deepEqual(completions, [], 'still must not block on a network call');
+    assert.match(h.printed(), /Nothing to complete from in \/mail yet/);
+    assert.match(h.printed(), /ls \/mail/, 'the message has to name the fix, not just the problem');
+  });
+
+  it('distinguishes a genuine miss from having nothing to work with', async () => {
+    const h = await harness();
+    const [completions] = h.complete('cd /mail/zzzz');
+
+    assert.deepEqual(completions, []);
+    assert.match(h.printed(), /No match for "zzzz" in \/mail/);
+    assert.doesNotMatch(
+      h.printed(),
+      /Nothing to complete from/,
+      'a populated folder must not be reported as unvisited',
+    );
+  });
+
+  it('says something for every kind of completion, not just paths', async () => {
+    for (const line of ['zzzz', 'ls --zzzz', 'find is:zzzz', 'set zzzz']) {
+      const h = await harness();
+      h.complete(line);
+      assert.notEqual(h.printed(), '', `"${line}" produced no output at all`);
+    }
+  });
+
+  it('writes the explanation as plain text with no escape codes', async () => {
+    // It has to survive being spoken and being piped, so it cannot rely on styling.
+    const h = await harness();
+    h.complete('cd /mail/zzzz');
+    // eslint-disable-next-line no-control-regex
+    assert.doesNotMatch(h.printed(), /\u001B/);
   });
 });
 

@@ -362,10 +362,24 @@ function extraColumn(node: VNode): string {
 export function formatDocument(doc: Document, options: FormatOptions): string {
   if (options.mode === 'json') return JSON.stringify(doc, null, 2);
 
-  const lines: string[] = [];
-  const labelWidth = Math.max(0, ...doc.headers.map(([label]) => label.length));
+  // `title` is required on Document, and it used to be silently discarded whenever a provider
+  // supplied one without also repeating it in `headers`. The built-in mail providers happen to
+  // emit a `Subject:` header, so the loss never showed there — but the simplest possible
+  // plugin returns `{title, body}` and nothing else, and its document rendered anonymously,
+  // led by a stray blank line. Synthesise the label here, before widths are measured, so it
+  // aligns with the real headers instead of hanging off the left of them.
+  const titleShownAlready = doc.headers.some(
+    ([, value]) => value.trim() !== '' && value.trim() === doc.title.trim(),
+  );
+  const headers: ReadonlyArray<readonly [string, string]> =
+    titleShownAlready || doc.title.trim() === ''
+      ? doc.headers
+      : [['Title', doc.title] as const, ...doc.headers];
 
-  for (const [label, value] of doc.headers) {
+  const lines: string[] = [];
+  const labelWidth = Math.max(0, ...headers.map(([label]) => label.length));
+
+  for (const [label, value] of headers) {
     if (value === '') continue;
     const paintedLabel = options.color ? paint(`${label}:`, 'cyan') : `${label}:`;
     const padding = options.mode === 'table' ? ' '.repeat(labelWidth - label.length) : '';
@@ -379,7 +393,9 @@ export function formatDocument(doc: Document, options: FormatOptions): string {
     lines.push(`${options.color ? paint('Attachments:', 'cyan') : 'Attachments:'} ${names}`);
   }
 
-  lines.push('');
+  // Only separate the headers from the body when there are headers. A leading blank line is
+  // visually trivial and, read aloud, is an unexplained pause before the content starts.
+  if (lines.length > 0) lines.push('');
   lines.push(wrapBody(doc.body, options.mode === 'plain' || options.mode === 'tsv' ? 0 : options.width));
 
   if (doc.webUrl !== undefined) {
@@ -476,14 +492,18 @@ export function formatRows(
   if (options.mode === 'tsv') return rows.map((row) => row.join('\t')).join('\n');
   if (options.mode === 'announce' || options.mode === 'plain') {
     return rows
-      .map((row, index) =>
-        `${String(index + 1)}. ` +
-        headers
-          .map((header, i) => `${header} ${sanitizeForDisplay(row[i] ?? '')}`)
-          .filter((part) => !part.endsWith(' '))
-          .join(', ') +
-        '.',
-      )
+      .map((row, index) => {
+        const sentence =
+          `${String(index + 1)}. ` +
+          headers
+            .map((header, i) => `${header} ${sanitizeForDisplay(row[i] ?? '')}`)
+            .filter((part) => !part.endsWith(' '))
+            .join(', ');
+        // Only add the full stop when the last cell did not already end the sentence.
+        // A doubled period is spoken as a pause and then another pause, which reads as a
+        // hesitation that is not in the text.
+        return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
+      })
       .join('\n');
   }
 

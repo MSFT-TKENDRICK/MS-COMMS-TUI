@@ -121,6 +121,21 @@ the whole protocol documented in its header. See [docs/PLUGINS.md](docs/PLUGINS.
 - **stdout is data, stderr is chrome.** Prompts, banners, status lines and paging footers
   go to stderr, so `mscomms find -q is:unread --json | jq` works.
 
+There is also an opt-in full-screen pane:
+
+```bash
+mscomms --tui
+```
+
+It is **opt-in on purpose**. The line shell above is the primary interface, because a
+full-screen application that repaints itself is exactly the thing screen readers handle
+worst. The pane adds no capability of its own — `:` inside it runs the same commands, and
+anything you can do there you can do by typing. It refuses to start with `--announce` or
+`--plain`, and says why rather than ignoring you. Arrow keys move, Enter opens, `?` lists
+the keys, `q` quits, and **Ctrl+C always works, from any mode**, including mid-filter.
+On exit it prints where you were and what was selected, so a full-screen session isn't a
+hole in your scrollback.
+
 ## Scripting
 
 ```sh
@@ -146,11 +161,16 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 ## Status
 
 Working and tested: the VFS engine, query language, cache, notifications, the line shell,
-tab completion, and the memory, RSS, GitHub, Graph and exec providers. 471 tests.
+tab completion, the opt-in full-screen pane (`--tui`), and the memory, RSS, GitHub, Graph
+and exec providers. 642 tests.
 
-Not done: the opt-in full-screen TUI (`--tui`), and offline-first sync. The Graph providers
-have been exercised against the API shape but not against every tenant configuration; if
-your tenant blocks the default public client, set `clientId` in the mount options.
+Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
+and the exec plugin protocol (against a Python plugin). The Graph providers have been
+exercised against the API shape but not against every tenant configuration; if your tenant
+blocks the default public client, set `clientId` in the mount options.
+
+Not done: offline-first sync. The full-screen pane has been tested against synthetic
+terminals rather than every real one.
 
 ## Licence
 

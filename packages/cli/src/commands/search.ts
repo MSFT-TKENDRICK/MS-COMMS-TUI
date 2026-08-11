@@ -10,14 +10,34 @@
 
 import { parseQuery, stringifyQuery, requiresContent, QUERY_FIELD_HELP, vpath, type VNode } from '@mscomms/core';
 import { formatListing, formatRows, sanitizeForDisplay, truncateWidth } from '../format.js';
+import type { Session } from '../session.js';
 import {
   OUTPUT_FLAGS,
   flagBool,
   flagNumber,
   flagString,
   modeFrom,
+  quoteCorrection,
   type Command,
 } from './types.js';
+
+/**
+ * The path a token names, if it names an existing folder.
+ *
+ * Used to decide whether `find <word> <word>` means "search this folder" or "match both
+ * words". Returning undefined for anything that is not a real, reachable folder keeps the
+ * decision grounded in something the user can verify with `ls`, rather than in a guess
+ * about what their words look like.
+ */
+async function resolveDirectory(session: Session, token: string): Promise<string | undefined> {
+  try {
+    const path = session.resolveToken(token);
+    const node = await session.vfs.stat(path);
+    return node.kind === 'dir' ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export const findCommand: Command = {
   name: 'find',
@@ -40,6 +60,12 @@ export const findCommand: Command = {
     '',
     'Sources that have their own search index use it. Sources that do not are walked',
     'breadth-first with a budget, so an unindexed feed is slow but never unbounded.',
+    '',
+    'Without `-q`, a leading word is treated as the folder to search only when it really',
+    'is one — `find /mail/Inbox budget` searches that folder for "budget", while',
+    '`find budget review` searches from here for "budget review". Whenever a folder is',
+    'inferred, it is stated back, so you can tell which reading you got. Use `-q` to',
+    'settle it explicitly.',
   ].join('\n'),
   args: ['path', 'query'],
   flags: [
@@ -50,14 +76,34 @@ export const findCommand: Command = {
   ],
   examples: ['find -q "is:unread"', 'find /mail -q "from:alice after:7d"', 'find -q "subject:budget OR subject:forecast"'],
   async run(session, args) {
-    // Everything after the path that is not a flag is treated as the query, so
-    // `find is:unread` works as well as `find -q is:unread`.
     const explicit = flagString(args, 'q', 'query');
     const positional = [...args.positional];
     let path = session.cwd;
-    if (positional.length > 0 && explicit !== undefined) {
-      path = session.resolveToken(positional[0] as string);
+
+    if (explicit !== undefined) {
+      // With -q, the query is settled and a positional can only be the path.
+      if (positional.length > 0) path = session.resolveToken(positional[0] as string);
+    } else if (positional.length > 1) {
+      // Without -q, `find /blog deploy` used to make "/blog" a *search term*, so it
+      // matched nothing and printed "(empty)". A false negative is the worst answer this
+      // program can give — the user concludes the message does not exist — and it
+      // contradicted the command's own `args: ['path', 'query']`, which is what Tab
+      // completion has always offered. So the first word is taken as the folder when it
+      // really is one, and the rest is the query.
+      //
+      // It is only ever inferred, never silent: the interpretation is stated back, so a
+      // user who meant both words as search terms can see that and add -q.
+      const candidate = positional[0] as string;
+      const resolved = await resolveDirectory(session, candidate);
+      if (resolved !== undefined) {
+        path = resolved;
+        positional.shift();
+        session.status(
+          `Searching ${resolved} for "${positional.join(' ')}". Use \`-q\` to search from here instead.`,
+        );
+      }
     }
+
     const queryText = explicit ?? positional.join(' ');
     if (queryText.trim() === '') {
       throw new Error('What are you looking for? Try `find -q "is:unread"`, or `queries` for the field list.');
@@ -112,6 +158,10 @@ export const grepCommand: Command = {
     '"no matches" never quietly means "I stopped early".',
     '',
     'Progress is printed to the error stream, so `--json` output stays clean when piped.',
+    '',
+    'A trailing word is treated as the folder to search only when it really is one, so',
+    '`grep budget review` looks for the phrase "budget review" here, while',
+    '`grep budget /mail/Inbox` looks for "budget" in that folder.',
   ].join('\n'),
   args: ['none', 'path'],
   flags: [
@@ -126,9 +176,31 @@ export const grepCommand: Command = {
   ],
   examples: ['grep budget', 'grep -q "from:alice" deadline', 'grep --regex "Q[34] (plan|forecast)"'],
   async run(session, args) {
-    const pattern = args.positional[0];
-    if (pattern === undefined) throw new Error('What text are you looking for? Try `grep budget`.');
-    const path = session.positionalPath(args, 1);
+    // `grep <text> [path]`: the path is trailing, so the *last* word is the path when it
+    // really is a folder, and everything before it is the text. Without this,
+    // `grep budget review` searched for "budget" inside a folder called "review" — which
+    // does not exist — and the user was told nothing matched. Same false negative as
+    // `find`, same rule, so the two commands behave alike.
+    const positional = [...args.positional];
+    let pathToken: string | undefined;
+    if (positional.length > 1) {
+      const last = positional[positional.length - 1] as string;
+      const resolved = await resolveDirectory(session, last);
+      if (resolved !== undefined) {
+        pathToken = last;
+        positional.pop();
+      }
+    }
+
+    if (positional.length === 0) {
+      throw new Error('What text are you looking for? Try `grep budget`.');
+    }
+    const pattern = positional.join(' ');
+    if (positional.length > 1) {
+      session.status(`Searching for "${pattern}".`);
+    }
+
+    const path = pathToken === undefined ? session.cwd : session.resolveToken(pathToken);
     const limit = flagNumber(args, 'n', 'limit') ?? 50;
     const scanLimit = flagNumber(args, 'scan') ?? 200;
     const context = flagNumber(args, 'context', 'C') ?? 0;
@@ -267,6 +339,8 @@ export const queriesCommand: Command = {
   group: 'search',
   summary: 'List the query fields you can search on, and your saved queries.',
   usage: 'queries [name]',
+  maxPositional: 1,
+  correction: quoteCorrection('queries'),
   detail: 'With a name, runs the saved query of that name from your config.',
   args: ['query'],
   flags: [...OUTPUT_FLAGS],

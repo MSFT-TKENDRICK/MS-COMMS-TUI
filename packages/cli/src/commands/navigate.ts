@@ -11,6 +11,7 @@ import {
   flagNumber,
   flagString,
   modeFrom,
+  quoteCorrection,
   type Command,
   type CommandArgs,
 } from './types.js';
@@ -48,6 +49,8 @@ export const lsCommand: Command = {
     'shows a page and `more` continues it.',
   ].join('\n'),
   args: ['path'],
+  maxPositional: 1,
+  correction: quoteCorrection('ls'),
   flags: [
     { name: 'l', description: 'Show extra columns: item counts, flags and sizes.' },
     { name: 'n', description: 'How many entries to show.', value: true, aliases: ['limit'] },
@@ -150,6 +153,7 @@ export const moreCommand: Command = {
   group: 'navigate',
   summary: 'Show the next page of the last listing, continuing the numbering.',
   usage: 'more [-n count]',
+  maxPositional: 0,
   detail:
     'Numbering continues rather than restarting, so item 26 stays item 26 for as long as\n' +
     'the listing is on screen. Restarting at 1 on every page would silently change what a\n' +
@@ -215,6 +219,8 @@ export const cdCommand: Command = {
     'With no argument, goes to the root. `cd ..` goes up, `cd -` goes back to where you\n' +
     'were, and `cd 2` enters the second item of the last listing.',
   args: ['path'],
+  maxPositional: 1,
+  correction: quoteCorrection('cd'),
   examples: ['cd Inbox', 'cd ..', 'cd -', 'cd 3'],
   async run(session, args) {
     const token = args.positional[0];
@@ -235,6 +241,7 @@ export const pwdCommand: Command = {
   group: 'navigate',
   summary: 'Print the folder you are currently in.',
   usage: 'pwd',
+  maxPositional: 0,
   async run(session) {
     session.print(session.cwd);
   },
@@ -245,6 +252,7 @@ export const backCommand: Command = {
   group: 'navigate',
   summary: 'Return to the folder you were in before the last `cd`.',
   usage: 'back',
+  maxPositional: 0,
   async run(session) {
     const previous = session.history.pop();
     if (previous === undefined) throw new Error('There is nowhere to go back to.');
@@ -264,6 +272,8 @@ export const treeCommand: Command = {
     'listing with extra punctuation, and indentation is announced character by character\n' +
     'by a screen reader. Use `--files` if you really want them.',
   args: ['path'],
+  maxPositional: 1,
+  correction: quoteCorrection('tree'),
   flags: [
     { name: 'depth', description: 'How many levels deep to go. Default 3.', value: true, aliases: ['d'] },
     { name: 'files', description: 'Include files, not just folders.' },
@@ -330,6 +340,7 @@ export const mountsCommand: Command = {
   group: 'navigate',
   summary: 'List the configured sources and what each one can do.',
   usage: 'mounts',
+  maxPositional: 0,
   detail:
     'Capabilities are listed honestly. If a source cannot search, it says so rather than\n' +
     'quietly walking every folder and appearing to hang.',

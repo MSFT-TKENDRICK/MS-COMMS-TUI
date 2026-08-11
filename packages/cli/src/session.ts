@@ -69,8 +69,22 @@ export class Session {
   readonly notifier: Notifier;
   readonly watcher: Watcher;
 
-  readonly write: (text: string) => void;
-  readonly writeError: (text: string) => void;
+  #sink: (text: string) => void = (text) => process.stdout.write(text);
+  #errorSink: (text: string) => void = (text) => process.stderr.write(text);
+
+  /**
+   * Where command output goes.
+   *
+   * These are stable function identities for the life of the session — the notifier and the
+   * watcher capture them at construction — so redirection works by swapping the sink
+   * underneath rather than by reassigning the property. See {@link capture}.
+   */
+  readonly write: (text: string) => void = (text) => {
+    this.#sink(text);
+  };
+  readonly writeError: (text: string) => void = (text) => {
+    this.#errorSink(text);
+  };
 
   /** Mounts that failed to start. Surfaced by `mounts` and `doctor` instead of at startup. */
   brokenMounts: readonly BuiltMount[] = [];
@@ -89,8 +103,8 @@ export class Session {
     this.registry = options.registry;
     this.logger = options.logger;
     this.paths = options.paths ?? resolveAppPaths();
-    this.write = options.write ?? ((text) => process.stdout.write(text));
-    this.writeError = options.writeError ?? ((text) => process.stderr.write(text));
+    if (options.write !== undefined) this.#sink = options.write;
+    if (options.writeError !== undefined) this.#errorSink = options.writeError;
 
     this.pageSize = options.config.ui.pageSize ?? 25;
 
@@ -308,6 +322,39 @@ export class Session {
 
   withMode(mode: OutputMode | undefined): FormatOptions {
     return mode === undefined ? this.format : { ...this.format, mode };
+  }
+
+  /**
+   * Run something with all output collected instead of printed.
+   *
+   * This exists so the full-screen view can run a real command and show its real output,
+   * rather than reimplementing a parallel set of half-commands that drift from the ones the
+   * shell has. `:grep budget` in the pane runs the same `grep` as the shell does; the text
+   * lands in the preview instead of scrolling the screen the pane is drawing on.
+   *
+   * Both streams are merged, deliberately. The split exists so that a pipe gets data on
+   * stdout and chrome on stderr; here there is no pipe, and a user who typed a command
+   * wants to see the warning that came with the answer.
+   *
+   * The sinks are restored in a `finally`, so a throwing command cannot leave a session
+   * permanently writing into a discarded buffer.
+   */
+  async capture(fn: () => Promise<void>): Promise<string> {
+    const chunks: string[] = [];
+    const previousSink = this.#sink;
+    const previousErrorSink = this.#errorSink;
+    const collect = (text: string): void => {
+      chunks.push(text);
+    };
+    this.#sink = collect;
+    this.#errorSink = collect;
+    try {
+      await fn();
+    } finally {
+      this.#sink = previousSink;
+      this.#errorSink = previousErrorSink;
+    }
+    return chunks.join('');
   }
 }
 

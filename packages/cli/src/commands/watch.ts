@@ -14,7 +14,7 @@
  * Assist, Do Not Disturb and headless SSH sessions all silently swallow them.
  */
 
-import { parseQuery, stringifyQuery } from '@mscomms/core';
+import { parseQuery, stringifyQuery, vpath } from '@mscomms/core';
 import { formatRows, relativeTime, sanitizeForDisplay } from '../format.js';
 import {
   OUTPUT_FLAGS,
@@ -22,6 +22,7 @@ import {
   flagNumber,
   flagString,
   modeFrom,
+  quoteCorrection,
   type Command,
 } from './types.js';
 
@@ -41,6 +42,8 @@ export const watchCommand: Command = {
     'start automatically.',
   ].join('\n'),
   args: ['path'],
+  maxPositional: 1,
+  correction: quoteCorrection('watch'),
   flags: [
     { name: 'q', description: 'Only notify about items matching this query.', value: true, aliases: ['query'] },
     { name: 'every', description: 'Seconds between checks. Default 120.', value: true, aliases: ['interval'] },
@@ -54,6 +57,13 @@ export const watchCommand: Command = {
     const queryText = flagString(args, 'q', 'query');
     const everySeconds = flagNumber(args, 'every', 'interval');
     const id = flagString(args, 'id') ?? (path.replace(/^\//, '').replace(/\//g, '.') || 'root');
+
+    // The help above promises that `watch` fails straight away rather than appearing to work
+    // and never firing. That promise was only kept for sources that cannot poll at all — a
+    // typo'd or missing path was accepted happily and then reported `state ok` forever,
+    // which is the exact failure the promise is about. Checking the path costs one request
+    // now and saves a silent watch that never fires.
+    await session.vfs.stat(path);
 
     const status = await session.watcher.add({
       id,
@@ -77,6 +87,7 @@ export const watchesCommand: Command = {
   group: 'watch',
   summary: 'List what is being watched and when each was last checked.',
   usage: 'watches',
+  maxPositional: 0,
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const statuses = session.watcher.statuses;
@@ -108,21 +119,48 @@ export const unwatchCommand: Command = {
   name: 'unwatch',
   group: 'watch',
   summary: 'Stop watching something.',
-  usage: 'unwatch <id>',
+  usage: 'unwatch <id or path>',
+  detail:
+    'Takes either the watch id or the path you originally passed to `watch`. You created it\n' +
+    'by typing a path, so removing it by that same path has to work — being told to go and\n' +
+    'look up a derived id is friction that nobody has a reason to accept.',
   args: ['watch'],
+  maxPositional: 1,
+  correction: quoteCorrection('unwatch'),
   async run(session, args) {
-    const id = args.positional[0];
-    if (id === undefined) throw new Error('Which watch? Run `watches` to see the ids.');
-    if (id === 'all') {
+    const target = args.positional[0];
+    if (target === undefined) throw new Error('Which watch? Run `watches` to see the ids.');
+    if (target === 'all') {
       const count = session.watcher.statuses.length;
       for (const status of session.watcher.statuses) session.watcher.remove(status.id);
       session.print(`Stopped ${String(count)} watch(es).`);
       return;
     }
-    if (!session.watcher.remove(id)) {
-      throw new Error(`There is no watch called "${id}". Run \`watches\` to see the ids.`);
+
+    if (session.watcher.remove(target)) {
+      session.print(`Stopped watching "${target}".`);
+      return;
     }
-    session.print(`Stopped watching "${id}".`);
+
+    // Not an id. `watch /mail/Inbox` names the watch `mail.Inbox`, so the path the user
+    // typed to create it is not the string they would have to type to remove it. Accept it
+    // anyway, resolving it the same way `cd` would so a relative path works too.
+    const wanted = vpath.resolve(session.cwd, target);
+    const byPath = session.watcher.statuses.filter((status) => status.path === wanted);
+
+    if (byPath.length === 0) {
+      throw new Error(
+        `There is no watch called "${target}", and nothing is watching that path. Run \`watches\` to see them.`,
+      );
+    }
+
+    for (const status of byPath) session.watcher.remove(status.id);
+    const names = byPath.map((status) => `"${status.id}"`).join(', ');
+    session.print(
+      byPath.length === 1
+        ? `Stopped watching ${names} on ${wanted}.`
+        : `Stopped ${String(byPath.length)} watches on ${wanted}: ${names}.`,
+    );
   },
 };
 
@@ -135,6 +173,8 @@ export const pollCommand: Command = {
     'With no id, every watch is checked. That is almost always what you want, and having\n' +
     'to name a watch just to say "check now" is friction for no benefit.',
   args: ['watch'],
+  maxPositional: 1,
+  correction: quoteCorrection('poll'),
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const id = args.positional[0];
@@ -171,6 +211,7 @@ export const notificationsCommand: Command = {
   group: 'watch',
   summary: 'Show notifications you have received, including ones the desktop swallowed.',
   usage: 'notifications [--all] [--clear] [--read]',
+  maxPositional: 0,
   detail:
     'Desktop notifications are unreliable: Focus Assist, Do Not Disturb and remote sessions\n' +
     'all suppress them silently. This log always records them, so nothing is ever lost to a\n' +

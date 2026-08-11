@@ -282,7 +282,33 @@ export class Completer {
       if (special.startsWith(current) && current !== '') candidates.push({ value: special });
     }
 
-    return this.#respond(candidates, kind === 'path' ? 'folder' : 'item', true);
+    return this.#respond(
+      candidates,
+      kind === 'path' ? 'folder' : 'item',
+      true,
+      this.#pathHint(base, namePart),
+    );
+  }
+
+  /**
+   * What to say when a path completion finds nothing.
+   *
+   * "No children available here" is deliberately *not* split into cold-cache versus
+   * genuinely-empty. It cannot be, reliably: `cachedChildren` answers for a mount root
+   * out of the synthetic overlay above the mounts, so an unvisited mount root and a
+   * genuinely empty folder are the same observation. Telling the user to run `ls` is the
+   * right advice either way — it either populates the cache or shows them the folder is
+   * empty. Claiming "no match" while the cache is merely cold would be worse than
+   * useless: it asserts the thing they are looking for does not exist, and they have no
+   * way to tell that the assertion is unfounded.
+   */
+  #pathHint(base: string, namePart: string): string {
+    if (this.#cachedChildren(base).length === 0) {
+      return `Nothing to complete from in ${base} yet. Run: ls ${base}`;
+    }
+    return namePart === ''
+      ? `${base} has nothing to complete.`
+      : `No match for "${sanitizeForDisplay(namePart)}" in ${base}.`;
   }
 
   /**
@@ -319,7 +345,12 @@ export class Completer {
    * no list at all; and a per-segment quote such as `Inbox/"Archive 2026"/` re-parses as
    * two arguments once the user presses Enter.
    */
-  #respond(candidates: readonly (string | Candidate)[], label: string, quote = false): CompletionResult {
+  #respond(
+    candidates: readonly (string | Candidate)[],
+    label: string,
+    quote = false,
+    emptyHint?: string,
+  ): CompletionResult {
     const raw = this.#raw;
     const seen = new Set<string>();
     const unique: Candidate[] = [];
@@ -331,6 +362,23 @@ export class Completer {
     }
 
     if (unique.length === 0) {
+      // Say so. The header of this file promises exactly that, and for a long time this
+      // branch returned in silence instead — which is the single worst outcome for the
+      // user this program is built for. Silence has at least three causes that are
+      // indistinguishable without sight: there is genuinely no match, the folder has not
+      // been listed yet so the cache is cold, or completion is broken. Only one of those
+      // is the user's problem to fix, and it is the common one on a fresh shell.
+      //
+      // Callers that can say something more specific pass `emptyHint`; everything else
+      // gets a sentence naming what was looked for and where, which is still infinitely
+      // better than nothing.
+      const typed = this.#logical;
+      const hint =
+        emptyHint ??
+        (typed === ''
+          ? `No ${label}s to complete here.`
+          : `No ${label} matches "${sanitizeForDisplay(typed)}".`);
+      this.#write(`\n${hint}\n\n`);
       return [[], raw];
     }
     if (unique.length === 1) {

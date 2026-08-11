@@ -11,7 +11,7 @@
 import { performance } from 'node:perf_hooks';
 import { VfsError, isVfsError, QUERY_FIELD_HELP } from '@mscomms/core';
 import { formatRows } from '../format.js';
-import { OUTPUT_FLAGS, flagBool, modeFrom, type Command, type CommandTable } from './types.js';
+import { OUTPUT_FLAGS, flagBool, modeFrom, quoteCorrection, type Command, type CommandTable } from './types.js';
 
 export function createHelpCommand(table: CommandTable): Command {
   return {
@@ -140,6 +140,7 @@ export const pluginsCommand: Command = {
   group: 'system',
   summary: 'List the source types available to mount.',
   usage: 'plugins',
+  maxPositional: 0,
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const rows = session.registry.all.map((plugin) => [
@@ -157,6 +158,7 @@ export const doctorCommand: Command = {
   group: 'system',
   summary: 'Check the setup and report anything wrong, with a suggested fix for each.',
   usage: 'doctor',
+  maxPositional: 0,
   flags: [...OUTPUT_FLAGS],
   detail:
     'Checks config, mounts, notifications and terminal capabilities. Every problem it\n' +
@@ -267,6 +269,7 @@ export const setCommand: Command = {
   group: 'system',
   summary: 'Change a display setting for this session.',
   usage: 'set [name] [value]',
+  maxPositional: 2,
   detail: [
     'With no arguments, lists the current settings.',
     '',
@@ -346,6 +349,8 @@ export const refreshCommand: Command = {
   summary: 'Discard cached listings so the next command fetches fresh data.',
   usage: 'refresh [path]',
   args: ['path'],
+  maxPositional: 1,
+  correction: quoteCorrection('refresh'),
   async run(session, args) {
     const path = session.positionalPath(args, 0);
     session.vfs.invalidate(path);
@@ -359,6 +364,7 @@ export const cacheCommand: Command = {
   group: 'system',
   summary: 'Show how much is cached and how well the cache is working.',
   usage: 'cache',
+  maxPositional: 0,
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const stats = session.vfs.cacheStats;
@@ -386,6 +392,7 @@ export const quitCommand: Command = {
   group: 'system',
   summary: 'Leave the shell.',
   usage: 'quit',
+  maxPositional: 0,
   async run(session) {
     session.exiting = true;
   },
@@ -396,6 +403,7 @@ export const demoCommand: Command = {
   group: 'system',
   summary: 'Mount sample data so you can try everything without connecting an account.',
   usage: 'demo [--reset]',
+  maxPositional: 0,
   detail:
     'The sample mailbox deliberately contains awkward names — duplicate subjects, slashes,\n' +
     'emoji, right-to-left overrides, a 190-character subject — because those are exactly\n' +
@@ -444,6 +452,7 @@ export const fieldsCommand: Command = {
   group: 'system',
   summary: 'Show the query syntax with examples.',
   usage: 'syntax',
+  maxPositional: 0,
   async run(session) {
     session.print(
       [

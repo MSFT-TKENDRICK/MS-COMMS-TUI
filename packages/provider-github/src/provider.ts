@@ -293,7 +293,16 @@ export class GitHubProvider implements Provider {
     const updated = new Date(item.updated_at);
     const flags = [item.state === 'open' ? 'open' : 'closed'];
     if (item.draft === true) flags.push('draft');
-    if (item.comments > 0) flags.push('reply');
+    // Deliberately *not* the well-known `reply` flag. Elsewhere `reply` means "this item
+    // is itself a reply to something" (see the chat provider), and an issue never is.
+    // Reusing it here to mean "has comments" would make `is:reply` return two different
+    // things depending on which mount you happened to be standing in, and would imply a
+    // reply action this provider does not offer. The comment count is already carried in
+    // `meta.comments` and shown in the document header, so nothing is lost.
+    if (item.comments > 0) flags.push('discussed');
+
+    const labels = item.labels.map((l) => (typeof l === 'string' ? l : l.name)).join(', ');
+    const assignees = (item.assignees ?? []).map((a) => a.login).join(', ');
 
     return {
       name: `${timestampPrefix(updated)} #${String(item.number)} ${item.title}.md`,
@@ -315,8 +324,10 @@ export class GitHubProvider implements Provider {
         comments: item.comments,
         url: item.html_url,
         created: item.created_at,
-        labels: item.labels.map((l) => (typeof l === 'string' ? l : l.name)).join(', '),
-        ...(item.assignees === undefined ? {} : { assignees: item.assignees.map((a) => a.login).join(', ') }),
+        // Omitted rather than blank when empty. `stat` and `--json` show every meta key,
+        // and a row that reads aloud as "labels, nothing" is pure noise to listen to.
+        ...(labels === '' ? {} : { labels }),
+        ...(assignees === '' ? {} : { assignees }),
       },
     };
   }

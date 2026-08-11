@@ -13,9 +13,12 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  DEFAULT_FORMAT,
   displayWidth,
   formatBytes,
   formatDate,
+  formatDocument,
+  formatRows,
   padTo,
   relativeTime,
   sanitizeForDisplay,
@@ -217,3 +220,108 @@ describe('wrapBody', () => {
     assert.equal(wrapBody('', 40), '');
   });
 });
+
+/**
+ * `formatDocument` had no direct tests, which is exactly why it silently dropped `title`.
+ * The bug surfaced only when a real third-party plugin returned the minimum legal Document
+ * — `{title, body}` with no headers — and its title vanished. These pin the contract.
+ */
+describe('formatDocument', () => {
+  const base = { format: 'text' as const };
+
+  it('shows a title that no header repeats', () => {
+    // The minimum legal Document, and the shape the simplest plugin returns.
+    const out = formatDocument(
+      { ...base, title: 'Hello from Python', headers: [], body: 'Body text.' },
+      { ...DEFAULT_FORMAT, color: false },
+    );
+    assert.match(out, /^Title: Hello from Python$/m);
+    assert.match(out, /Body text\./);
+  });
+
+  it('does not lead with a blank line when there are no headers', () => {
+    // Visually trivial; read aloud it is an unexplained pause before the content.
+    const out = formatDocument(
+      { ...base, title: '', headers: [], body: 'Body text.' },
+      { ...DEFAULT_FORMAT, color: false },
+    );
+    assert.equal(out.split('\n')[0], 'Body text.');
+  });
+
+  it('does not repeat a title that a header already carries', () => {
+    const out = formatDocument(
+      {
+        ...base,
+        title: 'Q3 planning',
+        headers: [
+          ['From', 'Dana'],
+          ['Subject', 'Q3 planning'],
+        ],
+        body: 'Body.',
+      },
+      { ...DEFAULT_FORMAT, color: false },
+    );
+    assert.equal(out.match(/Q3 planning/g)?.length, 1);
+    assert.doesNotMatch(out, /^Title:/m);
+  });
+
+  it('aligns a synthesised Title with the real header labels', () => {
+    // The reason the title is added before widths are measured rather than unshifted after.
+    const out = formatDocument(
+      { ...base, title: 'Fix the thing', headers: [['Author', 'dana']], body: 'Body.' },
+      { ...DEFAULT_FORMAT, color: false, mode: 'table' },
+    );
+    const lines = out.split('\n');
+    const title = lines.find((l) => l.startsWith('Title:'));
+    const author = lines.find((l) => l.startsWith('Author:'));
+    assert.ok(title !== undefined && author !== undefined);
+    // Values start in the same column.
+    assert.equal(title.indexOf('Fix the thing'), author.indexOf('dana'));
+  });
+
+  it('still separates headers from the body when there are headers', () => {
+    const out = formatDocument(
+      { ...base, title: 'T', headers: [['From', 'dana']], body: 'Body.' },
+      { ...DEFAULT_FORMAT, color: false },
+    );
+    const lines = out.split('\n');
+    assert.equal(lines[lines.indexOf('Body.') - 1], '');
+  });
+
+  it('keeps sanitising a hostile title', () => {
+    // The title now reaches the screen, so it has to go through the same control as the rest.
+    const out = formatDocument(
+      { ...base, title: 'evil\u202Etxt.exe', headers: [], body: 'x' },
+      { ...DEFAULT_FORMAT, color: false },
+    );
+    assert.doesNotMatch(out, /\u202E/);
+  });
+});
+
+describe('formatRows in announce mode', () => {
+  const opts = { ...DEFAULT_FORMAT, color: false, mode: 'announce' as const };
+
+  it('ends each row with exactly one full stop', () => {
+    // A doubled period is spoken as two pauses, which reads as a hesitation that is not
+    // in the text. `doctor` produces cells that already end in "." and it showed.
+    const out = formatRows(
+      ['check', 'detail'],
+      [['output mode', 'plain, colour off. Override with --plain.']],
+      opts,
+    );
+    assert.doesNotMatch(out, /\.\.$/m);
+    assert.match(out, /Override with --plain\.$/m);
+  });
+
+  it('still adds a full stop when the cell lacks one', () => {
+    const out = formatRows(['check', 'detail'], [['sources', '2 mounted']], opts);
+    assert.match(out, /2 mounted\.$/m);
+  });
+
+  it('respects a question mark or exclamation as sentence-final', () => {
+    const out = formatRows(['subject'], [['Lunch?']], opts);
+    assert.match(out, /Lunch\?$/m);
+    assert.doesNotMatch(out, /Lunch\?\./);
+  });
+});
+
