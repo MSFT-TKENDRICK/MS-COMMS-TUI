@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/provider-memory" },
+    { "path": "packages/provider-rss" },
+    { "path": "packages/provider-github" },
+    { "path": "packages/provider-graph" },
+    { "path": "packages/provider-exec" },
+    { "path": "packages/cli" }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@mscomms/provider-exec",
+  "version": "0.1.0",
+  "description": "Run any external program as a provider, over line-delimited JSON on stdio.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@mscomms/core": "0.1.0"
+  }
+}

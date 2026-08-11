@@ -1,0 +1,19 @@
+{
+  "name": "@mscomms/provider-memory",
+  "version": "0.1.0",
+  "description": "Deterministic in-memory fixture provider. Lets the whole application be demoed and tested with no network and no credentials.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@mscomms/core": "0.1.0"
+  }
+}

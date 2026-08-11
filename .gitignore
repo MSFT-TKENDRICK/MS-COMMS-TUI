@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+
+# Local runtime state: token caches, sync state, logs. Never commit.
+.mscomms/
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
