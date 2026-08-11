@@ -1,0 +1,32 @@
+{
+  "name": "ms-comms-tui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browse Outlook, Teams, GitHub and any custom feed as a virtual filesystem, from an accessible keyboard-driven terminal.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "workspaces": [
+    "packages/core",
+    "packages/cli",
+    "packages/provider-memory",
+    "packages/provider-rss",
+    "packages/provider-github",
+    "packages/provider-graph",
+    "packages/provider-exec"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean",
+    "typecheck": "tsc --build --force",
+    "test": "npm run build && node --test \"packages/*/dist/**/*.test.js\"",
+    "test:only": "node --test \"packages/*/dist/**/*.test.js\"",
+    "msh": "node packages/cli/dist/bin.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

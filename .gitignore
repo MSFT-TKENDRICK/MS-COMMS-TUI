@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Scratch directories the test suite writes into. Regenerated on every run.
+.test-tmp/
+.env
+.env.*
+!.env.example
+
+# Local runtime state: token caches, sync state, logs. Never commit.
+.mscomms/
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+{
+  "name": "@mscomms/core",
+  "version": "0.1.0",
+  "description": "Virtual filesystem engine, provider contract, query language and notification bus for MS-COMMS-TUI.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./testing": "./dist/testing/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --build"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@mscomms/provider-github",
+  "version": "0.1.0",
+  "description": "GitHub issues, pull requests and notifications as a virtual filesystem.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist"],
+  "scripts": { "build": "tsc --build" },
+  "dependencies": { "@mscomms/core": "0.1.0" }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@mscomms/cli",
+  "version": "0.1.0",
+  "description": "Accessible, keyboard-driven shell for browsing messages, chats, issues and feeds as a virtual filesystem.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "mscomms": "./dist/bin.js",
+    "msh": "./dist/bin.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@mscomms/core": "0.1.0",
+    "@mscomms/provider-memory": "0.1.0",
+    "@mscomms/provider-rss": "0.1.0",
+    "@mscomms/provider-github": "0.1.0",
+    "@mscomms/provider-graph": "0.1.0",
+    "@mscomms/provider-exec": "0.1.0"
+  }
+}
