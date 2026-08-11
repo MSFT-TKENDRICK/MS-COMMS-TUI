@@ -45,7 +45,8 @@ and covered in [PLUGINS.md](PLUGINS.md#names-are-yours-to-choose-and-it-matters)
 
 **`vfs.ts`** — the engine: mount table, resolution, listing, reading, search fan-out.
 
-**`query.ts`** — parse, evaluate and re-serialise `from:dana is:unread after:7d`.
+**`query.ts`** — parse, evaluate, rank and re-serialise `from:dana is:unread after:7d`,
+including the Lucene modifiers (wildcards, fuzzy, proximity, ranges, boosts).
 
 **`cache.ts`** — TTL cache for listings and documents, with explicit invalidation.
 
@@ -103,6 +104,61 @@ the engine re-filters locally. Returning too much is safe; returning too little 
 
 Exact equality, rather than "close enough", because judging equivalence between two query
 ASTs is exactly the sort of thing that looks right until it silently isn't.
+
+This is also why the Lucene modifiers had to survive `stringifyQuery` round-tripping.
+A boost or a slop value that vanished on the way out would make two different queries
+render identically, and the engine would then trust a filter that was never applied.
+Every new AST field is therefore covered by a round-trip test.
+
+## Searching every source at once
+
+`Vfs.search` on a synthetic directory — the root, or any ancestor of several mounts —
+fans out rather than walking. Each mount is searched through its own provider, in
+parallel, and the results are merged.
+
+The alternative, walking the synthetic tree breadth-first, is wrong in a way that is hard
+to notice: one shared node budget means whichever mount sorts first consumes it, and the
+rest return nothing. "No results in Teams" and "never got as far as Teams" then look
+identical.
+
+Four properties hold it together:
+
+**Isolation.** One provider throwing must not abort the others. The whole reason to ask
+four backends is that three can still answer.
+
+**A deadline per source.** Enforced twice — an `AbortSignal` asks politely, and a race
+guarantees the merge proceeds even against a provider that ignores signals. A hung tenant
+must not make the tool look frozen; to someone reading one line at a time, frozen and
+crashed are the same thing.
+
+**Ranking.** Across four unrelated backends there is no shared natural order, so the query
+supplies one via `scoreQuery`. Matching and scoring share a single code path — `judgeTerm`
+returns a verdict *and* a quality — because a separate matcher and scorer would eventually
+disagree, and put an item at the top of the results that the tool also says is not a match.
+Ties break on recency, then path, so two identical runs give identical order.
+
+**No cursor.** Resuming a merged search would mean juggling N provider cursors and
+re-ranking against results the user has already seen. A cursor that quietly loses or
+repeats items is worse than no cursor, so the result carries a per-source report —
+including sources that failed, timed out, or were cut off — and the CLI says "showing the
+top N" rather than offering `more`.
+
+### The partial source
+
+A source that fails is loud, and easy to report. The dangerous case is the one in between:
+a source that answers normally, having skipped some of itself. A walked source absorbs a
+folder it cannot list — one revoked scope should not cost you the other nine — but
+absorbing it *silently* is how a partial answer comes to look like a complete one.
+
+So `#walkSearch` counts what it skipped and returns it as `unreadable`, and
+`#searchOneSource` turns a non-zero count into `status: 'partial'`. `find` then prints a
+line naming the source. The same count is surfaced for a single-source search, which has
+exactly the same blind spot and no federation to hide behind.
+
+Cancellation is deliberately excluded from that absorption: the walk re-throws an abort
+rather than counting it, and checks the signal each iteration rather than trusting the
+provider to notice, because a Ctrl-C that only works if the backend cooperates is not a
+working Ctrl-C.
 
 ## The CLI
 

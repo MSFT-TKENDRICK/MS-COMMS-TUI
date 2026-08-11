@@ -20,6 +20,7 @@ import {
   evaluateQuery,
   isMatchAll,
   requiresContent,
+  scoreQuery,
   stringifyQuery,
   type Query,
 } from './query.js';
@@ -94,7 +95,82 @@ export interface VfsListResult extends ListPage {
   /** True when served from cache after a failed refresh. */
   readonly stale: boolean;
   readonly staleAgeMs?: number;
+  /**
+   * Folders skipped during a walked search because they could not be read.
+   *
+   * A walk must not abort because one subtree is unreadable — a revoked scope on one
+   * folder should not cost you the other nine. But swallowing the failure entirely makes
+   * "nothing matched" and "I could not look" render identically, so the count comes back
+   * and the caller is expected to say so.
+   */
+  readonly unreadable?: number;
+  /** The first failure encountered while walking, when `unreadable` is set. */
+  readonly unreadableError?: string;
+  /**
+   * One entry per source consulted, present only for a cross-source search.
+   *
+   * A search that spans several backends is a search that can be *partly* wrong: one
+   * tenant revokes a scope, one feed times out, one repository rate-limits. Returning the
+   * surviving results with no word about the rest turns "your mail is not there" and "I
+   * could not look" into the same answer, which is the single most damaging thing a
+   * search tool can do. So every source reports back, including the ones that failed.
+   */
+  readonly sources?: readonly SearchSourceReport[];
+  /** True when entries are ordered by relevance rather than by the provider's order. */
+  readonly ranked?: boolean;
 }
+
+/** What one source did during a cross-source search. */
+export interface SearchSourceReport {
+  /** The mount's stable id, as used by `--source`. */
+  readonly id: string;
+  readonly path: string;
+  readonly provider: string;
+  /**
+   * What became of this source.
+   *
+   * 'ok' — it answered in full. 'partial' — it answered, but some folders under it could
+   * not be read, so the absence of a result there means nothing. 'failed' — it errored.
+   * 'timeout' — it did not answer in time. The last three are all reported to the user by
+   * name, because a search that quietly drops a source teaches you to trust an answer
+   * that was never complete.
+   */
+  readonly status: 'ok' | 'partial' | 'failed' | 'timeout';
+  /** True when the source's own index answered, rather than the engine walking it. */
+  readonly native: boolean;
+  readonly matches: number;
+  readonly durationMs: number;
+  /** True when this source had more to give and was cut off by the budget. */
+  readonly truncated: boolean;
+  /** Entries this source could not decide without fetching bodies. */
+  readonly undecided: number;
+  readonly error?: string;
+}
+
+export interface SearchOptions extends ListOptions {
+  /** Cap on nodes visited when a source has no index and must be walked. */
+  readonly maxNodes?: number;
+  readonly maxDepth?: number;
+  /**
+   * Restrict a cross-source search to these sources, named by mount id or mount path.
+   * Supplying it forces a cross-source search even from inside a single mount.
+   */
+  readonly sources?: readonly string[];
+  /**
+   * How long any one source gets before the others are reported without it. Default
+   * 15 seconds; 0 waits indefinitely.
+   */
+  readonly sourceTimeoutMs?: number;
+  /** How many sources to query at once. Default 6. */
+  readonly concurrency?: number;
+  /**
+   * Order merged results by relevance. Defaults to true for a real query, because there
+   * is no meaningful common order across four different backends otherwise. Ignored when
+   * an explicit `sort` is given.
+   */
+  readonly rank?: boolean;
+}
+
 
 export interface VfsOptions {
   readonly ttlMs?: number;
@@ -457,6 +533,13 @@ export class Vfs {
    * backend's index; otherwise walks the tree breadth-first with a bounded budget so an
    * unindexed provider degrades to something slow but finite rather than unbounded.
    *
+   * From a synthetic directory — the root, or any ancestor of several mounts — this fans
+   * out across every source beneath it *in parallel*, each through its own native index,
+   * and merges the results by relevance. Walking a synthetic root breadth-first instead
+   * would be both far slower and much worse: a shared node budget spent depth-first means
+   * the first mount in path order eats it, and the honest answer "no results in Teams"
+   * becomes indistinguishable from "never got as far as Teams".
+   *
    * Native results get the same treatment `list` gives: the query is re-applied locally
    * unless the provider explicitly claims it applied the whole thing, and every name is
    * run through the naming rules. Search is the one place where results from many
@@ -464,13 +547,22 @@ export class Vfs {
    * because the user wants to know *where* a hit lives, and because a bare leaf name is
    * not unique across folders.
    */
-  async search(
-    path: string,
-    query: Query,
-    options: ListOptions & { maxNodes?: number; maxDepth?: number } = {},
-  ): Promise<VfsListResult> {
+  async search(path: string, query: Query, options: SearchOptions = {}): Promise<VfsListResult> {
     const normalized = vpath.normalize(path);
     const located = this.findMount(normalized);
+    const explicitSources = options.sources !== undefined && options.sources.length > 0;
+
+    if (located === undefined || explicitSources) {
+      const beneath = this.#mountsBeneath(normalized, options.sources);
+      if (beneath.length > 0) return this.#federatedSearch(normalized, beneath, query, options);
+      if (explicitSources) {
+        const known = this.mounts.map((mount) => mount.id).join(', ');
+        throw VfsError.invalid(
+          `No source matches ${(options.sources ?? []).map((name) => `"${name}"`).join(', ')}.`,
+          known === '' ? 'Nothing is mounted yet.' : `Mounted sources: ${known}.`,
+        );
+      }
+    }
 
     if (located !== undefined) {
       const { mount } = located;
@@ -509,6 +601,185 @@ export class Vfs {
 
     return this.#walkSearch(normalized, query, options);
   }
+
+  /**
+   * The mounts a cross-source search should consult, optionally narrowed by name.
+   *
+   * A source may be named by its id (`mail`), its mount path (`/mail`) or the last
+   * segment of that path, because those are the three things the user actually sees and
+   * none of them is obviously the "real" one.
+   */
+  #mountsBeneath(root: string, sources?: readonly string[]): readonly Mount[] {
+    const beneath = this.mounts.filter((mount) => vpath.contains(root, mount.path));
+    if (sources === undefined || sources.length === 0) return beneath;
+
+    const wanted = new Set(
+      sources.map((name) => name.trim().toLocaleLowerCase()).filter((name) => name !== ''),
+    );
+    return beneath.filter(
+      (mount) =>
+        wanted.has(mount.id.toLocaleLowerCase()) ||
+        wanted.has(mount.path.toLocaleLowerCase()) ||
+        wanted.has(vpath.basename(mount.path).toLocaleLowerCase()),
+    );
+  }
+
+  /**
+   * Search several sources at once and merge what comes back.
+   *
+   * Three rules govern this, and each exists because the obvious alternative is a lie:
+   *
+   * Sources are isolated. One provider throwing must never abort the rest — the whole
+   * point of asking four backends is that three of them can still answer.
+   *
+   * Sources are bounded. A source that does not answer within the deadline is dropped
+   * from the results and named in the report. A hung mail tenant must not make the tool
+   * look frozen, which for a screen-reader user is indistinguishable from a crash.
+   *
+   * No cursor is returned. Continuing a merged search would mean resuming N independent
+   * provider cursors and re-ranking against results the user has already seen; a cursor
+   * that quietly loses or repeats items is worse than no cursor. Truncation is reported
+   * instead, so the caller can say "showing the top 50" and mean it.
+   */
+  async #federatedSearch(
+    root: string,
+    mounts: readonly Mount[],
+    query: Query,
+    options: SearchOptions,
+  ): Promise<VfsListResult> {
+    const limit = options.limit ?? this.#defaultPageSize;
+    const timeoutMs = options.sourceTimeoutMs ?? 15_000;
+    const concurrency = Math.max(1, Math.min(options.concurrency ?? 6, mounts.length));
+
+    const reports = new Array<SearchSourceReport>(mounts.length);
+    const harvest = new Array<readonly VNode[]>(mounts.length);
+    let next = 0;
+
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const index = next++;
+        const mount = mounts[index];
+        if (mount === undefined) return;
+        const outcome = await this.#searchOneSource(mount, query, options, timeoutMs, limit);
+        reports[index] = outcome.report;
+        harvest[index] = outcome.entries;
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, worker));
+
+    // A caller-initiated abort is a real error, not a per-source failure to report around.
+    options.signal?.throwIfAborted();
+
+    const merged: VNode[] = [];
+    for (const entries of harvest) merged.push(...entries);
+
+    const named = this.#nameSearchHits(root, merged);
+    const ranked = options.sort === undefined && (options.rank ?? true);
+    const ordered = ranked
+      ? rankHits(named, query)
+      : options.sort === undefined
+        ? named
+        : sortNodes(named, options.sort);
+
+    const sources = reports.filter((report): report is SearchSourceReport => report !== undefined);
+    const undecided = sources.reduce((sum, report) => sum + report.undecided, 0);
+
+    return {
+      path: root,
+      entries: ordered.slice(0, limit),
+      undecided: requiresContent(query) ? undecided : 0,
+      stale: false,
+      total: ordered.length,
+      sources,
+      ranked,
+    };
+  }
+
+  /** Ask one source, under a deadline, and never throw. */
+  async #searchOneSource(
+    mount: Mount,
+    query: Query,
+    options: SearchOptions,
+    timeoutMs: number,
+    limit: number,
+  ): Promise<{ report: SearchSourceReport; entries: readonly VNode[] }> {
+    const started = this.#now();
+    const native = mount.provider.capabilities.has('search') && mount.provider.search !== undefined;
+    const base = {
+      id: mount.id,
+      path: mount.path,
+      provider: mount.provider.displayName,
+      native,
+    } as const;
+
+    // The deadline is enforced twice on purpose: the signal asks politely, and the race
+    // guarantees the merge proceeds even against a provider that ignores signals.
+    const stopper = new AbortController();
+    const signals = [stopper.signal, ...(options.signal === undefined ? [] : [options.signal])];
+    const perSource: SearchOptions = {
+      ...options,
+      limit,
+      sources: [],
+      signal: signals.length === 1 ? stopper.signal : AbortSignal.any(signals),
+    };
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const work = this.search(mount.path, query, perSource);
+      const page =
+        timeoutMs > 0
+          ? await Promise.race([
+              work,
+              new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                  stopper.abort();
+                  reject(new SourceTimeout());
+                }, timeoutMs);
+                timer.unref?.();
+              }),
+            ])
+          : await work;
+
+      const unreadable = page.unreadable ?? 0;
+      return {
+        report: {
+          ...base,
+          status: unreadable > 0 ? 'partial' : 'ok',
+          matches: page.entries.length,
+          durationMs: this.#now() - started,
+          truncated: page.cursor !== undefined || page.entries.length >= limit,
+          undecided: page.undecided,
+          ...(unreadable === 0
+            ? {}
+            : {
+                error: `${unreadable} ${unreadable === 1 ? 'folder' : 'folders'} could not be read${
+                  page.unreadableError === undefined ? '' : `: ${page.unreadableError}`
+                }`,
+              }),
+        },
+        entries: page.entries,
+      };
+    } catch (error) {
+      const timedOut = error instanceof SourceTimeout;
+      return {
+        report: {
+          ...base,
+          status: timedOut ? 'timeout' : 'failed',
+          matches: 0,
+          durationMs: this.#now() - started,
+          truncated: false,
+          undecided: 0,
+          error: timedOut ? `No response within ${timeoutMs}ms.` : describeError(error),
+        },
+        entries: [],
+      };
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      stopper.abort();
+    }
+  }
+
 
   /**
    * Give search hits display names that are unique within the result set and safe as path
@@ -835,9 +1106,15 @@ export class Vfs {
     const queue: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }];
     let visited = 0;
     let undecided = 0;
+    let unreadable = 0;
+    let firstFailure: string | undefined;
     const contentNeeded = requiresContent(query);
 
     while (queue.length > 0 && visited < maxNodes && matches.length < limit) {
+      // Checked every iteration, not just handed to the provider: a walk can spend
+      // minutes on a mailbox, and a Ctrl-C that only takes effect if the backend happens
+      // to honour signals is not a working Ctrl-C.
+      options.signal?.throwIfAborted();
       const current = queue.shift();
       if (current === undefined) break;
       if (current.depth > maxDepth) continue;
@@ -848,8 +1125,13 @@ export class Vfs {
           limit: 200,
           ...(options.signal === undefined ? {} : { signal: options.signal }),
         });
-      } catch {
-        // One unreadable subtree (permissions, a revoked scope) must not abort the search.
+      } catch (error) {
+        // One unreadable subtree (permissions, a revoked scope, a feed that will not
+        // answer) must not abort the search — but it must not vanish either, or a
+        // partial answer is indistinguishable from a complete one. Count it and go on.
+        if (isAbortError(error)) throw error;
+        unreadable += 1;
+        firstFailure ??= describeError(error);
         continue;
       }
 
@@ -874,6 +1156,8 @@ export class Vfs {
       undecided: contentNeeded ? undecided : 0,
       stale: false,
       total: matches.length,
+      ...(unreadable === 0 ? {} : { unreadable }),
+      ...(firstFailure === undefined ? {} : { unreadableError: firstFailure }),
     };
   }
 
@@ -896,6 +1180,51 @@ function decodeOffsetCursor(cursor: string | undefined): number | undefined {
   if (cursor === undefined || !cursor.startsWith(OFFSET_PREFIX)) return undefined;
   const value = Number(cursor.slice(OFFSET_PREFIX.length));
   return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** Raised when a source misses its deadline; never escapes `#searchOneSource`. */
+class SourceTimeout extends Error {
+  constructor() {
+    super('Source timed out.');
+    this.name = 'SourceTimeout';
+  }
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+/**
+ * True for a cancellation rather than a failure.
+ *
+ * A walk swallows failures so one bad folder cannot cost you the rest, but cancellation
+ * is not a failure — it is the caller changing their mind, and continuing to walk after
+ * it would ignore the only instruction that matters.
+ */
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+}
+
+/**
+ * Order merged hits by relevance.
+ *
+ * Across four unrelated backends there is no shared natural order — a mail folder's
+ * order, a chat's order and a repository's order have nothing to say to each other — so
+ * the query itself has to supply one. Ties break on recency and then on path, because a
+ * search whose result order changes between two identical runs is unusable for someone
+ * reading it one line at a time.
+ */
+export function rankHits(nodes: readonly VNode[], query: Query): VNode[] {
+  const scored = nodes.map((node, index) => ({ node, index, score: scoreQuery(query, node) }));
+  scored.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
+    const recency = (b.node.mtime?.getTime() ?? 0) - (a.node.mtime?.getTime() ?? 0);
+    if (recency !== 0) return recency;
+    const path = (a.node.path ?? a.node.name).localeCompare(b.node.path ?? b.node.name);
+    return path !== 0 ? path : a.index - b.index;
+  });
+  return scored.map((entry) => entry.node);
 }
 
 export function sortNodes(nodes: readonly VNode[], sort: SortSpec): VNode[] {

@@ -18,11 +18,13 @@ import {
   MATCH_ALL,
   evaluateQuery,
   isMatchAll,
+  parseDateBoundEnd,
   parseDateValue,
   parseQuery,
   parseSizeValue,
   queryFields,
   requiresContent,
+  scoreQuery,
   stringifyQuery,
   tokenizeQuery,
 } from '../query.js';
@@ -284,4 +286,173 @@ describe('value parsing', () => {
     assert.equal(parseSizeValue('2m'), 2 * 1024 * 1024);
     assert.equal(parseSizeValue('512'), 512);
   });
+
+  it('treats a partial date as the period it names, not the instant it starts', () => {
+    // `date:<=2026-01` must include the whole of January. Taking the literal instant
+    // would silently drop 30 days of mail, and the user has no way to see that happen.
+    // The edges are local, because the month a user means is the month where they are.
+    assert.equal(parseDateBoundEnd('2026-01').getTime(), new Date(2026, 1, 1).getTime());
+    assert.equal(parseDateBoundEnd('2026').getTime(), new Date(2027, 0, 1).getTime());
+    assert.equal(parseDateBoundEnd('2026-01-31').getTime(), new Date(2026, 1, 1).getTime());
+  });
 });
+
+// ---------------------------------------------------------------------------
+// Lucene syntax
+// ---------------------------------------------------------------------------
+
+/**
+ * Every Lucene form is checked for three things at once: that it parses, that it decides
+ * the same way a user would expect, and that it survives `stringifyQuery`.
+ *
+ * The third is not cosmetic. The engine compares stringified queries to decide whether a
+ * provider really applied a filter server-side, so a modifier that vanishes on the round
+ * trip makes two different queries look identical — and the engine then trusts a filter
+ * that was never applied and hides mail without saying so.
+ */
+describe('Lucene syntax', () => {
+  const target = node();
+
+  function roundTrip(text: string): string {
+    const once = stringifyQuery(parseQuery(text));
+    assert.equal(stringifyQuery(parseQuery(once)), once, `"${text}" did not survive the round trip`);
+    return once;
+  }
+
+  it('matches wildcards, and keeps them through the round trip', () => {
+    assert.equal(evaluateQuery(parseQuery('subject:budg*'), target), true);
+    assert.equal(evaluateQuery(parseQuery('subject:bud?et'), target), true);
+    assert.equal(evaluateQuery(parseQuery('subject:xylo*'), target), false);
+    assert.equal(roundTrip('subject:budg*'), 'subject:budg*');
+    assert.equal(roundTrip('subject:bud?et'), 'subject:bud?et');
+  });
+
+  it('anchors a wildcard to whole words, so `budg*` is not a bare substring search', () => {
+    // Otherwise `subject:budg*` would match "rebudgeting", and the user who typed a
+    // wildcard to be *more* precise would get less precision than typing nothing.
+    assert.equal(evaluateQuery(parseQuery('subject:udget*'), target), false);
+  });
+
+  it('finds a misspelling with fuzzy search', () => {
+    assert.equal(evaluateQuery(parseQuery('budgt~'), target), true);
+    assert.equal(evaluateQuery(parseQuery('budgt~1'), target), true);
+    assert.equal(evaluateQuery(parseQuery('zzzzzz~1'), target), false);
+    assert.equal(roundTrip('budgt~1'), 'budgt~1');
+    assert.equal(roundTrip('budgt~'), 'budgt~2', 'a bare ~ means the Lucene default of 2');
+  });
+
+  it('grades fuzzy hits by the misspelling, not by the budget allowed', () => {
+    // `budgt~1` and `budgt~2` found the same word by the same margin. Scoring them
+    // differently would reorder results based on a number the user typed for safety.
+    assert.equal(scoreQuery(parseQuery('budgt~1'), target), scoreQuery(parseQuery('budgt~2'), target));
+  });
+
+  it('matches a proximity phrase within the given slop', () => {
+    assert.equal(evaluateQuery(parseQuery('"FY26 review"~3'), target), true);
+    assert.equal(evaluateQuery(parseQuery('"FY26 review"~0'), target), false, 'the words are not adjacent');
+    assert.equal(roundTrip('"FY26 review"~3'), '"FY26 review"~3');
+  });
+
+  it('matches a proximity phrase whichever order the words appear in', () => {
+    // Someone typing `"budget review"~5` is asking whether the two words are near each
+    // other. Text reading "review the budget" is exactly what they wanted, and making
+    // them guess the author's word order turns a search into a false negative.
+    const summary = node({ title: 'Offsite', summary: 'We should review the budget today.' });
+    assert.equal(evaluateQuery(parseQuery('"budget review"~4'), summary), true);
+    assert.equal(evaluateQuery(parseQuery('"review budget"~4'), summary), true);
+    assert.equal(evaluateQuery(parseQuery('"budget review"~0'), summary), false, 'slop still bounds it');
+  });
+
+  it('keeps a quoted phrase a phrase even with a trailing slop marker', () => {
+    const tokens = tokenizeQuery('"budget review"~5');
+    assert.equal(tokens.length, 1);
+    assert.equal(tokens[0]?.quoted, true);
+  });
+
+  it('lowers a range into the two comparisons it already means', () => {
+    // A dedicated range node would make every provider, every push-down translator and
+    // the exec JSON protocol learn a third shape meaning what two existing shapes mean.
+    assert.equal(roundTrip('size:[1k TO 10M]'), 'size:>=1k size:<=10M');
+    assert.equal(roundTrip('size:{1k TO 10M}'), 'size:>1k size:<10M');
+    assert.equal(roundTrip('date:[2026-01-01 TO *]'), 'date:>=2026-01-01');
+    assert.equal(roundTrip('date:[* TO 2026-12-31]'), 'date:<=2026-12-31');
+    assert.equal(evaluateQuery(parseQuery('size:[1k TO 10M]'), target), true);
+    assert.equal(evaluateQuery(parseQuery('size:[10M TO 20M]'), target), false);
+  });
+
+  it('rejects an unbounded range instead of quietly matching everything', () => {
+    assert.throws(() => parseQuery('size:[* TO *]'), /EINVAL|bound/i);
+  });
+
+  it('does not mistake a bracketed value for a range', () => {
+    // `subject:[urgent]` is a real thing people type. Only a literal " TO " makes a range.
+    assert.equal(roundTrip('subject:[urgent]'), 'subject:"[urgent]"');
+  });
+
+  it('accepts +, -, &&, || and ! as the operators Lucene users expect', () => {
+    assert.equal(roundTrip('+is:unread -is:read'), 'is:unread NOT is:read');
+    assert.equal(roundTrip('is:unread && subject:budget'), 'is:unread subject:budget');
+    assert.equal(roundTrip('nothing || subject:budget'), 'nothing OR subject:budget');
+    assert.equal(roundTrip('!is:read'), 'NOT is:read');
+    assert.equal(evaluateQuery(parseQuery('+is:unread -is:read'), target), true);
+    assert.equal(evaluateQuery(parseQuery('is:unread && subject:budget'), target), true);
+    assert.equal(evaluateQuery(parseQuery('!is:read'), target), true);
+  });
+
+  it('treats an escaped operator as an ordinary word', () => {
+    // Otherwise a user searching for the literal text "AND" cannot express it at all.
+    const query = parseQuery('a \\AND b');
+    assert.equal(stringifyQuery(query), 'a AND b'.replace('AND', '"AND"'));
+  });
+
+  it('escapes a wildcard so it can be searched for literally', () => {
+    assert.equal(evaluateQuery(parseQuery('subject:bud\\*et'), target), false);
+    assert.equal(evaluateQuery(parseQuery('subject:bud*et'), target), true);
+    assert.equal(roundTrip('subject:bud\\*et'), 'subject:"bud*et"');
+  });
+
+  it('boosts a clause, and a whole group', () => {
+    assert.equal(roundTrip('subject:budget^3'), 'subject:budget^3');
+    assert.equal(roundTrip('(subject:budget OR subject:forecast)^2'), '(subject:budget OR subject:forecast)^2');
+    assert.ok(
+      scoreQuery(parseQuery('subject:budget^3'), target) > scoreQuery(parseQuery('subject:budget'), target),
+      'a boost must actually change the score, or it is decoration',
+    );
+  });
+
+  it('does not let a boost change whether something matched', () => {
+    // Boosting is about order. If it could also decide membership, a user raising the
+    // weight of one clause would silently lose results from another.
+    assert.equal(
+      evaluateQuery(parseQuery('subject:budget^9'), target),
+      evaluateQuery(parseQuery('subject:budget'), target),
+    );
+  });
+});
+
+describe('scoreQuery', () => {
+  it('ranks an exact title above a word above a substring', () => {
+    const query = parseQuery('budget');
+    const exact = scoreQuery(query, node({ title: 'budget' }));
+    const word = scoreQuery(query, node({ title: 'FY26 budget review' }));
+    const inside = scoreQuery(query, node({ title: 'Re: rebudgeting later' }));
+    assert.ok(exact > word, 'an exact title is the best possible match');
+    assert.ok(word > inside, 'a whole word beats a fragment of a longer word');
+    assert.ok(inside > 0, 'a fragment still matched, so it still scores');
+  });
+
+  it('never scores something it also says does not match', () => {
+    // A result at the top of the list that the tool separately claims is not a match is
+    // the kind of contradiction that makes a user stop trusting the whole thing.
+    const query = parseQuery('subject:xylophone');
+    const item = node();
+    assert.equal(evaluateQuery(query, item), false);
+    assert.equal(scoreQuery(query, item), 0);
+  });
+
+  it('gives every item the same score for match-all, so ranking falls through to recency', () => {
+    assert.equal(scoreQuery(MATCH_ALL, node({ title: 'a' })), scoreQuery(MATCH_ALL, node({ title: 'b' })));
+  });
+});
+
+
