@@ -32,6 +32,18 @@ export interface DeviceCodeAuthOptions {
   readonly logger: Logger;
   /** Where to show the device code. Defaults to stderr. */
   readonly prompt?: (message: string, verificationUri: string, userCode: string) => void;
+  /**
+   * Environment variable holding an externally-supplied access token, checked before any
+   * cached or fresh token. Defaults to `MSCOMMS_GRAPH_TOKEN`.
+   *
+   * It is a parameter rather than a constant because the flow is reused for resources that
+   * are not Microsoft Graph. An access token is audience-bound: handing a Graph token to
+   * Azure DevOps produces a 401 that looks exactly like an expired sign-in, so each
+   * resource reads its own variable and one escape hatch cannot silently break another.
+   */
+  readonly tokenEnvVar?: string;
+  /** State-store key the token set is cached under. Defaults to `graph:tokens`. */
+  readonly stateKey?: string;
 }
 
 interface TokenSet {
@@ -61,16 +73,21 @@ export const DEFAULT_SCOPES = [
 ];
 
 const STATE_KEY = 'graph:tokens';
+const TOKEN_ENV_VAR = 'MSCOMMS_GRAPH_TOKEN';
 
 export class DeviceCodeAuthenticator {
   readonly #options: DeviceCodeAuthOptions;
   readonly #authority: string;
+  readonly #stateKey: string;
+  readonly #tokenEnvVar: string;
   #tokens: TokenSet | undefined;
   #inFlight: Promise<string> | undefined;
 
   constructor(options: DeviceCodeAuthOptions) {
     this.#options = options;
     this.#authority = (options.authority ?? 'https://login.microsoftonline.com').replace(/\/+$/, '');
+    this.#stateKey = options.stateKey ?? STATE_KEY;
+    this.#tokenEnvVar = options.tokenEnvVar ?? TOKEN_ENV_VAR;
   }
 
   /**
@@ -81,7 +98,7 @@ export class DeviceCodeAuthenticator {
    * prompts, which is both confusing and a good way to get throttled.
    */
   async getToken(): Promise<string> {
-    const external = process.env['MSCOMMS_GRAPH_TOKEN'];
+    const external = process.env[this.#tokenEnvVar];
     if (external !== undefined && external.length > 0) return external;
 
     if (this.#inFlight !== undefined) return this.#inFlight;
@@ -93,7 +110,7 @@ export class DeviceCodeAuthenticator {
 
   async signOut(): Promise<void> {
     this.#tokens = undefined;
-    await this.#options.state.delete(STATE_KEY);
+    await this.#options.state.delete(this.#stateKey);
   }
 
   async #acquire(): Promise<string> {
@@ -122,7 +139,7 @@ export class DeviceCodeAuthenticator {
   }
 
   async #load(): Promise<TokenSet | undefined> {
-    const raw = await this.#options.state.get(STATE_KEY);
+    const raw = await this.#options.state.get(this.#stateKey);
     if (raw === undefined) return undefined;
     try {
       const parsed = JSON.parse(raw) as TokenSet;
@@ -137,7 +154,7 @@ export class DeviceCodeAuthenticator {
 
   async #save(tokens: TokenSet): Promise<void> {
     this.#tokens = tokens;
-    await this.#options.state.set(STATE_KEY, JSON.stringify(tokens));
+    await this.#options.state.set(this.#stateKey, JSON.stringify(tokens));
   }
 
   get #scopeString(): string {

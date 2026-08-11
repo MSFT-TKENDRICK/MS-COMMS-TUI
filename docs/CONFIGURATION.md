@@ -164,6 +164,54 @@ Plus every `graph-mail` authentication option. Teams scopes such as
 degrades to what it can reach rather than failing outright, and `mounts` reports the
 reduced capability set.
 
+### `ado-boards` — Azure DevOps Boards
+
+Projects, teams, boards and columns become directories; work items become files.
+
+```
+/ado/Contoso/Platform Team/Stories/Active/2026-08-11 #1234 Ship the thing.md
+/ado/Contoso/Assigned to me/2026-08-11 #1234 Ship the thing.md
+```
+
+The column level is the point: "what is in Active" becomes `ls` rather than a query. Every
+project also gets an `Assigned to me` folder, which is the view most people actually open
+Azure DevOps for.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `organization` | string | — | Organization name, e.g. `contoso`. Required unless `orgUrl` is set. |
+| `orgUrl` | string | — | Full collection URL. Required for Azure DevOps Server; overrides `organization`. |
+| `projects` | string[] | every visible project | Restricting this also skips discovery, so a project-scoped PAT works. |
+| `teams` | string[] | every visible team | Restrict to these team names. |
+| `boards` | string[] | every board | Restrict to these board names, e.g. `["Stories"]`. |
+| `auth` | `"auto"` \| `"pat"` \| `"aad"` | `"auto"` | See below. |
+| `token` | string | — | A PAT. Use `${env:AZURE_DEVOPS_EXT_PAT}`. |
+| `clientId` | string | Azure CLI public client | Your own app registration, if the default is blocked. |
+| `tenantId` | string | `common` | Single-tenant directory ID. |
+| `authority` | string | login.microsoftonline.com | Sovereign or national clouds. |
+| `includeAssignedToMe` | boolean | `true` | Add an `Assigned to me` folder to every project. |
+| `includeComments` | boolean | `true` | Append the discussion when reading a work item. |
+| `pageSize` | number | 50 | Work items fetched per request. |
+| `maxItems` | number | 1000 | Hard cap per listing. Guards against a 20,000-item board. |
+| `apiVersion` | string | `7.1` | Only worth changing for an older Azure DevOps Server. |
+| `timeoutMs` | number | 30000 | Per-request timeout. |
+
+`auth` defaults to `auto`: use a personal access token if one is available, otherwise sign
+in interactively with the device code flow. That order matters for CI, where a device code
+prompt would hang a pipeline forever with no terminal to read the code from. A PAT is looked
+for in `token` first, then `AZURE_DEVOPS_EXT_PAT`, `AZURE_DEVOPS_PAT` and
+`SYSTEM_ACCESSTOKEN` — so a machine already set up for `az devops`, or a pipeline step with
+the job token enabled, needs no extra configuration. The token needs only the
+**Work items (read)** scope.
+
+Interactive sign-in reuses the same device code flow as the Graph mounts, but Azure DevOps
+is a different *resource*: a separate token is cached under `MSCOMMS_ADO_TOKEN`, and signing
+out of one does not sign you out of the other.
+
+Filters push down into WIQL where they can be translated exactly — `find . -q "after:7d"`
+becomes a server-side date bound — and are applied locally otherwise. Nothing is ever
+claimed as filtered unless it was, so a narrower result is never a silently shorter one.
+
 ### `exec` — any program, any language
 
 | Option | Type | Default | Meaning |
@@ -187,6 +235,7 @@ Never write a token into the file. Two indirections are resolved at use time:
 ```jsonc
 "token": "${env:GITHUB_TOKEN}"          // read from the environment
 "token": "${file:~/.config/gh-token}"   // read from a file, trimmed
+"token": "${env:AZURE_DEVOPS_EXT_PAT}"  // the same indirection, any provider
 ```
 
 `${file:...}` accepts `~`, absolute and relative paths, and suits both

@@ -1,7 +1,8 @@
 # MS-COMMS-TUI
 
-Browse Outlook mail, Microsoft Teams chats, GitHub issues, RSS feeds and anything else you
-can write forty lines of script for — as folders and files, from the keyboard.
+Browse Outlook mail, Microsoft Teams chats, GitHub issues, Azure DevOps boards, RSS feeds
+and anything else you can write forty lines of script for — as folders and files, from the
+keyboard.
 
 ```
 /> cd /demo-mail/Inbox
@@ -42,9 +43,9 @@ terminal client for Microsoft Teams or Outlook — wrappers, raw API CLIs and we
 but no real TUI. See [docs/PRIOR-ART.md](docs/PRIOR-ART.md) for that survey and the
 learnings taken from twenty-odd adjacent projects.
 
-**Everything is the same shape.** Mail, chats, issues and feeds are all "a stream of
-authored, timestamped, sometimes-unread things, grouped somehow". Modelling them once and
-writing the interface once means a new backend is a plugin, not a fork.
+**Everything is the same shape.** Mail, chats, issues, work items and feeds are all "a
+stream of authored, timestamped, sometimes-unread things, grouped somehow". Modelling them
+once and writing the interface once means a new backend is a plugin, not a fork.
 
 ## Install
 
@@ -88,6 +89,8 @@ A minimal config:
     { "id": "teams",  "path": "/teams",  "type": "graph-chat" },
     { "id": "gh",     "path": "/gh",     "type": "github",
       "options": { "repos": ["octocat/hello-world"], "token": "${env:GITHUB_TOKEN}" } },
+    { "id": "ado",    "path": "/ado",    "type": "ado-boards",
+      "options": { "organization": "contoso", "token": "${env:AZURE_DEVOPS_EXT_PAT}" } },
     { "id": "news",   "path": "/news",   "type": "rss",
       "options": { "feeds": [{ "url": "https://example.com/feed.xml", "name": "Example" }] } }
   ]
