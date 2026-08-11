@@ -198,6 +198,60 @@ const TREE: readonly Item[] = [
   },
 ];
 
+/**
+ * A provider whose tree is not a tree.
+ *
+ * This is the shape of the people graph: Ada's `manager/` holds Grace, and Grace's
+ * `reports/` holds Ada, so every node is reachable by unboundedly many paths. The
+ * fallback search has to cope with that, and the two cases it must get right — one hit
+ * per item, and a bounded number of listings — are what the tests below check.
+ */
+class CyclicProvider implements Provider {
+  readonly id = 'cyclic';
+  readonly displayName = 'Cyclic';
+  readonly capabilities = new Set<Capability>(['list']);
+
+  listCalls = 0;
+
+  static readonly #CHILDREN: ReadonlyMap<string, readonly VNode[]> = new Map([
+    ['', [dir('ada', 'person:ada', 'Ada Lovelace'), dir('grace', 'person:grace', 'Grace Hopper')]],
+    [
+      'person:ada',
+      [
+        dir('manager', 'facet:ada:manager', 'Manager'),
+        dir('reports', 'facet:ada:reports', 'Reports'),
+        file('note.eml', 'msg:ada', 'Budget review'),
+      ],
+    ],
+    [
+      'person:grace',
+      [
+        dir('manager', 'facet:grace:manager', 'Manager'),
+        dir('reports', 'facet:grace:reports', 'Reports'),
+        file('note.eml', 'msg:grace', 'Lunch plans'),
+      ],
+    ],
+    ['facet:ada:manager', [dir('grace', 'person:grace', 'Grace Hopper')]],
+    ['facet:ada:reports', []],
+    ['facet:grace:manager', []],
+    ['facet:grace:reports', [dir('ada', 'person:ada', 'Ada Lovelace')]],
+  ]);
+
+  list(parent: VNode | null): Promise<ListPage> {
+    this.listCalls += 1;
+    const entries = CyclicProvider.#CHILDREN.get(parent?.id ?? '') ?? [];
+    return Promise.resolve({ entries, total: entries.length });
+  }
+}
+
+function dir(name: string, id: string, title: string): VNode {
+  return { name, id, kind: 'dir', title };
+}
+
+function file(name: string, id: string, title: string): VNode {
+  return { name, id, kind: 'file', title };
+}
+
 // ---------------------------------------------------------------------------
 
 describe('Vfs: mounting', () => {
@@ -441,6 +495,25 @@ describe('Vfs: search', () => {
     mountStub(vfs, { tree: TREE });
     const result = await vfs.search('/m', MATCH_ALL);
     assert.ok(result.entries.length >= 4);
+  });
+
+  it('reports one hit per item when the same item is reachable by many paths', async () => {
+    // The people graph is cyclic on purpose. Before this, one unread message showed up
+    // nine times in `find` output — once per route the walk happened to take to it.
+    const vfs = new Vfs();
+    vfs.mount({ path: '/p', id: 'cyclic', provider: new CyclicProvider() });
+    const result = await vfs.search('/p', parseQuery('budget'));
+    assert.deepEqual(result.entries.map((entry) => entry.id), ['msg:ada']);
+  });
+
+  it('walks each directory of a cyclic mount once instead of chasing the cycle', async () => {
+    const vfs = new Vfs();
+    const provider = new CyclicProvider();
+    vfs.mount({ path: '/p', id: 'cyclic', provider });
+    await vfs.search('/p', MATCH_ALL);
+    // Root, two people, four facets. Anything more means the walk went round the loop,
+    // burning the node budget on directories it had already read.
+    assert.equal(provider.listCalls, 7);
   });
 });
 

@@ -411,7 +411,9 @@ export const demoCommand: Command = {
   flags: [{ name: 'reset', description: 'Remove the demo mounts again.' }],
   async run(session, args) {
     if (flagBool(args, 'reset')) {
-      for (const path of ['/demo-mail', '/demo-chat', '/demo-issues']) await session.vfs.unmount(path);
+      for (const path of ['/demo-mail', '/demo-chat', '/demo-issues', '/demo-people']) {
+        await session.vfs.unmount(path);
+      }
       session.print('Removed the demo mounts.');
       return;
     }
@@ -428,6 +430,7 @@ export const demoCommand: Command = {
         { path: '/demo-mail', type: 'memory', options: { fixture: 'mail' }, description: 'Sample mailbox' },
         { path: '/demo-chat', type: 'memory', options: { fixture: 'chat' }, description: 'Sample chats' },
         { path: '/demo-issues', type: 'memory', options: { fixture: 'issues' }, description: 'Sample issues' },
+        { path: '/demo-people', type: 'memory', options: { fixture: 'people' }, description: 'Sample org chart' },
       ],
       {
         registry: session.registry,
@@ -442,8 +445,9 @@ export const demoCommand: Command = {
     }
     // Confirmation, not data: `demo` produces no records, so this belongs on the same
     // stream as the hint that follows it.
-    session.status('Mounted /demo-mail, /demo-chat and /demo-issues.');
+    session.status('Mounted /demo-mail, /demo-chat, /demo-issues and /demo-people.');
     session.status('Try: `cd /demo-mail` then `ls`, then `cat 3`.');
+    session.status('Or walk the org chart: `cd /demo-people/Me` then `ls`, then `cd manager`.');
   },
 };
 

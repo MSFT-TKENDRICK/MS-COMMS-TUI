@@ -49,9 +49,24 @@ interface TokenSet {
  */
 export const DEFAULT_CLIENT_ID = '14d82eec-204b-4c2f-b7e8-296a70dab67e';
 
+/**
+ * Scopes requested at login.
+ *
+ * This is one shared list rather than per-provider sets on purpose: `shared.ts` caches
+ * authenticators by scope-set key, so a mail mount and a people mount asking for different
+ * scopes would produce two device-code prompts for the same person. Everything any built-in
+ * Graph provider needs to *read* is therefore requested once, up front.
+ *
+ * Writing scopes (`Mail.Send`, `Chat.ReadWrite`, `ChatMessage.Send`) are deliberately absent.
+ * A tool that can read your mail is a very different proposition from one that can send as
+ * you, and consent should reflect that. Mounts with `"allowSend": true` add them via the
+ * mount's own `scopes` option.
+ */
 export const DEFAULT_SCOPES = [
   'offline_access',
   'User.Read',
+  'User.ReadBasic.All',
+  'People.Read',
   'Mail.Read',
   'MailboxSettings.Read',
   'Chat.Read',

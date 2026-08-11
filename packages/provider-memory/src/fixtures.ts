@@ -391,9 +391,428 @@ const ISSUES: MemoryItem[] = [
   },
 ];
 
+// ---------------------------------------------------------------------------
+// People — the org chart as folders
+// ---------------------------------------------------------------------------
+
+/**
+ * The people fixture mirrors the shape of the `graph-people` provider closely enough to
+ * learn the navigation on, without a tenant: sections at the root, a folder per person,
+ * and inside it a profile, the three hierarchy facets, and a merged list of every mail and
+ * chat exchanged with them.
+ *
+ * Two honest differences from the real thing, both consequences of the fixture engine
+ * being deliberately simple. It sorts strictly by recency, so the priority order is faked
+ * here by giving the messages that would rank first the most recent timestamps. And the
+ * hierarchy is a finite tree rather than the real provider's cycle, because a fixture is
+ * an eagerly indexed map and cannot contain one.
+ */
+interface DemoPerson {
+  readonly id: string;
+  readonly name: string;
+  readonly title: string;
+  readonly address: string;
+  readonly department: string;
+  readonly office: string;
+  readonly managerId?: string;
+  readonly reportIds?: readonly string[];
+  readonly external?: boolean;
+}
+
+const ME = 'alex';
+
+const STAFF: readonly DemoPerson[] = [
+  {
+    id: 'morgan',
+    name: 'Morgan Ellis',
+    title: 'Chief Technology Officer',
+    address: 'morgan.ellis@contoso.example',
+    department: 'Technology',
+    office: 'Seattle / 21-1100',
+    reportIds: ['dana'],
+  },
+  {
+    id: 'dana',
+    name: 'Dana Whitfield',
+    title: 'Director of Engineering',
+    address: 'dana.whitfield@contoso.example',
+    department: 'Platform',
+    office: 'Seattle / 18-2140',
+    managerId: 'morgan',
+    reportIds: [ME, 'priya', 'tom'],
+  },
+  {
+    id: ME,
+    name: 'Alex Kimura',
+    title: 'Principal Engineer',
+    address: 'alex.kimura@contoso.example',
+    department: 'Platform',
+    office: 'Seattle / 18-2208',
+    managerId: 'dana',
+    reportIds: ['lena', 'sam'],
+  },
+  {
+    id: 'priya',
+    name: 'Priya Raman',
+    title: 'Engineering Manager',
+    address: 'priya.raman@contoso.example',
+    department: 'Platform',
+    office: 'Bengaluru / 4-330',
+    managerId: 'dana',
+  },
+  {
+    id: 'tom',
+    name: 'Tom Okafor',
+    title: 'Staff Engineer',
+    address: 'tom.okafor@contoso.example',
+    department: 'Platform',
+    office: 'Lagos / 2-014',
+    managerId: 'dana',
+  },
+  {
+    id: 'lena',
+    name: 'Lena Björk',
+    title: 'Senior Engineer',
+    address: 'lena.bjork@contoso.example',
+    department: 'Platform',
+    office: 'Stockholm / 6-118',
+    managerId: ME,
+  },
+  {
+    id: 'sam',
+    name: 'Sam Ito',
+    title: 'Engineer',
+    address: 'sam.ito@contoso.example',
+    department: 'Platform',
+    office: 'Tokyo / 9-405',
+    managerId: ME,
+  },
+  {
+    id: 'jordan',
+    name: 'Jordan Reyes',
+    title: 'Partner Solutions Architect',
+    address: 'jordan.reyes@fabrikam.example',
+    department: 'Fabrikam',
+    office: 'Remote',
+    external: true,
+  },
+];
+
+function staff(id: string): DemoPerson {
+  const found = STAFF.find((person) => person.id === id);
+  if (found === undefined) throw new Error(`Demo fixture references unknown person "${id}".`);
+  return found;
+}
+
+/** One exchanged message, already in the order the real provider would rank it. */
+interface DemoComm {
+  readonly channel: 'Mail' | 'Chat';
+  readonly subject: string;
+  readonly flags: readonly string[];
+  readonly body: string;
+}
+
+const CONVERSATIONS: Readonly<Record<string, readonly DemoComm[]>> = {
+  dana: [
+    {
+      channel: 'Mail',
+      subject: 'Re: Platform review — can you take the Thursday slot?',
+      flags: ['unread', 'unanswered', 'important'],
+      body: [
+        'Alex,',
+        '',
+        'Morgan wants the platform review moved to Thursday and I would rather you presented',
+        'the reliability numbers than me. Twenty minutes, no deck required.',
+        '',
+        'Can you take it?',
+        '',
+        'Dana',
+      ].join('\n'),
+    },
+    {
+      channel: 'Chat',
+      subject: 'did you see the incident review notes?',
+      flags: ['unread', 'unanswered'],
+      body: 'did you see the incident review notes? the timeline section needs your eyes before I send it up',
+    },
+    {
+      channel: 'Mail',
+      subject: 'Headcount plan for next half',
+      flags: ['unanswered'],
+      body: [
+        'Draft attached. I have pencilled you in for two additions rather than three, on the',
+        'assumption that the migration lands. Push back if that is wrong.',
+        '',
+        'Dana',
+      ].join('\n'),
+    },
+    {
+      channel: 'Mail',
+      subject: 'Re: One-to-one notes',
+      flags: ['sent'],
+      body: 'Thanks — agreed on all three. I will start on the second one this week.',
+    },
+  ],
+  priya: [
+    {
+      channel: 'Chat',
+      subject: '@Alex Kimura can you review the budget split?',
+      flags: ['unread', 'unanswered', 'mention'],
+      body: '@Alex Kimura can you review the budget split before I send it to Dana? mostly want a sanity check on the tooling line',
+    },
+    {
+      channel: 'Mail',
+      subject: 'FY26 budget review — please read before Thursday',
+      flags: ['unread', 'important', 'attachment'],
+      body: [
+        'Hi all,',
+        '',
+        'The revised FY26 numbers are attached. Headcount moved from Q2 to Q3 and the tooling',
+        'line item is now split by team.',
+        '',
+        'Priya',
+      ].join('\n'),
+    },
+    {
+      channel: 'Mail',
+      subject: 'Re: Migration sequencing',
+      flags: ['sent'],
+      body: 'Sequencing looks right to me. The only ordering I feel strongly about is that the read path moves first.',
+    },
+  ],
+  jordan: [
+    {
+      channel: 'Mail',
+      subject: 'Integration questions before the pilot',
+      flags: ['unread', 'unanswered', 'external'],
+      body: [
+        'Hi Alex,',
+        '',
+        'Three questions before we start the pilot next month:',
+        '',
+        '  1. Is the rate limit per tenant or per application?',
+        '  2. Do you support webhook replay?',
+        '  3. Who signs off on the data-handling addendum?',
+        '',
+        'Jordan Reyes',
+        'Fabrikam',
+      ].join('\n'),
+    },
+    {
+      channel: 'Mail',
+      subject: 'Re: Kickoff scheduling',
+      flags: ['external', 'sent'],
+      body: 'Either the 12th or the 14th works for us. Happy to host.',
+    },
+  ],
+  lena: [
+    {
+      channel: 'Chat',
+      subject: 'pushed the retry fix, want a second pair of eyes',
+      flags: ['unread', 'unanswered'],
+      body: 'pushed the retry fix, want a second pair of eyes on the backoff maths before I merge',
+    },
+    {
+      channel: 'Mail',
+      subject: 'Re: Holiday cover',
+      flags: [],
+      body: 'That works. I will pick up the on-call week and hand back on the 30th.',
+    },
+  ],
+  sam: [
+    {
+      channel: 'Mail',
+      subject: 'Question about the caching layer',
+      flags: ['unanswered'],
+      body: 'Is the cache meant to be authoritative for reads after a write, or is a stale read acceptable for a few seconds?',
+    },
+    {
+      channel: 'Chat',
+      subject: 'thanks for the walkthrough',
+      flags: [],
+      body: 'thanks for the walkthrough earlier, that made the ownership boundaries much clearer',
+    },
+  ],
+  tom: [
+    {
+      channel: 'Mail',
+      subject: 'Re: Deprecation timeline',
+      flags: ['sent'],
+      body: 'Agreed. Six months of overlap, then we remove it. I will write the announcement.',
+    },
+  ],
+  morgan: [
+    {
+      channel: 'Mail',
+      subject: 'Platform review — Thursday',
+      flags: [],
+      body: 'Looking forward to it. Keep it to the numbers and what you would change.',
+    },
+  ],
+};
+
+function profileItem(person: DemoPerson, prefix: string): MemoryItem {
+  const manager = person.managerId === undefined ? undefined : staff(person.managerId);
+  const reports = (person.reportIds ?? []).map((id) => staff(id).name);
+  return {
+    id: `${prefix}:profile`,
+    title: 'profile',
+    subtype: 'profile',
+    agoMinutes: 0,
+    format: 'markdown',
+    summary: `${person.title} — ${person.address}`,
+    body: [
+      `# ${person.name}`,
+      '',
+      `${person.title}${person.external === true ? ' (external)' : ''}`,
+      '',
+      `- Email: ${person.address}`,
+      `- Department: ${person.department}`,
+      `- Office: ${person.office}`,
+      `- Manager: ${manager?.name ?? 'none on record'}`,
+      `- Direct reports: ${reports.length === 0 ? 'none' : reports.join(', ')}`,
+      '',
+      person.external === true
+        ? 'This person is outside your organisation, so only correspondence is available — there is no hierarchy to walk.'
+        : 'Use `cd manager`, `cd reports` or `cd peers` to keep walking the org chart.',
+    ].join('\n'),
+    meta: {
+      address: person.address,
+      jobTitle: person.title,
+      department: person.department,
+      office: person.office,
+    },
+  };
+}
+
+function commsItems(person: DemoPerson, prefix: string): MemoryItem[] {
+  const conversation = CONVERSATIONS[person.id] ?? [];
+  // Ages ascend with position so that the fixture engine's recency sort reproduces the
+  // real provider's priority order: unread, then unanswered, then everything else, then
+  // things you sent.
+  return conversation.map((entry, index) => ({
+    id: `${prefix}:c${String(index)}`,
+    title: `${entry.channel} — ${entry.subject}`,
+    subtype: entry.channel === 'Chat' ? 'chat' : 'message',
+    agoMinutes: 12 + index * 47,
+    author: entry.flags.includes('sent') ? 'Alex Kimura' : person.name,
+    authorId: entry.flags.includes('sent') ? staff(ME).address : person.address,
+    ...(entry.flags.length === 0 ? {} : { flags: entry.flags }),
+    summary: entry.body.split('\n')[0]?.slice(0, 120) ?? '',
+    body: entry.body,
+    format: 'text' as const,
+    meta: { channel: entry.channel.toLowerCase(), person: person.name, personAddress: person.address },
+  }));
+}
+
+function peopleFolder(
+  id: string,
+  title: string,
+  ids: readonly string[],
+  order = 0,
+): MemoryItem {
+  return {
+    id,
+    title,
+    subtype: 'folder',
+    // The fixture engine sorts newest first, so `order` is expressed as an age: it is the
+    // only lever a fixture has for saying "these folders have a meaningful sequence".
+    agoMinutes: order,
+    refs: ids.map((personId) => `person:${personId}`),
+  };
+}
+
+/**
+ * Every person, defined exactly once.
+ *
+ * The hierarchy is then expressed entirely in references, which is what makes the demo a
+ * faithful model rather than a convenient approximation: `Colleagues/Priya Raman` and
+ * `Me/peers/Priya Raman` are not two copies of Priya, they are Priya. Her unanswered chat
+ * has one id, so `find` reports it once, `stat` agrees whichever way you walked there, and
+ * marking it read from one path marks it read from all of them.
+ *
+ * It is also genuinely cyclic — `Me/manager/Dana Whitfield/reports/` contains you — which
+ * is the one property a tree-shaped fixture could never demonstrate.
+ */
+function personItem(person: DemoPerson): MemoryItem {
+  const prefix = `person:${person.id}`;
+  const children: MemoryItem[] = [profileItem(person, prefix)];
+
+  if (person.external !== true) {
+    if (person.managerId !== undefined) {
+      children.push(peopleFolder(`${prefix}:manager`, 'manager', [person.managerId], 0));
+    }
+    if ((person.reportIds ?? []).length > 0) {
+      children.push(peopleFolder(`${prefix}:reports`, 'reports', person.reportIds ?? [], 1));
+    }
+    const manager = person.managerId === undefined ? undefined : staff(person.managerId);
+    const peers = (manager?.reportIds ?? []).filter((id) => id !== person.id);
+    if (peers.length > 0) {
+      children.push(peopleFolder(`${prefix}:peers`, 'peers', peers, 2));
+    }
+  }
+
+  children.push(...commsItems(person, prefix));
+
+  return {
+    id: prefix,
+    title: person.name,
+    subtype: 'person',
+    // A person is only as urgent as the most urgent thing they are waiting on, and the
+    // fixture engine's one ordering lever is age — so urgency is expressed as one. This is
+    // how the demo shows people ranked by what needs an answer rather than alphabetically.
+    agoMinutes: urgency(person) * 10 + STAFF.findIndex((entry) => entry.id === person.id),
+    ...(person.external === true ? { flags: ['external'] } : {}),
+    summary: `${person.title} — ${person.address}`,
+    meta: { address: person.address, jobTitle: person.title, department: person.department },
+    children,
+  };
+}
+
+/** 0 is "needs you most". Mirrors the real provider's unread-then-unanswered ranking. */
+function urgency(person: DemoPerson): number {
+  const comms = CONVERSATIONS[person.id] ?? [];
+  if (comms.some((comm) => comm.flags.includes('unread') && comm.flags.includes('unanswered'))) return 0;
+  if (comms.some((comm) => comm.flags.includes('unread'))) return 1;
+  if (comms.some((comm) => comm.flags.includes('unanswered'))) return 2;
+  return 3;
+}
+
+/**
+ * `Me` is the person directory, not a folder containing one — the same shortcut the real
+ * provider takes, because `cd Me` then `cd manager` is how you actually navigate.
+ */
+const ME_SECTION: MemoryItem = {
+  id: 'people-me',
+  title: 'Me',
+  subtype: 'section',
+  agoMinutes: 0,
+  summary: 'You: your profile, your manager and your reports.',
+  refs: (personItem(staff(ME)).children ?? []).map((child) => child.id),
+};
+
+const PEOPLE: MemoryItem[] = [
+  ME_SECTION,
+  peopleFolder('people-org', 'Org', ['dana', 'morgan'], 1),
+  peopleFolder('people-reports', 'Reports', ['lena', 'sam'], 2),
+  peopleFolder('people-colleagues', 'Colleagues', ['priya', 'tom'], 3),
+  peopleFolder('people-recent', 'Recent', ['dana', 'priya', 'jordan', 'lena', 'sam'], 4),
+  peopleFolder('people-external', 'External', ['jordan'], 5),
+  {
+    // The definitions live here, so the Directory is every person's canonical location and
+    // the path a search hit reports.
+    id: 'people-directory',
+    title: 'Directory',
+    subtype: 'folder',
+    agoMinutes: 6,
+    children: STAFF.map((person) => personItem(person)),
+  },
+];
+
 export const FIXTURES: Readonly<Record<string, readonly MemoryItem[]>> = {
   mail: MAIL,
   chat: CHAT,
   issues: ISSUES,
+  people: PEOPLE,
   empty: [],
 };

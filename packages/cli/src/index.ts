@@ -23,7 +23,7 @@ import {
 import { memoryPlugin } from '@mscomms/provider-memory';
 import { rssPlugin } from '@mscomms/provider-rss';
 import { githubPlugin } from '@mscomms/provider-github';
-import { graphMailPlugin, graphChatPlugin } from '@mscomms/provider-graph';
+import { graphMailPlugin, graphChatPlugin, graphPeoplePlugin } from '@mscomms/provider-graph';
 import { execPlugin } from '@mscomms/provider-exec';
 import { Session } from './session.js';
 import { Shell } from './shell.js';
@@ -60,6 +60,7 @@ export function builtinRegistry(logger: Logger = NULL_LOGGER): PluginRegistry {
   registry.register(githubPlugin);
   registry.register(graphMailPlugin);
   registry.register(graphChatPlugin);
+  registry.register(graphPeoplePlugin);
   registry.register(execPlugin);
   return registry;
 }

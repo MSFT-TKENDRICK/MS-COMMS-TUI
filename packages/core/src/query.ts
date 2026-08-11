@@ -612,7 +612,7 @@ export const QUERY_FIELD_HELP: ReadonlyArray<readonly [string, string]> = [
   ['author:', 'sender name or address'],
   ['subject:', 'item title'],
   ['body:', 'item body (requires fetching content)'],
-  ['is:', 'flag: unread, read, flagged, attachment, mention, draft'],
+  ['is:', 'flag: unread, read, unanswered, external, sent, flagged, attachment, mention, draft'],
   ['has:', 'alias of is:'],
   ['kind:', 'dir or file'],
   ['after:', 'newer than a date or duration, e.g. 2026-01-01 or 7d'],

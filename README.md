@@ -1,7 +1,8 @@
 # MS-COMMS-TUI
 
-Browse Outlook mail, Microsoft Teams chats, GitHub issues, RSS feeds and anything else you
-can write forty lines of script for — as folders and files, from the keyboard.
+Browse Outlook mail, Microsoft Teams chats, your org chart, GitHub issues, RSS feeds and
+anything else you can write forty lines of script for — as folders and files, from the
+keyboard.
 
 ```
 /> cd /demo-mail/Inbox
@@ -46,6 +47,29 @@ learnings taken from twenty-odd adjacent projects.
 authored, timestamped, sometimes-unread things, grouped somehow". Modelling them once and
 writing the interface once means a new backend is a plugin, not a fork.
 
+**People are a filesystem too.** `/people` mounts the corporate hierarchy as directories:
+`cd` walks up to your manager and back down through their reports, and each person's folder
+merges everything they have said to you — mail and Teams together — ordered by what you owe
+them rather than by date. Unread first, then unanswered, then everything else.
+
+```
+/> cd /people/Me/manager
+/> ls
+Dana Whitfield          unread(2) unanswered   Engineering Manager — Platform
+/> cd "Dana Whitfield"
+/> ls
+profile.md
+manager/  reports/  peers/
+2026-08-11 16:04 chat — Ping about the rollout.md     unread unanswered
+2026-08-09 08:00 mail — Budget question.eml           unread unanswered
+2026-08-10 09:00 mail — Design review.eml             unanswered
+/> do 2 reply body="Looking at it now"
+```
+
+The graph is genuinely cyclic — your manager's `reports/` contains you — and a person is one
+person however you got there, so `find /people -q "is:unanswered"` lists each thing you owe a
+reply to exactly once.
+
 ## Install
 
 Node 20.11 or newer. No third-party runtime dependencies — deliberately: this program reads
@@ -64,10 +88,11 @@ npm link        # optional: puts `mscomms` and `msh` on your PATH
 
 ```sh
 mscomms          # starts the shell
-/> demo          # mounts sample mail, chats and issues
+/> demo          # mounts sample mail, chats, issues and people
 /> ls /demo-mail/Inbox
 /> cat 3
 /> find /demo-mail -q "budget is:unread"
+/> ls /demo-people/Recent
 ```
 
 The demo data is generated in-process. No credentials, no network.
@@ -86,6 +111,7 @@ A minimal config:
   "mounts": [
     { "id": "mail",   "path": "/mail",   "type": "graph-mail" },
     { "id": "teams",  "path": "/teams",  "type": "graph-chat" },
+    { "id": "people", "path": "/people", "type": "graph-people" },
     { "id": "gh",     "path": "/gh",     "type": "github",
       "options": { "repos": ["octocat/hello-world"], "token": "${env:GITHUB_TOKEN}" } },
     { "id": "news",   "path": "/news",   "type": "rss",
@@ -162,7 +188,7 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 
 Working and tested: the VFS engine, query language, cache, notifications, the line shell,
 tab completion, the opt-in full-screen pane (`--tui`), and the memory, RSS, GitHub, Graph
-and exec providers. 642 tests.
+and exec providers. 800 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been
