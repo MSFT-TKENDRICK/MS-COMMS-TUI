@@ -255,6 +255,39 @@ export interface ActionDescriptor {
   readonly params?: readonly ActionParam[];
   /** True when the action is destructive and should require confirmation. */
   readonly destructive?: boolean;
+  /**
+   * Advertise up front that this verb cannot be taken back.
+   *
+   * Purely for what the interface can say *before* the user commits — `actions` prints it
+   * and the confirmation prompt quotes it. The authoritative answer is still
+   * {@link ActionResult.undo}, because only the call itself knows what actually changed.
+   */
+  readonly irreversible?: boolean;
+}
+
+/**
+ * How to reverse an action that has already happened.
+ *
+ * Returned by {@link ActionResult}, not declared on {@link ActionDescriptor}, and that
+ * distinction is the whole design. An inverse is not a property of a verb, it is a
+ * property of a verb *applied to a particular item at a particular moment*: "mark as
+ * read" undoes to "mark as unread" only when the message was unread to begin with, and
+ * `tag followup` undoes to `untag followup` only when the tag was not already there.
+ *
+ * The provider is the only party that knows the prior state, and it knows it at exactly
+ * one instant — while it is performing the change. Anything computed later is a guess,
+ * and a guessed undo silently writes the wrong state into somebody's mailbox.
+ *
+ * A provider that genuinely cannot reverse an action omits this. That is a supported
+ * answer, and the engine treats it as a hard stop rather than reaching past it to undo
+ * something older. See {@link Journal}.
+ */
+export interface UndoSpec {
+  /** The action to invoke to get back to the prior state. */
+  readonly action: string;
+  readonly params?: Readonly<Record<string, MetaValue>>;
+  /** Human phrase for the undo, e.g. "mark it unread again". Used in confirmations. */
+  readonly label?: string;
 }
 
 export interface ActionResult {
@@ -262,6 +295,14 @@ export interface ActionResult {
   readonly message: string;
   /** Paths whose cached state is now stale and should be invalidated. */
   readonly invalidates?: readonly string[];
+  /**
+   * The exact inverse of what this call did, when there is one.
+   *
+   * Omit it when the action changed nothing (marking an already-read message read) or
+   * when it cannot be taken back (sending a mail). Both are honest answers, and both are
+   * better than an inverse that only usually works.
+   */
+  readonly undo?: UndoSpec;
 }
 
 // ---------------------------------------------------------------------------

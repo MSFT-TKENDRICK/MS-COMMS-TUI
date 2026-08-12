@@ -83,9 +83,31 @@ export function render(state: TuiState, options: RenderOptions): string[] {
   }
 
   lines.push(rule(width, options));
-  lines.push(fit(state.status, width));
+  lines.push(fit(statusLine(state), width));
   lines.push(inputLine(state, width, options));
   return lines;
+}
+
+/**
+ * The status line, with the microphone state prepended when it is on.
+ *
+ * A recording indicator is not decoration. The one thing a user must be able to check at a
+ * glance, in a program that can hear them, is whether it is listening right now — and it has
+ * to be a word rather than a coloured dot, because the people most likely to be using voice
+ * control are the least likely to be able to see one.
+ */
+export function statusLine(state: TuiState): string {
+  switch (state.voice.phase) {
+    case 'listening':
+      return `[MIC ON] ${state.status}`;
+    case 'transcribing':
+      return `[MIC …] ${state.status}`;
+    case 'off':
+    case 'idle':
+      return state.status;
+    default:
+      return `[MIC] ${state.status}`;
+  }
 }
 
 function rule(width: number, options: RenderOptions): string {
@@ -186,6 +208,8 @@ export function renderHelp(options: RenderOptions): string[] {
     ['/', 'filter as you type (Enter keeps it, Escape clears it)'],
     [':', 'run any command \u2014 ls, find, grep, cat, open, mark, watch\u2026'],
     ['r, F5', 'refresh the current folder'],
+    ['u', 'undo the last change (anywhere \u2014 pane, shell, or voice)'],
+    ['Ctrl+Space', 'push to talk: speak one command (needs `voice on`)'],
     ['?', 'this screen'],
     ['Ctrl+C', 'always works, from any mode, even mid-filter'],
     ['q, Escape', 'leave (the folder and selection are printed on the way out)'],
@@ -201,6 +225,9 @@ export function renderHelp(options: RenderOptions): string[] {
     'Everything above is also a command, and `:` reaches the same command table as the',
     'line shell. If this pane is awkward to use, quit and run mscomms without --tui: the',
     'line shell does everything this does, in plain text, one line at a time.',
+    '',
+    'That includes speech. Voice does not drive the pane directly \u2014 it produces the same',
+    'command line you would have typed, so anything you can say, you can type and undo.',
     '',
     'Press any key to go back.',
   ]) {

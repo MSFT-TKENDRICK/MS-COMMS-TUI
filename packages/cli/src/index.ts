@@ -33,8 +33,10 @@ import { Tui } from './tui/app.js';
 import { CommandTable, parseLine, surplusMessage, tokenize } from './commands/types.js';
 import { navigationCommands } from './commands/navigate.js';
 import { graphCommands } from './commands/graph.js';
+import { journalCommands } from './commands/journal.js';
 import { readCommands } from './commands/read.js';
 import { searchCommands } from './commands/search.js';
+import { voiceCommands } from './commands/voice.js';
 import { watchCommands } from './commands/watch.js';
 import { demoCommand, systemCommands } from './commands/system.js';
 import { STARTER_CONFIG } from './starter-config.js';
@@ -53,6 +55,9 @@ export function buildCommandTable(): CommandTable {
   table.registerAll(searchCommands);
   table.registerAll(graphCommands);
   table.registerAll(watchCommands);
+  // Registered before the system group so `redo` can dispatch back into a complete table.
+  table.registerAll(journalCommands(table));
+  table.registerAll(voiceCommands(table));
   table.registerAll(systemCommands(table));
   return table;
 }
@@ -241,7 +246,7 @@ export async function main(options: CliOptions): Promise<number> {
   let config: AppConfig;
   try {
     config = globals.noConfig
-      ? { plugins: [], mounts: [], queries: [], watches: [], ui: {}, notifications: {}, keymap: {} }
+      ? { plugins: [], mounts: [], queries: [], watches: [], ui: {}, notifications: {}, voice: {}, keymap: {} }
       : await loadConfig(globals.configPath ?? paths.configFile, { required: globals.configPath !== undefined });
   } catch (error) {
     writeError(`${error instanceof Error ? error.message : String(error)}\n`);

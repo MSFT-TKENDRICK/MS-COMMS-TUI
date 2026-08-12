@@ -113,6 +113,7 @@ export class Shell {
     // the whole batch dies at the first command that awaits anything slow, and the
     // remaining lines are silently lost.
     let closed = false;
+    let pendingConfirm: ((answer: boolean) => void) | undefined;
     rl.on('close', () => {
       closed = true;
     });
@@ -126,8 +127,43 @@ export class Shell {
     // session — and its numbering — for what is usually a typo.
     rl.on('SIGINT', () => {
       session.write('\n');
+      // A Ctrl+C while a confirmation is pending is a "no". Leaving the promise unresolved
+      // would wedge the command that is waiting on it, with no way out but killing the shell.
+      if (pendingConfirm !== undefined) {
+        const resolve = pendingConfirm;
+        pendingConfirm = undefined;
+        resolve(false);
+      }
+      session.voice?.stop();
       promptAgain();
     });
+
+    // Ask a yes/no question at the prompt.
+    //
+    // The answer is intercepted by the `line` handler below rather than read with
+    // `rl.question`, which cannot be used here: readline routes questions through the same
+    // machinery the main loop is already sitting in, and the two deadlock. Routing every
+    // line through one handler and deciding there what it is for is both simpler and the
+    // reason a confirmation can be answered while a command is still running.
+    session.confirm = (question: string): Promise<boolean> => {
+      // A question nobody can answer is a "no". Saying so matters: a script that pipes
+      // commands in gets "Cancelled" for a reason that has nothing to do with what it asked,
+      // and without this it has no way to find that out.
+      if (closed || !isTty) {
+        session.status(
+          `${question} — but input is not interactive, so I cannot ask. Add \`--yes\` to the command, or run \`set voice.autoRun on\` first to let spoken changes run unconfirmed.`,
+        );
+        return Promise.resolve(false);
+      }
+      // Two questions at once cannot both own the next line. The second is refused rather
+      // than queued, because a queued confirmation would be answered by a keystroke the
+      // user aimed at the first one.
+      if (pendingConfirm !== undefined) return Promise.resolve(false);
+      session.status(`${question} [y/N]`);
+      return new Promise<boolean>((resolve) => {
+        pendingConfirm = resolve;
+      });
+    };
 
     // A live announcement of anything that arrives while the user is at the prompt. It is
     // written above the prompt line so the line being typed is never disturbed.
@@ -138,7 +174,55 @@ export class Shell {
 
     promptAgain();
 
-    for await (const line of rl) {
+    /**
+     * Lines, buffered, in arrival order.
+     *
+     * The loop used to be `for await (const line of rl)`, which reads one line only while
+     * nothing else is running. That is fine until something running needs to ask a question:
+     * the answer arrives on the same stream the loop is no longer reading, and the two wait
+     * for each other forever. Draining `line` events into a queue instead means input is
+     * always accepted, whoever happens to be waiting for it — and it also stops fast piped
+     * input from being dropped while a slow command finishes.
+     */
+    const queue: string[] = [];
+    let waiting: ((line: string | undefined) => void) | undefined;
+
+    rl.on('line', (line: string) => {
+      // A pending confirmation gets first refusal on the next line.
+      if (pendingConfirm !== undefined) {
+        const resolve = pendingConfirm;
+        pendingConfirm = undefined;
+        resolve(/^\s*(?:y|yes|yeah|yep|ok|okay)\s*$/i.test(line));
+        return;
+      }
+      if (waiting !== undefined) {
+        const resume = waiting;
+        waiting = undefined;
+        resume(line);
+        return;
+      }
+      queue.push(line);
+    });
+
+    rl.on('close', () => {
+      pendingConfirm?.(false);
+      pendingConfirm = undefined;
+      waiting?.(undefined);
+      waiting = undefined;
+    });
+
+    const nextLine = (): Promise<string | undefined> => {
+      const queued = queue.shift();
+      if (queued !== undefined) return Promise.resolve(queued);
+      if (closed) return Promise.resolve(undefined);
+      return new Promise<string | undefined>((resolve) => {
+        waiting = resolve;
+      });
+    };
+
+    for (;;) {
+      const line = await nextLine();
+      if (line === undefined) break;
       const trimmed = line.trim();
       if (trimmed !== '') {
         await this.#execute(trimmed);
@@ -149,6 +233,7 @@ export class Shell {
     }
 
     unsubscribe();
+    session.voice?.stop();
     rl.close();
     return 0;
   }

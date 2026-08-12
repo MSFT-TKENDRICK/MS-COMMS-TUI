@@ -73,6 +73,89 @@ export interface NotificationConfig {
   readonly maxEntries?: number;
 }
 
+/**
+ * Speech input.
+ *
+ * Off unless configured, and that default is not timidity. A microphone left listening in
+ * an open-plan office, in a program that has the user's mail open, is a privacy incident
+ * waiting for a quiet afternoon — so voice is opt-in, push-to-talk is the default mode,
+ * and continuous listening has to be asked for by name.
+ *
+ * Credentials follow the same rule as everywhere else in this file: `apiKey` holds a
+ * `${env:NAME}` reference, never the key itself, so a config file stays safe to commit.
+ */
+export interface VoiceConfig {
+  readonly enabled?: boolean;
+  /**
+   * Which speech-to-text backend to use.
+   *
+   * `mai` is the default: Microsoft Foundry's LLM Speech API running MAI-Transcribe-1.5.
+   * It is a different request shape from the OpenAI one — `speechtotext/transcriptions:transcribe`
+   * with a JSON `definition` part — and it is the only engine here that accepts a phrase
+   * list, which matters because the words most often spoken to this program are folder
+   * names and people's names rather than dictionary words.
+   *
+   * `foundry` is the same tenant's OpenAI-compatible surface, for a Whisper or
+   * gpt-4o-transcribe deployment. `azure-speech` is the classic Azure AI Speech REST
+   * endpoint, for tenants that already have one. `openai` covers Whisper and any other
+   * OpenAI-compatible host, `xai` covers Grok, and `command` shells out to a local binary
+   * so the audio never leaves the machine at all.
+   */
+  readonly engine?: 'mai' | 'foundry' | 'azure-speech' | 'openai' | 'xai' | 'command';
+  readonly endpoint?: string;
+  readonly model?: string;
+  /** A `${env:NAME}` reference. A literal key here is rejected at load time. */
+  readonly apiKey?: string;
+  /** BCP-47 tag, e.g. `en-US`. Sent to engines that accept a language hint. */
+  readonly language?: string;
+  readonly region?: string;
+  /** Local binary for `engine: "command"`. Receives WAV on stdin, prints the transcript. */
+  readonly command?: string;
+  readonly commandArgs?: readonly string[];
+  /** `push` waits for a key; `continuous` listens until told to stop. */
+  readonly mode?: 'push' | 'continuous';
+  /** Required prefix in continuous mode, so ambient speech is not obeyed. */
+  readonly wakeWord?: string;
+  /** Seconds of audio to capture per utterance before giving up. */
+  readonly maxSeconds?: number;
+  /** Recording program to spawn. Auto-detected when omitted. */
+  readonly recorder?: string;
+  readonly recorderArgs?: readonly string[];
+  /** Input device name to pass to the recorder. */
+  readonly device?: string;
+  /**
+   * Speak confirmations back through the operating system's own text-to-speech.
+   *
+   * The OS, deliberately, rather than a cloud voice: it works offline, adds no latency to
+   * a confirmation the user is waiting on, and keeps the contents of a mailbox off a
+   * network that speech synthesis has no reason to touch.
+   */
+  readonly speak?: boolean;
+  /**
+   * Run recognized commands without reading them back first.
+   *
+   * Off by default, and it only ever governs commands that change something — confirming
+   * every "go to inbox" would make voice slower than typing, while confirming every
+   * "archive it" is the entire safety story. Speech recognition is probabilistic, and a
+   * misheard `archive` is not a typo you can see before pressing Enter.
+   */
+  readonly autoRun?: boolean;
+  /**
+   * Send the names on screen to the recognizer as a phrase list.
+   *
+   * On by default, and only ever used by engines that support biasing. The vocabulary of a
+   * mail client is mostly proper nouns — folder names, colleagues, project code names — and
+   * a general recognizer has no reason to prefer "Contoso" over "can't so". Telling it what
+   * is actually in front of the user is the difference between voice navigation working and
+   * being a party trick.
+   *
+   * Names are already on the user's screen and go to the same endpoint that is about to
+   * receive a recording of them saying those names out loud, so this leaks nothing new.
+   * Turn it off if you would rather send audio and nothing else.
+   */
+  readonly phraseBias?: boolean;
+}
+
 export interface AppConfig {
   readonly plugins: readonly string[];
   readonly mounts: readonly MountConfig[];
@@ -80,6 +163,7 @@ export interface AppConfig {
   readonly watches: readonly WatchConfig[];
   readonly ui: UiConfig;
   readonly notifications: NotificationConfig;
+  readonly voice: VoiceConfig;
   readonly keymap: Readonly<Record<string, string>>;
   readonly ttlMs?: number;
   /** Where this config was loaded from; undefined when defaults were used. */
@@ -93,6 +177,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   watches: [],
   ui: {},
   notifications: {},
+  voice: {},
   keymap: {},
 };
 
@@ -249,6 +334,7 @@ const KNOWN_CONFIG_KEYS = new Set([
   'watches',
   'ui',
   'notifications',
+  'voice',
   'keymap',
   'ttlMs',
   // Conventional no-ops, so a file can carry an editor schema reference or a note.
@@ -386,10 +472,63 @@ function validateConfigBody(raw: unknown, sourcePath?: string): AppConfig {
     watches,
     ui: asObject(root['ui'], 'ui') as UiConfig,
     notifications: asObject(root['notifications'], 'notifications') as NotificationConfig,
+    voice: validateVoice(root['voice']),
     keymap: asObject(root['keymap'], 'keymap') as Record<string, string>,
     ...(typeof root['ttlMs'] === 'number' ? { ttlMs: root['ttlMs'] } : {}),
     ...(sourcePath === undefined ? {} : { sourcePath }),
   };
+}
+
+const VOICE_ENGINES = ['foundry', 'azure-speech', 'openai', 'xai', 'command'] as const;
+
+/**
+ * Validate the voice block.
+ *
+ * The one check worth its weight is the credential check. Every other mistake here is
+ * recoverable by editing a file; a literal API key written into `voice.apiKey` is a
+ * secret that has probably already been committed by the time anyone notices, and this is
+ * the last moment the program can say so. The rest of this codebase resolves secrets
+ * through `${env:NAME}` for exactly that reason, and voice does not get an exemption for
+ * being new.
+ */
+function validateVoice(raw: unknown): VoiceConfig {
+  const record = asObject(raw, 'voice') as Record<string, unknown>;
+
+  const engine = record['engine'];
+  if (engine !== undefined && !VOICE_ENGINES.includes(engine as (typeof VOICE_ENGINES)[number])) {
+    throw VfsError.config(
+      `voice.engine "${String(engine)}" is not a speech backend I know.`,
+      `Use one of: ${VOICE_ENGINES.join(', ')}. "foundry" is Microsoft Foundry with MAI-Transcribe-1.5.`,
+    );
+  }
+
+  const apiKey = record['apiKey'];
+  if (typeof apiKey === 'string' && apiKey !== '' && !isSecretRef(apiKey)) {
+    throw VfsError.config(
+      'voice.apiKey looks like a literal key rather than a reference to one.',
+      'Write it as "${env:AZURE_SPEECH_KEY}" and put the value in your environment, so the config file stays safe to commit and to paste into a bug report.',
+    );
+  }
+
+  const mode = record['mode'];
+  if (mode !== undefined && mode !== 'push' && mode !== 'continuous') {
+    throw VfsError.config(
+      `voice.mode "${String(mode)}" is not valid.`,
+      '"push" waits for a key before listening; "continuous" listens until you stop it and needs a wakeWord.',
+    );
+  }
+
+  // Continuous listening without a wake word means every sentence spoken near the machine
+  // is a candidate command, in a program that can archive mail. Refusing is kinder than
+  // the incident.
+  if (mode === 'continuous' && typeof record['wakeWord'] !== 'string') {
+    throw VfsError.config(
+      'voice.mode is "continuous" but no voice.wakeWord is set.',
+      'Continuous listening obeys anything it hears, so it requires a wake word: try "wakeWord": "computer".',
+    );
+  }
+
+  return record as VoiceConfig;
 }
 
 function validateMount(entry: unknown, index: number): MountConfig {

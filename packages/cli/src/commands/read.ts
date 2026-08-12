@@ -55,6 +55,8 @@ export const catCommand: Command = {
     const format = session.withMode(mode);
     session.print(formatDocument(doc, flagBool(args, 'raw') ? { ...format, width: 0 } : format));
 
+    session.noteRead(args.raw, `Read "${doc.title}"`, { path: Session.pathOf(path) });
+
     if ((doc.attachments ?? []).length > 0 && mode !== 'json') {
       session.status(
         `${String((doc.attachments ?? []).length)} attachment(s). Use \`attachments\` to list them and \`save\` to write one to disk.`,
@@ -210,8 +212,16 @@ export const doCommand: Command = {
         param.type === 'number' ? Number(raw) : param.type === 'boolean' ? raw === true || raw === 'true' : String(raw);
     }
 
-    const result = await session.vfs.invoke(action, path, params);
+    // Through the session rather than straight at the VFS, so the action lands in the
+    // journal with the inverse the provider named and the view hears that it happened.
+    // Calling `session.vfs.invoke` here would still work and would still be wrong: it is
+    // the one path by which a mutation can escape `undo`.
+    const result = await session.runAction(action, path, params, { command: args.raw });
     session.print(result.message);
+
+    if (result.undo !== undefined) {
+      session.status(`\`undo\` will ${result.undo.label ?? `run \`${result.undo.action}\``}.`);
+    }
   },
 };
 
@@ -380,7 +390,7 @@ export const parentCommand: Command = {
   maxPositional: 0,
   async run(session) {
     const parent = vpath.dirname(session.cwd);
-    session.setCwd(parent);
+    session.navigate(parent, { command: 'up' });
     session.print(parent);
   },
 };

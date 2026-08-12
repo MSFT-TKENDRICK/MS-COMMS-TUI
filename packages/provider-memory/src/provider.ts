@@ -44,6 +44,15 @@ interface Entry {
 
 const CURSOR_PREFIX = 'mem:';
 
+/**
+ * Flags that belong to the model rather than to the user's tagging.
+ *
+ * `untag` refuses to touch these: removing `unread` through the tag mechanism would leave
+ * the item in a state `read`/`unread` never produced, and the undo entry recorded for it
+ * would name a verb that cannot restore it.
+ */
+const RESERVED_FLAGS = new Set(['unread', 'flagged', 'attachment', 'draft', 'sent']);
+
 export class MemoryProvider implements Provider {
   readonly id: string;
   readonly displayName: string;
@@ -330,6 +339,23 @@ export class MemoryProvider implements Provider {
       description: 'Attach an arbitrary flag, to exercise action parameters.',
       params: [{ name: 'tag', type: 'string', label: 'Tag name', required: true }],
     });
+
+    // `untag` is offered only when there is something to remove, and it exists mainly so
+    // `tag` has a real inverse to name. An undo that can only be expressed as a verb the
+    // provider does not actually offer is an undo nobody can invoke by hand, which would
+    // make the undo stack the only route to it — exactly the sort of capability asymmetry
+    // this project refuses everywhere else.
+    const removable = [...entry.flags].filter((flag) => !RESERVED_FLAGS.has(flag));
+    if (removable.length > 0) {
+      descriptors.push({
+        name: 'untag',
+        label: 'Remove a tag',
+        description: `Remove one of: ${removable.sort().join(', ')}.`,
+        params: [
+          { name: 'tag', type: 'choice', label: 'Tag name', required: true, choices: removable.sort() },
+        ],
+      });
+    }
     return descriptors;
   }
 
@@ -338,12 +364,29 @@ export class MemoryProvider implements Provider {
     if (entry === undefined) throw VfsError.notFound(node.path ?? node.name);
 
     switch (action) {
-      case 'read':
-        entry.flags.delete('unread');
-        return { ok: true, message: `Marked "${entry.item.title}" as read.`, invalidates: [node.path ?? ''] };
-      case 'unread':
+      case 'read': {
+        // The inverse is reported only when there was something to reverse. Marking an
+        // already-read message read changes nothing, so claiming it can be undone would
+        // put an entry on the undo stack that, when taken, would mark the message unread
+        // — a state the user was never in.
+        const wasUnread = entry.flags.delete('unread');
+        return {
+          ok: true,
+          message: `Marked "${entry.item.title}" as read.`,
+          invalidates: [node.path ?? ''],
+          ...(wasUnread ? { undo: { action: 'unread', label: 'mark it unread again' } } : {}),
+        };
+      }
+      case 'unread': {
+        const wasRead = !entry.flags.has('unread');
         entry.flags.add('unread');
-        return { ok: true, message: `Marked "${entry.item.title}" as unread.`, invalidates: [node.path ?? ''] };
+        return {
+          ok: true,
+          message: `Marked "${entry.item.title}" as unread.`,
+          invalidates: [node.path ?? ''],
+          ...(wasRead ? { undo: { action: 'read', label: 'mark it read again' } } : {}),
+        };
+      }
       case 'flag': {
         const nowFlagged = !entry.flags.has('flagged');
         if (nowFlagged) entry.flags.add('flagged');
@@ -352,6 +395,9 @@ export class MemoryProvider implements Provider {
           ok: true,
           message: `${nowFlagged ? 'Flagged' : 'Unflagged'} "${entry.item.title}".`,
           invalidates: [node.path ?? ''],
+          // A toggle is its own inverse, which is the one case where naming the undo is
+          // trivially safe.
+          undo: { action: 'flag', label: nowFlagged ? 'remove the flag again' : 'put the flag back' },
         };
       }
       case 'tag': {
@@ -359,8 +405,35 @@ export class MemoryProvider implements Provider {
         if (typeof tag !== 'string' || tag.length === 0) {
           throw VfsError.invalid('The "tag" action needs a tag name.', 'Try: do tag 3 tag=followup');
         }
+        const alreadyThere = entry.flags.has(tag);
         entry.flags.add(tag);
-        return { ok: true, message: `Tagged "${entry.item.title}" with ${tag}.`, invalidates: [node.path ?? ''] };
+        return {
+          ok: true,
+          message: `Tagged "${entry.item.title}" with ${tag}.`,
+          invalidates: [node.path ?? ''],
+          ...(alreadyThere ? {} : { undo: { action: 'untag', params: { tag }, label: `remove the ${tag} tag` } }),
+        };
+      }
+      case 'untag': {
+        const tag = params['tag'];
+        if (typeof tag !== 'string' || tag.length === 0) {
+          throw VfsError.invalid('The "untag" action needs a tag name.', 'Try: do untag 3 --tag followup');
+        }
+        if (RESERVED_FLAGS.has(tag)) {
+          throw VfsError.invalid(
+            `"${tag}" is a built-in marker, not a tag.`,
+            `Use \`do ${tag === 'unread' ? 'read' : tag === 'flagged' ? 'flag' : tag} …\` instead.`,
+          );
+        }
+        const removed = entry.flags.delete(tag);
+        return {
+          ok: true,
+          message: removed
+            ? `Removed the ${tag} tag from "${entry.item.title}".`
+            : `"${entry.item.title}" was not tagged ${tag}.`,
+          invalidates: [node.path ?? ''],
+          ...(removed ? { undo: { action: 'tag', params: { tag }, label: `put the ${tag} tag back` } } : {}),
+        };
       }
       default:
         throw VfsError.unsupported(`Action "${action}"`, this.id);

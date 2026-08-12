@@ -49,6 +49,7 @@ genuinely unrelated key gets a plain "unknown key" rather than a misleading gues
 | `queries` | array | Saved queries, available by name to `find` and `watch`. |
 | `watches` | array | Watches to start automatically at launch. |
 | `ui` | object | Display settings. |
+| `voice` | object | Speech recognition and speech output. |
 | `notifications` | object | Desktop notification settings. |
 | `keymap` | object | Key rebindings for the opt-in TUI. |
 | `ttlMs` | number | Default cache lifetime for listings, in milliseconds. |
@@ -403,6 +404,56 @@ but nothing in the docs or the generated config will ever show you how.
 
 Colour is decoration only. Everything shown in colour is also stated in words, so
 `--plain` loses appearance and never loses information.
+
+## `voice`
+
+```jsonc
+"voice": {
+  "engine": "mai",
+  "endpoint": "https://my-resource.cognitiveservices.azure.com",
+  "apiKey": "${env:FOUNDRY_API_KEY}",
+  "language": "en-US"
+}
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Start listening at launch. Off by default, deliberately. |
+| `engine` | `"mai"` \| `"foundry"` \| `"azure-speech"` \| `"openai"` \| `"xai"` \| `"command"` | `"mai"` | Which service transcribes. `command` runs a local binary and sends nothing anywhere. |
+| `endpoint` | string | — | Resource URL. Required for everything except `command` and `azure-speech` with a `region`. For the OpenAI-compatible engines, an endpoint that already names a transcription path is used verbatim. |
+| `apiKey` | string | — | Use `${env:NAME}`. A literal-looking key is rejected at load time. |
+| `model` | string | `mai-transcribe-1.5` | Model name, or the deployment name for `engine: "foundry"` (which has no default and must be set). Not validated — hosted surfaces move faster than releases of this program. |
+| `phraseBias` | boolean | `true` | Send the names currently on screen to the recognizer as an entity bias. Used only by `mai`; ignored by engines that cannot accept it. |
+| `language` | string | `en-US` | BCP-47 tag. Sent as `locales` to `mai`; omitting it asks the model to identify the language itself. |
+| `region` | string | — | For `azure-speech`, as an alternative to `endpoint`. |
+| `command` / `commandArgs` | string / string[] | — | Local binary for `engine: "command"`. WAV on stdin, transcript on stdout. |
+| `mode` | `"push"` \| `"continuous"` | `"push"` | `push` captures one utterance at a time; `continuous` listens until told to stop and requires `wakeWord`. |
+| `wakeWord` | string | — | Required prefix in continuous mode, so ambient speech is not obeyed. |
+| `maxSeconds` | number | 15 | Longest single utterance. |
+| `recorder` / `recorderArgs` | string / string[] | auto | Force a capture program rather than detecting one. |
+| `device` | string | — | Input device name passed to the recorder. |
+| `autoRun` | boolean | `false` | Skip confirmation for mutating commands. |
+| `speak` | boolean | `false` | Read results back through the OS synthesizer. |
+
+`voice status` reports which engine resolved, whether the key reference resolved (without
+printing what it resolved to) and whether a recorder was found. `voice devices` lists the
+capture backends available on this machine.
+
+`mai` and `foundry` are two different APIs on the same Foundry resource. `mai` is the LLM
+Speech API that serves MAI-Transcribe — a different URL, request body and response shape
+from the OpenAI one — and it is the default because it is the only one that accepts a phrase
+list. `foundry` is the OpenAI-compatible surface, for a Whisper or `gpt-4o-transcribe`
+deployment, and needs the `model` set to whatever you named that deployment.
+
+The default model is **MAI-Transcribe-1.5**, Microsoft's current transcription model, across
+43 languages. Only `engine: "command"` keeps audio on the machine; the rest send it to the
+service you configured. Speech *output* is always the OS synthesizer and never a network
+service — sending subject lines to a cloud TTS API would leak exactly what the rest of this
+program is careful about.
+
+Voice never gains a capability the keyboard lacks: it produces a command line and hands it
+to the same dispatcher, so it inherits confirmation, journalling and undo rather than
+reimplementing them. Full details in [VOICE.md](VOICE.md).
 
 ## `notifications`
 

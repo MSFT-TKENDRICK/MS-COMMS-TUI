@@ -23,7 +23,7 @@
  * unique power, so no user is locked out of a feature by being unable to use the pane.
  */
 
-import type { VNode } from '@mscomms/core';
+import type { SessionEvent, VNode } from '@mscomms/core';
 
 export type Pane = 'list' | 'preview';
 export type Mode = 'browse' | 'filter' | 'command' | 'help';
@@ -45,8 +45,22 @@ export interface TuiState {
   readonly status: string;
   readonly busy: boolean;
   readonly exiting: boolean;
+  /**
+   * What the microphone is doing, if anything.
+   *
+   * Held in state rather than drawn ad hoc because a listening indicator that can disagree
+   * with reality is worse than none at all — the whole question the user is asking is "is
+   * this thing recording me right now?", and it deserves a single answer that the renderer
+   * reads and the reducer owns.
+   */
+  readonly voice: VoiceIndicator;
   /** Rows available for the list body, set by the renderer from the real terminal size. */
   readonly rows: number;
+}
+
+export interface VoiceIndicator {
+  readonly phase: 'off' | 'idle' | 'listening' | 'transcribing' | 'heard' | 'error';
+  readonly text: string;
 }
 
 export type Effect =
@@ -55,6 +69,8 @@ export type Effect =
   | { readonly kind: 'command'; readonly line: string }
   | { readonly kind: 'refresh' }
   | { readonly kind: 'quit' }
+  /** Record one spoken phrase and act on it. See `voiceListening` in {@link TuiState}. */
+  | { readonly kind: 'listen' }
   | { readonly kind: 'bell' };
 
 export interface Key {
@@ -86,8 +102,70 @@ export function initialState(cwd: string, rows = 20): TuiState {
     status: 'Loading…',
     busy: true,
     exiting: false,
+    voice: { phase: 'off', text: '' },
     rows,
   };
+}
+
+/**
+ * Fold a session event into the view.
+ *
+ * This is the whole of "the view stays synchronized with the VFS", and it is deliberately a
+ * pure function next to the key reducer rather than a set of callbacks in the app. Before it
+ * existed, each half of the interface kept its own idea of the current folder and reconciled
+ * them wherever somebody remembered to, so an action run from `:do` left the list showing a
+ * message that had just been archived, and an undo moved nothing at all.
+ *
+ * Now there is one rule: whatever changes the world says so, and the view listens. It does
+ * not matter whether the change came from a key, from `:`, from `undo`, or from somebody
+ * speaking — they all arrive here as the same event.
+ */
+export function applySessionEvent(state: TuiState, event: SessionEvent): Step {
+  switch (event.kind) {
+    case 'cwd':
+      // Already there — nothing to redraw, and re-listing would fight the pane's own move.
+      if (event.path === state.cwd) return { state, effects: [] };
+      return {
+        state: { ...state, busy: true, status: `Moved to ${event.path}.` },
+        effects: [{ kind: 'list', path: event.path }],
+      };
+
+    case 'mutated': {
+      // Re-list only when the change touched what is on screen. Refreshing on every mutation
+      // anywhere would make a background watch tick yank the selection out from under
+      // somebody mid-read, which is precisely the bug this event was added to fix.
+      const affected = event.paths.some((path) => path === state.cwd || parentPath(path) === state.cwd);
+      if (!affected) return { state: { ...state, status: event.message }, effects: [] };
+      return {
+        state: { ...state, busy: true, status: event.message },
+        effects: [{ kind: 'list', path: state.cwd }],
+      };
+    }
+
+    case 'journal':
+      return { state: { ...state, status: event.summary }, effects: [] };
+
+    case 'voice': {
+      const text = event.text ?? '';
+      const status =
+        event.phase === 'listening'
+          ? text === ''
+            ? 'Listening…'
+            : `Listening — ${text}`
+          : event.phase === 'transcribing'
+            ? 'Transcribing…'
+            : event.phase === 'heard'
+              ? `Heard: "${text}"`
+              : event.phase === 'error'
+                ? `Voice error: ${text}`
+                : state.status;
+      return { state: { ...state, voice: { phase: event.phase, text }, status }, effects: [] };
+    }
+
+    case 'listing':
+      // The listing the pane itself just asked for. Redrawing again would loop.
+      return { state, effects: [] };
+  }
 }
 
 /**
@@ -304,8 +382,23 @@ function reduceBrowse(state: TuiState, key: Key): Step {
     case 'r':
       return { state: { ...state, busy: true, status: 'Refreshing…' }, effects: [{ kind: 'refresh' }] };
 
+    // `u` undoes, matching every editor anyone has used. It goes through the command table
+    // rather than a bespoke path so the pane cannot undo something the shell could not.
+    case 'u':
+      return { state: { ...state, busy: true, status: 'Undoing…' }, effects: [{ kind: 'command', line: 'undo' }] };
+
     default:
       break;
+  }
+
+  // Ctrl+Space is push-to-talk. Chosen because it is not a character, so it cannot collide
+  // with typeahead, and because it is reachable one-handed — which matters for the users
+  // most likely to be reaching for voice control in the first place.
+  if (key.ctrl === true && (key.name === 'space' || key.sequence === ' ' || key.sequence === '\u0000')) {
+    if (state.voice.phase === 'listening') {
+      return { state: { ...state, status: 'Stopping…' }, effects: [{ kind: 'command', line: 'voice off' }] };
+    }
+    return { state: { ...state, status: 'Listening…' }, effects: [{ kind: 'listen' }] };
   }
 
   // `/`, `:` and `?` are matched by sequence because they are punctuation, and terminals

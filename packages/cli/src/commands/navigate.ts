@@ -231,7 +231,7 @@ export const cdCommand: Command = {
       throw new Error(`"${sanitizeForDisplay(node.name)}" is not a folder. Use \`cat\` to read it.`);
     }
 
-    session.setCwd(path);
+    session.navigate(path, { command: `cd ${token === undefined ? '/' : token}` });
     session.print(path);
   },
 };
@@ -253,11 +253,16 @@ export const backCommand: Command = {
   summary: 'Return to the folder you were in before the last `cd`.',
   usage: 'back',
   maxPositional: 0,
+  detail:
+    '`back` walks the trail of folders you visited. `undo` is the related but different\n' +
+    'thing: it reverses your last interaction, whatever kind it was, so it will take back\n' +
+    'a flag or a mark-as-read as readily as a move.',
   async run(session) {
     const previous = session.history.pop();
     if (previous === undefined) throw new Error('There is nowhere to go back to.');
-    session.cwd = previous;
-    session.lastListing = undefined;
+    // `navigate` would push the folder we are leaving back onto the trail, so `back` twice
+    // would oscillate between two folders forever instead of walking back through them.
+    session.stepBackTo(previous);
     session.print(previous);
   },
 };

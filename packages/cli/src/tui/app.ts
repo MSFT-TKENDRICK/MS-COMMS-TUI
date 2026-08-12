@@ -29,6 +29,7 @@ import type { Session } from '../session.js';
 import { bodyRows, render } from './render.js';
 import type { RenderOptions } from './render.js';
 import {
+  applySessionEvent,
   describeSelection,
   initialState,
   reduce,
@@ -40,6 +41,7 @@ import {
   withStatus,
 } from './state.js';
 import type { Effect, Key, TuiState } from './state.js';
+import type { SessionEvent } from '@mscomms/core';
 
 const ALT_SCREEN_ON = '\u001B[?1049h';
 const ALT_SCREEN_OFF = '\u001B[?1049l';
@@ -79,6 +81,17 @@ export class Tui {
   #onSigint: (() => void) | undefined;
   /** Set while an effect is in flight, so a held-down arrow cannot stack requests. */
   #working = false;
+  #unsubscribe: (() => void) | undefined;
+  /**
+   * Session events that arrived while an effect was running.
+   *
+   * Queued rather than applied immediately because an event can ask for a re-list, and
+   * re-entering the effect runner from inside itself would interleave two listings and
+   * leave the pane showing a mixture of both.
+   */
+  readonly #pending: SessionEvent[] = [];
+  /** Resolver for the confirmation line currently on screen, if any. */
+  #confirming: ((answer: boolean) => void) | undefined;
 
   constructor(options: TuiOptions) {
     this.#session = options.session;
@@ -100,6 +113,19 @@ export class Tui {
     }
 
     this.#enter();
+
+    // The pane is an interface, not a separate program: say so, so the journal records how
+    // each interaction arrived and `history` can tell a keypress from a spoken command.
+    this.#session.source = 'tui';
+    this.#session.confirm = (question) => this.#askConfirm(question);
+
+    // Anything that changes the world announces it, and the pane listens. This is the whole
+    // of the view-synchronization contract — see `applySessionEvent`.
+    this.#unsubscribe = this.#session.subscribe((event) => {
+      this.#pending.push(event);
+      if (!this.#working) void this.#drain();
+    });
+
     // The first listing is fetched before the first paint, so the user never sees an empty
     // frame that then fills in — a repaint a screen reader would announce twice.
     await this.#perform({ kind: 'list', path: this.#session.cwd });
@@ -125,6 +151,13 @@ export class Tui {
   #restore(): void {
     if (this.#restored) return;
     this.#restored = true;
+    this.#unsubscribe?.();
+    this.#unsubscribe = undefined;
+    this.#session.voice?.stop();
+    // Anything still waiting on an answer gets a "no". Leaving it unresolved would hold the
+    // process open after the terminal has already been handed back.
+    this.#confirming?.(false);
+    this.#confirming = undefined;
     if (this.#onKeypress !== undefined) this.#stdin.off('keypress', this.#onKeypress);
     if (this.#onResize !== undefined) this.#stdout.off('resize', this.#onResize);
     if (this.#onSigint !== undefined) process.off('SIGINT', this.#onSigint);
@@ -171,6 +204,19 @@ export class Tui {
 
   async #handle(chunk: string, key: Key | undefined): Promise<void> {
     if (this.#restored) return;
+
+    // A confirmation on screen owns the keyboard until it is answered. Nothing else should
+    // act on a keypress while the user is being asked whether to archive something.
+    if (this.#confirming !== undefined) {
+      const resolve = this.#confirming;
+      this.#confirming = undefined;
+      const answer = /^[yY]$/.test(chunk) || key?.name === 'y';
+      this.#state = withStatus(this.#state, answer ? 'Confirmed.' : 'Cancelled.');
+      this.#paint();
+      resolve(answer);
+      return;
+    }
+
     // Keys arriving while a fetch is outstanding are dropped rather than queued. Queuing
     // means a held-down arrow fires a burst of requests that all resolve after the user has
     // stopped moving, and the selection then lurches somewhere they did not ask for.
@@ -202,8 +248,12 @@ export class Tui {
 
         case 'list': {
           const result = await this.#session.vfs.list(effect.path, { limit: LIST_LIMIT });
-          this.#session.cwd = effect.path;
           this.#state = withListing(this.#state, effect.path, result.entries);
+          // Recorded, not just assigned. An arrow key that walks into a folder is an
+          // interaction like any other: it belongs in `history`, and `undo` should walk back
+          // out of it. Assigning `cwd` directly — which this used to do — made the pane the
+          // one way to move around that left no trace and could not be undone.
+          this.#session.navigate(effect.path, { command: `cd ${quoteForCommand(effect.path)}`, reason: 'pane' });
           // A first run with no config lands on an empty root. "/ is empty." is true but
           // useless — and unlike the line shell, a user in the pane can't just type `demo`,
           // so the way out has to name the `:` key explicitly.
@@ -242,12 +292,64 @@ export class Tui {
         case 'command':
           await this.#runCommand(effect.line);
           break;
+
+        case 'listen': {
+          const voice = this.#session.voice;
+          if (voice === undefined || !voice.enabled) {
+            // Turn it on rather than refusing. Somebody pressing the talk key has already
+            // said what they want; making them run `:voice on` first is a pointless detour.
+            await this.#runCommand('voice on');
+          }
+          if (this.#session.voice?.enabled === true) {
+            await this.#runCommand('voice once');
+          }
+          break;
+        }
       }
     } catch (error) {
       this.#state = withError(this.#state, messageOf(error));
     } finally {
       this.#working = false;
     }
+    await this.#drain();
+  }
+
+  /**
+   * Apply queued session events.
+   *
+   * Runs after every effect, and immediately when an event arrives with nothing in flight.
+   * Each event may itself ask for a listing, so the queue is drained rather than iterated —
+   * a re-list can legitimately arrive while an earlier one is still being applied.
+   */
+  async #drain(): Promise<void> {
+    if (this.#working) return;
+    while (this.#pending.length > 0) {
+      const event = this.#pending.shift() as SessionEvent;
+      const step = applySessionEvent(this.#state, event);
+      this.#state = step.state;
+      for (const effect of step.effects) {
+        if (effect.kind === 'quit') continue;
+        await this.#perform(effect);
+      }
+    }
+    if (!this.#restored) this.#paint();
+  }
+
+  /**
+   * Ask a yes/no question in the pane.
+   *
+   * Drawn as the status line and answered with a single key, rather than in the `:` prompt,
+   * because a confirmation is not a command — it should not be editable, completable, or
+   * recallable with the up arrow, and it should be answerable without composing anything.
+   */
+  #askConfirm(question: string): Promise<boolean> {
+    if (this.#restored) return Promise.resolve(false);
+    if (this.#confirming !== undefined) return Promise.resolve(false);
+    this.#state = withStatus(this.#state, `${question}  [y/N]`);
+    this.#paint();
+    return new Promise<boolean>((resolve) => {
+      this.#confirming = resolve;
+    });
   }
 
   /**
@@ -258,7 +360,6 @@ export class Tui {
    * behaves identically in both, including the bare-path and listing-number shorthands.
    */
   async #runCommand(line: string): Promise<void> {
-    const before = this.#session.cwd;
     const output = await this.#session.capture(async () => {
       await this.#dispatcher.execute(this.#session, line);
     });
@@ -268,14 +369,10 @@ export class Tui {
       return;
     }
 
-    // A command that moved us (`cd`, `back`, a bare folder name) should move the pane too,
-    // otherwise the two halves of the interface disagree about where the user is.
-    if (this.#session.cwd !== before) {
-      const result = await this.#session.vfs.list(this.#session.cwd, { limit: LIST_LIMIT });
-      this.#state = withListing(this.#state, this.#session.cwd, result.entries);
-      return;
-    }
-
+    // A command that moved us is reported by the session's own `cwd` event and handled in
+    // `#drain`, so there is deliberately no cwd comparison here any more. Doing both meant
+    // two listings for one `cd`, and the pane briefly showing the old folder's contents
+    // under the new folder's title.
     const trimmed = output.replace(/\n+$/, '');
     this.#state =
       trimmed.trim() === ''
@@ -304,4 +401,15 @@ export class Tui {
 function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/**
+ * Quote a path for a journal command line.
+ *
+ * The journal's lines have to survive a round trip back through the tokenizer, and this
+ * program is about messages — folder names here are subject lines and chat titles, which are
+ * mostly spaces.
+ */
+function quoteForCommand(value: string): string {
+  return /[\s"']/.test(value) ? `"${value.replace(/"/g, '')}"` : value;
 }
