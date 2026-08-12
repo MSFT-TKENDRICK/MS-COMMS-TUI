@@ -90,6 +90,61 @@ export {
 
 export { TtlCache, type CacheEntry, type CacheOptions, type CacheStats } from './cache.js';
 
+// ---------------------------------------------------------------------------
+// Local snapshot: background sync, cache-ahead, and offline search
+// ---------------------------------------------------------------------------
+
+export {
+  openSqlDriver,
+  type SqlDriver,
+  type SqlDriverKind,
+  type SqlDriverOptions,
+  type SqlRow,
+  type SqlStatement,
+  type SqlValue,
+} from './sql.js';
+
+export {
+  DEFAULT_DIMENSIONS,
+  cosineSimilarity,
+  decodeVector,
+  embeddableText,
+  encodeVector,
+  hashEmbed,
+  hashEmbedder,
+  vectorLiteral,
+  type Embedder,
+} from './vector.js';
+
+export {
+  SnapshotStore,
+  DEFAULT_RECENT,
+  type SnapshotHit,
+  type SnapshotListing,
+  type SnapshotOptions,
+  type SnapshotSearchOptions,
+  type SnapshotStats,
+} from './snapshot.js';
+
+export {
+  NavigationPredictor,
+  PREFETCH_PRIORITY,
+  PrefetchQueue,
+  type PredictedTarget,
+  type PredictorOptions,
+  type PrefetchQueueOptions,
+  type PrefetchStats,
+  type PrefetchTask,
+} from './prefetch.js';
+
+export {
+  BackgroundSync,
+  type BackgroundSyncOptions,
+  type SyncHost,
+  type SyncMount,
+  type SyncStatus,
+} from './sync.js';
+
 export {
   ConsoleLogger,
   MemoryStateStore,
@@ -105,6 +160,7 @@ export {
   rankHits,
   sortNodes,
   type Mount,
+  type PrefetchOptions,
   type SearchOptions,
   type SearchSourceReport,
   type VfsListResult,
@@ -140,6 +196,7 @@ export {
   validateConfig,
   type AppConfig,
   type AppPaths,
+  type CacheConfig,
   type MountConfig,
   type NotificationConfig,
   type SavedQueryConfig,

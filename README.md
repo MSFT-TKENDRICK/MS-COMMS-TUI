@@ -117,11 +117,45 @@ The graph is genuinely cyclic — your manager's `reports/` contains you — and
 person however you got there, so `find /people -q "is:unanswered"` lists each thing you owe a
 reply to exactly once.
 
+## The local snapshot
+
+Turn on the cache and mail is pulled into a local Turso (libSQL) database in the
+background, so the tool stops waiting on the network to show you things it already knows.
+
+```jsonc
+"cache": { "enabled": true, "recent": 500, "bodies": 25 }
+```
+
+What changes:
+
+- **Cold start is not cold.** The first `ls` of the day reads from disk. Milliseconds, not
+  seconds.
+- **Navigation is predicted.** Moving into a folder speculatively fetches where you usually
+  go next, and the next page of where you are. The folder is often loaded before you ask.
+- **Search hits the local index first**, then the network, and merges. Local matches appear
+  immediately; remote ones join as they land. With embeddings on, the local half matches on
+  meaning too, so "quarterly numbers" finds "Q3 financials".
+- **`find --local`** never touches the network at all. On a plane it is the only answer; the
+  rest of the time it is the fastest one.
+
+It keeps the *n* most recent items per folder rather than replicating the mailbox, and it is
+careful about what that entitles it to say. A plain `ls` is served locally; a filtered one
+goes to the source, because answering `is:unread` from a truncated cache could report
+nothing while an unread message sits just outside the window. Search never concludes
+absence from the cache alone, and `find` tells you how many results came from it.
+
+The whole thing is an accelerator: if it cannot open, the shell starts anyway and `cache`
+says why. Details in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#cache).
+
 ## Install
 
-Node 20.11 or newer. No third-party runtime dependencies — deliberately: this program reads
-your corporate mail, and every transitive package is somebody else's ability to change what
-it does. The only `dependencies` entries are this repo's own workspace packages.
+Node 20.11 or newer. One runtime dependency, `@libsql/client`, which backs the optional
+local snapshot — the on-disk Turso database that makes a cold start fast and search
+instant. Everything else is this repo's own workspace packages.
+
+The snapshot is **off by default**: turning it on writes corporate mail to a file on your
+machine, and that is a decision to make deliberately rather than to inherit. `cache enable`
+asks once and records the answer.
 
 ```sh
 git clone https://github.com/MSFT-TKENDRICK/MS-COMMS-TUI
@@ -332,7 +366,8 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 ## Status
 
 Working and tested: the VFS engine, the query language (including Lucene syntax and
-relevance ranking), cross-source search, cache, notifications, the line shell, tab
+relevance ranking), cross-source search, cache, the local Turso snapshot with background
+sync, predictive prefetching and vector search, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
 1163 tests.

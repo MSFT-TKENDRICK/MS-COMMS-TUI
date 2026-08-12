@@ -16,14 +16,19 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import {
+  BackgroundSync,
   FileStateStore,
   Notifier,
   PluginRegistry,
+  SnapshotStore,
   Vfs,
   Watcher,
   buildMounts,
+  hashEmbedder,
+  openSqlDriver,
   parseQuery,
   resolveAppPaths,
+  resolveSecret,
   stateFileFor,
   vpath,
   type AppConfig,
@@ -68,6 +73,12 @@ export class Session {
   readonly vfs: Vfs;
   readonly notifier: Notifier;
   readonly watcher: Watcher;
+
+  /** The local snapshot, once opened. Undefined when caching is off or unavailable. */
+  snapshot: SnapshotStore | undefined;
+  sync: BackgroundSync | undefined;
+  /** Why the cache is not running, when it was asked for but could not start. */
+  cacheError: string | undefined;
 
   #sink: (text: string) => void = (text) => process.stdout.write(text);
   #errorSink: (text: string) => void = (text) => process.stderr.write(text);
@@ -120,6 +131,7 @@ export class Session {
     this.vfs = new Vfs({
       ...(options.config.ttlMs === undefined ? {} : { ttlMs: options.config.ttlMs }),
       pageSize: this.pageSize,
+      logger: options.logger,
     });
 
     this.notifier = new Notifier({
@@ -171,6 +183,10 @@ export class Session {
     }
     this.brokenMounts = broken;
 
+    // Opened after the mounts, because a snapshot with nothing mounted has nothing to
+    // sync, and before the watches, so a watch's first poll can be served locally.
+    await this.#startCache();
+
     // The cwd defaults to the only mount when there is exactly one. Landing in a root
     // that contains a single directory and making the user `cd` into it is pure ceremony.
     const mounts = this.vfs.mounts;
@@ -197,7 +213,72 @@ export class Session {
 
   async dispose(): Promise<void> {
     this.watcher.stop();
+    // Order matters, and `stop()` must be awaited: it aborts the cycle *and waits for it
+    // to unwind*. Dropping that promise would close the database under a sync still
+    // writing to it, which is the same bug as not flushing, arriving from the other side.
+    await this.sync?.stop();
+    // Then settle the engine's outstanding snapshot writes before closing the database
+    // under them, or the last thing the user did is the one thing not saved.
+    await this.vfs.flush().catch(() => undefined);
+    await this.snapshot?.close().catch(() => undefined);
     await this.vfs.dispose();
+  }
+
+  /**
+   * Open the local snapshot and start background sync.
+   *
+   * Every failure here is non-fatal and recorded rather than thrown. A cache that will not
+   * open is a slower program, not a broken one, and refusing to start the shell because a
+   * disk was full would turn an optimisation into a single point of failure. `cache status`
+   * reports {@link cacheError} so the degradation is visible rather than mysterious.
+   */
+  async #startCache(): Promise<void> {
+    const cache = this.config.cache;
+    if (cache.enabled !== true) return;
+
+    try {
+      const embedder = cache.vectors === false ? undefined : hashEmbedder();
+      const authToken = cache.authToken === undefined ? undefined : await resolveSecret(cache.authToken);
+      const driver = await openSqlDriver({
+        path: cache.path ?? join(this.paths.cacheDir, 'snapshot.db'),
+        ...(cache.driver === undefined ? {} : { driver: cache.driver }),
+        ...(cache.syncUrl === undefined ? {} : { syncUrl: cache.syncUrl }),
+        ...(authToken === undefined ? {} : { authToken }),
+        onWarning: (message) => {
+          this.logger.warn(message);
+        },
+      });
+
+      const snapshot = await SnapshotStore.open({
+        driver,
+        ...(cache.recent === undefined ? {} : { maxNodesPerDirectory: cache.recent }),
+        ...(cache.ttlMs === undefined ? {} : { ttlMs: cache.ttlMs }),
+        ...(cache.vectors === undefined ? {} : { vectors: cache.vectors }),
+        ...(embedder === undefined ? {} : { embedder }),
+        logger: this.logger.child('snapshot'),
+      });
+
+      this.snapshot = snapshot;
+      this.vfs.attachSnapshot(snapshot, {
+        enabled: cache.prefetch ?? true,
+        ...(cache.prefetchConcurrency === undefined ? {} : { concurrency: cache.prefetchConcurrency }),
+      });
+      await this.vfs.warmPredictor().catch(() => undefined);
+
+      this.sync = new BackgroundSync({
+        host: this.vfs,
+        snapshot,
+        logger: this.logger.child('sync'),
+        ...(cache.intervalMs === undefined ? {} : { intervalMs: cache.intervalMs }),
+        ...(cache.recent === undefined ? {} : { recent: cache.recent }),
+        ...(cache.depth === undefined ? {} : { depth: cache.depth }),
+        ...(cache.bodies === undefined ? {} : { bodies: cache.bodies }),
+      });
+      this.sync.start();
+    } catch (error) {
+      this.cacheError = error instanceof Error ? error.message : String(error);
+      this.logger.warn('local cache could not start', { message: this.cacheError });
+    }
   }
 
   // -------------------------------------------------------------------------

@@ -16,7 +16,15 @@
 import { TtlCache, type CacheStats } from './cache.js';
 import { VfsError, toVfsError } from './errors.js';
 import { GraphSpace, treeGraphSource, type GraphSourceEntry } from './graph.js';
+import { NULL_LOGGER } from './logging.js';
 import { NameAllocator, sanitizeSegment } from './naming.js';
+import {
+  NavigationPredictor,
+  PREFETCH_PRIORITY,
+  PrefetchQueue,
+  type PredictorOptions,
+  type PrefetchStats,
+} from './prefetch.js';
 import {
   evaluateQuery,
   isMatchAll,
@@ -25,6 +33,7 @@ import {
   stringifyQuery,
   type Query,
 } from './query.js';
+import type { SnapshotHit, SnapshotStore } from './snapshot.js';
 import type {
   ActionDescriptor,
   ActionResult,
@@ -32,6 +41,7 @@ import type {
   Document,
   ListOptions,
   ListPage,
+  Logger,
   MetaValue,
   Provider,
   ReadOptions,
@@ -170,6 +180,27 @@ export interface SearchOptions extends ListOptions {
    * an explicit `sort` is given.
    */
   readonly rank?: boolean;
+  /**
+   * Answer from the local snapshot alone, without asking any provider.
+   *
+   * Instant, and correct about everything it holds — which is the recent past, not the
+   * archive. The result says so: the snapshot reports as a source with `truncated` set,
+   * so "nothing found locally" never renders as "nothing exists".
+   */
+  readonly local?: boolean;
+  /**
+   * Include vector nearest-neighbours from the snapshot as search candidates.
+   * Defaults to true when a snapshot is configured.
+   */
+  readonly semantic?: boolean;
+}
+
+export interface PrefetchOptions extends PredictorOptions {
+  readonly enabled?: boolean;
+  /** Speculative fetches in flight at once. Small on purpose; see ./prefetch.js. */
+  readonly concurrency?: number;
+  /** Entries fetched per speculative listing. Smaller than a real page — it is a guess. */
+  readonly pageSize?: number;
 }
 
 
@@ -184,6 +215,14 @@ export interface VfsOptions {
    * and on the day the vendor changes their API.
    */
   readonly serveStaleOnError?: boolean;
+  /**
+   * Local libSQL/Turso snapshot. Absent means the engine behaves exactly as it did
+   * before one existed — in-memory caching only, every cold start a cold start.
+   */
+  readonly snapshot?: SnapshotStore;
+  /** Predictive cache-ahead. Requires a snapshot to be worth anything, but works without. */
+  readonly prefetch?: PrefetchOptions;
+  readonly logger?: Logger;
 }
 
 export class Vfs {
@@ -193,11 +232,28 @@ export class Vfs {
   readonly #defaultPageSize: number;
   readonly #serveStaleOnError: boolean;
   readonly #now: () => number;
+  readonly #logger: Logger;
+
+  #snapshot: SnapshotStore | undefined;
+  #prefetchQueue: PrefetchQueue | undefined;
+  #predictor: NavigationPredictor | undefined;
+  #prefetchOptions: PrefetchOptions;
+  /**
+   * Snapshot writes, chained.
+   *
+   * Recording a listing must never make `ls` slower, so every write is fired and not
+   * awaited. But "fired and forgotten" is untestable and makes shutdown a race, so the
+   * tail is retained and exposed as {@link flush}. Serialising them also keeps SQLite off
+   * the write-contention path, which matters because the background sync is writing too.
+   */
+  #writes: Promise<void> = Promise.resolve();
+  #lastListedPath: string | undefined;
 
   constructor(options: VfsOptions = {}) {
     this.#now = options.now ?? Date.now;
     this.#defaultPageSize = options.pageSize ?? 50;
     this.#serveStaleOnError = options.serveStaleOnError ?? true;
+    this.#logger = options.logger ?? NULL_LOGGER;
     const cacheOptions = {
       ttlMs: options.ttlMs ?? 60_000,
       maxEntries: options.maxCacheEntries ?? 2_000,
@@ -205,7 +261,87 @@ export class Vfs {
     };
     this.#dirCache = new TtlCache<DirectoryIndex>(cacheOptions);
     this.#docCache = new TtlCache<Document>({ ...cacheOptions, ttlMs: 5 * 60_000 });
+
+    this.#snapshot = options.snapshot;
+    this.#prefetchOptions = options.prefetch ?? {};
+    if (this.#prefetchOptions.enabled === true) {
+      this.#prefetchQueue = new PrefetchQueue({
+        ...(this.#prefetchOptions.concurrency === undefined ? {} : { concurrency: this.#prefetchOptions.concurrency }),
+        logger: this.#logger.child('prefetch'),
+      });
+      this.#predictor = new NavigationPredictor(this.#prefetchOptions);
+    }
   }
+
+  // -------------------------------------------------------------------------
+  // Snapshot and prefetch
+  // -------------------------------------------------------------------------
+
+  get snapshot(): SnapshotStore | undefined {
+    return this.#snapshot;
+  }
+
+  /**
+   * Attach a snapshot after construction.
+   *
+   * Opening a database is I/O, and the engine is constructed synchronously by callers who
+   * then hand it to a shell, a watcher and a completer before anything has been awaited.
+   * Rather than make every one of those wait for a disk file that may not even be enabled,
+   * the engine starts fully functional without a snapshot and gains one when it is ready —
+   * which is also exactly what happens when the user runs `cache enable` mid-session.
+   */
+  attachSnapshot(snapshot: SnapshotStore, prefetch: PrefetchOptions = {}): void {
+    this.#snapshot = snapshot;
+    this.#prefetchOptions = prefetch;
+    if (prefetch.enabled === true && this.#prefetchQueue === undefined) {
+      this.#prefetchQueue = new PrefetchQueue({
+        ...(prefetch.concurrency === undefined ? {} : { concurrency: prefetch.concurrency }),
+        logger: this.#logger.child('prefetch'),
+      });
+      this.#predictor = new NavigationPredictor(prefetch);
+    }
+  }
+
+  /** Detach and stop using the snapshot. Speculative work aimed at it is abandoned. */
+  detachSnapshot(): void {
+    this.#prefetchQueue?.cancel({ includeRunning: true });
+    this.#snapshot = undefined;
+  }
+
+  get prefetchStats(): PrefetchStats | undefined {
+    return this.#prefetchQueue?.stats;
+  }
+
+  /**
+   * Recover a previous session's navigation history so the first command is already warm.
+   *
+   * Separate from the constructor because it is I/O, and because a predictor that has not
+   * loaded yet is merely less clever rather than broken — there is nothing to await for
+   * correctness, only for quality of guessing.
+   */
+  async warmPredictor(): Promise<void> {
+    if (this.#snapshot === undefined || this.#predictor === undefined) return;
+    const history = await this.#snapshot.navigationHistory().catch(() => []);
+    if (history.length === 0) return;
+    for (const entry of history) this.#predictor.learn(entry.from, entry.to, entry.count);
+  }
+
+  /** Settle outstanding snapshot writes and speculative fetches. Tests and shutdown. */
+  async flush(): Promise<void> {
+    await this.#prefetchQueue?.idle();
+    await this.#writes;
+  }
+
+  /** Queue a snapshot write without making the caller wait for it. */
+  #record(work: () => Promise<void>): void {
+    if (this.#snapshot === undefined) return;
+    this.#writes = this.#writes.then(work).catch((error: unknown) => {
+      // The snapshot is an accelerator. A cache that cannot be written is a slower tool,
+      // not a broken one, and turning a disk-full into a failed `ls` would be a poor trade.
+      this.#logger.debug('Snapshot write failed.', { error: String(error) });
+    });
+  }
+
 
   // -------------------------------------------------------------------------
   // Mount table
@@ -312,6 +448,13 @@ export class Vfs {
   /** Drop cached listings and documents at or beneath `path`. */
   invalidate(path: string): void {
     const normalized = vpath.normalize(path);
+    // Speculative work aimed at the place being invalidated is now fetching what we have
+    // just decided we do not trust; killing it also stops it re-populating the snapshot
+    // from behind with the very rows being cleared.
+    this.#prefetchQueue?.cancel({ includeRunning: true });
+    this.#record(async () => {
+      await (this.#snapshot as SnapshotStore).invalidate(normalized);
+    });
     if (normalized === vpath.ROOT) {
       this.#dirCache.clear();
       this.#docCache.clear();
@@ -472,7 +615,7 @@ export class Vfs {
 
   async list(
     target: VfsTarget,
-    options: ListOptions & { refresh?: boolean } = {},
+    options: ListOptions & { refresh?: boolean; speculative?: boolean } = {},
   ): Promise<VfsListResult> {
     const { mount, node, synthetic, path: normalized } = await this.#locate(target, options);
 
@@ -528,6 +671,20 @@ export class Vfs {
 
     const sorted = options.sort === undefined ? entries : sortNodes(entries, options.sort);
 
+    // Learning and guessing happen only for a plain, un-narrowed listing the *user* asked
+    // for: that is the shape of navigation. A filtered `ls` is someone interrogating a
+    // folder, not moving to it, and treating it as a move would poison the transition
+    // model with places the user never actually went.
+    //
+    // Speculative listings are excluded for a sharper reason: a prefetch that fed the
+    // predictor would predict from its own guess, schedule more, and walk the entire tree
+    // — an unbounded recursion that never yields, taking the provider's rate limit and the
+    // event loop with it. Prefetching is exactly one hop deep, and this is what keeps it
+    // that way.
+    if (isMatchAll(query) && options.cursor === undefined && options.speculative !== true) {
+      this.#afterNavigation(owner, node, normalized, sorted, page.cursor);
+    }
+
     return {
       path: normalized,
       entries: sorted,
@@ -538,6 +695,81 @@ export class Vfs {
       stale,
       ...(staleAgeMs === undefined ? {} : { staleAgeMs }),
     };
+  }
+
+  /**
+   * Record the move and warm what comes next.
+   *
+   * Cancelling first is the important half. Predictions made from the previous directory
+   * are guesses about somewhere the user has now left, and letting them run would spend
+   * the tiny prefetch budget — and the provider's rate limit — on the past. Documents and
+   * below are dropped; an in-flight next-page fetch is kept, because paging is the one
+   * prediction that survives a `cd` (the user often comes straight back).
+   */
+  #afterNavigation(
+    mount: Mount,
+    node: VNode | null,
+    path: string,
+    entries: readonly VNode[],
+    cursor: string | undefined,
+  ): void {
+    const queue = this.#prefetchQueue;
+    const predictor = this.#predictor;
+    const moved = this.#lastListedPath !== path;
+    this.#lastListedPath = path;
+
+    if (predictor === undefined || queue === undefined) return;
+    if (moved) {
+      predictor.record(path);
+      queue.cancel({ minPriority: PREFETCH_PRIORITY.document });
+      this.#persistNavigation();
+    }
+
+    const targets = predictor.predict(path, entries, {
+      ...(cursor === undefined ? {} : { cursor }),
+      siblings: this.#siblingPaths(path),
+    });
+
+    for (const target of targets) {
+      queue.schedule({
+        key: `${target.kind}:${target.path}:${target.cursor ?? ''}`,
+        priority: target.priority,
+        path: target.path,
+        run: async (signal) => {
+          const pageSize = this.#prefetchOptions.pageSize ?? 25;
+          if (target.kind === 'document') {
+            await this.read(target.path, { signal });
+            return;
+          }
+          await this.list(target.path, {
+            signal,
+            limit: pageSize,
+            speculative: true,
+            ...(target.cursor === undefined ? {} : { cursor: target.cursor }),
+          });
+        },
+      });
+    }
+  }
+
+  /** Directories alongside `path`, from cache only — a prediction must not cost a fetch. */
+  #siblingPaths(path: string): readonly string[] {
+    if (path === vpath.ROOT) return [];
+    const parent = vpath.dirname(path);
+    const siblings = this.cachedChildren(parent) ?? [];
+    return siblings
+      .filter((entry) => entry.kind === 'dir')
+      .map((entry) => entry.path ?? vpath.join(parent, entry.name))
+      .filter((candidate) => candidate !== path);
+  }
+
+  #persistNavigation(): void {
+    const predictor = this.#predictor;
+    if (predictor === undefined || !predictor.dirty) return;
+    const transitions = predictor.transitions();
+    this.#record(async () => {
+      await (this.#snapshot as SnapshotStore).saveNavigationHistory(transitions);
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -557,9 +789,24 @@ export class Vfs {
     }
     if (node.kind === 'dir') throw VfsError.isDirectory(normalized);
 
+    // A message body does not change. That is what makes the snapshot's document store
+    // worth far more than its listing store: a listing goes stale in minutes, but a mail
+    // you have already read is correct forever, so re-fetching it over the network is
+    // pure latency for no information.
+    if (this.#snapshot !== undefined) {
+      const stored = await this.#snapshot.document(normalized).catch(() => undefined);
+      if (stored !== undefined) {
+        this.#docCache.set(normalized, stored.doc);
+        return stored.doc;
+      }
+    }
+
     try {
       const doc = await owner.provider.read(node, options);
       this.#docCache.set(normalized, doc);
+      this.#record(async () => {
+        await (this.#snapshot as SnapshotStore).putDocument(owner.id, { ...node, path: normalized }, doc);
+      });
       return doc;
     } catch (error) {
       const stale = this.#serveStaleOnError ? this.#docCache.getStale(normalized) : undefined;
@@ -590,8 +837,141 @@ export class Vfs {
    * directories land in one list, so names are shown relative to the search root — both
    * because the user wants to know *where* a hit lives, and because a bare leaf name is
    * not unique across folders.
+   *
+   * The local snapshot is consulted *before* any of that. It answers in about a
+   * millisecond from indexes that are already on disk, and its hits are merged with the
+   * network's, deduplicated by node id with the live copy winning. That ordering is what
+   * makes search survive a dead network: the recent past always answers, and the archive
+   * answers when it can. The snapshot reports as a source of its own so the result never
+   * pretends a local-only answer was exhaustive.
    */
   async search(path: string, query: Query, options: SearchOptions = {}): Promise<VfsListResult> {
+    const normalized = vpath.normalize(path);
+    const limit = options.limit ?? this.#defaultPageSize;
+    const local = await this.#snapshotSearch(normalized, query, options);
+
+    if (options.local === true) {
+      const named = this.#nameSearchHits(normalized, local.entries);
+      const ranked = options.sort === undefined && (options.rank ?? true);
+      const ordered = ranked ? rankHits(named, query) : options.sort === undefined ? named : sortNodes(named, options.sort);
+      return {
+        path: normalized,
+        entries: ordered.slice(0, limit),
+        undecided: 0,
+        stale: false,
+        total: ordered.length,
+        ...(local.report === undefined ? {} : { sources: [local.report] }),
+        ranked,
+      };
+    }
+
+    const live = await this.#searchProviders(normalized, query, options);
+    return this.#mergeSnapshotHits(normalized, query, options, live, local);
+  }
+
+  /**
+   * Merge local snapshot hits into a live result set.
+   *
+   * The live copy wins every collision. A snapshot row is a photograph of a message as it
+   * was when it was cached: the provider's version knows it has since been read, moved or
+   * flagged, and showing the stale one would have the user acting on yesterday's state.
+   */
+  #mergeSnapshotHits(
+    root: string,
+    query: Query,
+    options: SearchOptions,
+    live: VfsListResult,
+    local: { entries: readonly VNode[]; report?: SearchSourceReport },
+  ): VfsListResult {
+    if (local.entries.length === 0) return local.report === undefined ? live : { ...live, sources: [...(live.sources ?? []), local.report] };
+
+    const limit = options.limit ?? this.#defaultPageSize;
+    const seen = new Set(live.entries.map((entry) => entry.id));
+    const extra = local.entries.filter((entry) => !seen.has(entry.id));
+    if (extra.length === 0) {
+      return local.report === undefined ? live : { ...live, sources: [...(live.sources ?? []), local.report] };
+    }
+
+    const named = this.#nameSearchHits(root, [...live.entries, ...extra]);
+    const ranked = live.ranked ?? (options.sort === undefined && (options.rank ?? true));
+    const ordered = ranked ? rankHits(named, query) : options.sort === undefined ? named : sortNodes(named, options.sort);
+
+    return {
+      ...live,
+      entries: ordered.slice(0, limit),
+      total: ordered.length,
+      ...(local.report === undefined ? {} : { sources: [...(live.sources ?? []), local.report] }),
+      ranked,
+    };
+  }
+
+  /**
+   * Candidates from the local indexes, filtered by the engine's own query evaluator.
+   *
+   * The snapshot proposes; `evaluateQuery` disposes. Re-implementing the query language in
+   * SQL would give two subtly different search semantics depending on whether a message
+   * happened to be cached, which is a far worse bug than a slow search — so the SQL side
+   * over-retrieves on purpose and the real evaluator makes every decision.
+   */
+  async #snapshotSearch(
+    root: string,
+    query: Query,
+    options: SearchOptions,
+  ): Promise<{ entries: readonly VNode[]; report?: SearchSourceReport }> {
+    if (this.#snapshot === undefined) return { entries: [] };
+    const started = this.#now();
+    const limit = options.limit ?? this.#defaultPageSize;
+
+    let hits: readonly SnapshotHit[];
+    try {
+      hits = await this.#snapshot.candidates(query, {
+        root,
+        limit,
+        ...(options.semantic === undefined ? {} : { semantic: options.semantic }),
+      });
+    } catch (error) {
+      return {
+        entries: [],
+        report: {
+          id: 'snapshot',
+          path: root,
+          provider: 'Local snapshot',
+          native: true,
+          status: 'failed',
+          matches: 0,
+          durationMs: this.#now() - started,
+          truncated: false,
+          undecided: 0,
+          error: describeError(error),
+        },
+      };
+    }
+
+    const entries: VNode[] = [];
+    for (const hit of hits) {
+      const verdict = evaluateQuery(query, hit.node, hit.body === undefined ? undefined : { body: hit.body });
+      if (verdict === true) entries.push(hit.node);
+    }
+
+    return {
+      entries,
+      report: {
+        id: 'snapshot',
+        path: root,
+        provider: 'Local snapshot',
+        native: true,
+        status: 'ok',
+        matches: entries.length,
+        durationMs: this.#now() - started,
+        // Always true: the snapshot holds the recent past by construction, so "no local
+        // hits" must never be presented as "no such message exists".
+        truncated: true,
+        undecided: 0,
+      },
+    };
+  }
+
+  async #searchProviders(path: string, query: Query, options: SearchOptions): Promise<VfsListResult> {
     const normalized = vpath.normalize(path);
     const located = this.findMount(normalized);
     const explicitSources = options.sources !== undefined && options.sources.length > 0;
@@ -780,7 +1160,10 @@ export class Vfs {
 
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const work = this.search(mount.path, query, perSource);
+      // Deliberately the provider path, not the public `search`: the snapshot has already
+      // been consulted once for the whole result set, and asking it again per mount would
+      // pay for the same local query N times to produce rows that are then deduplicated.
+      const work = this.#searchProviders(mount.path, query, perSource);
       const page =
         timeoutMs > 0
           ? await Promise.race([
@@ -1038,6 +1421,41 @@ export class Vfs {
       }
     }
 
+    // Nothing usable in memory. Before paying for the network, ask the local snapshot —
+    // this is the cold-start path, and the whole point of having one. It only answers
+    // un-narrowed first pages: the snapshot holds the recent past, so serving a *filtered*
+    // listing from it would silently answer "no matches" for something sitting just
+    // outside retention. Filtered listings go to the provider, which can see everything.
+    if (this.#snapshot !== undefined && options.cursor === undefined && isMatchAll(options.query)) {
+      const limit = options.limit ?? this.#defaultPageSize;
+      const listing = await this.#snapshot.listing(path, { limit }).catch(() => undefined);
+      if (listing !== undefined && listing.entries.length > 0) {
+        const merged = this.#mergeIntoIndex(
+          path,
+          {
+            entries: listing.entries,
+            ...(listing.cursor === undefined ? {} : { cursor: listing.cursor }),
+            ...(listing.total === undefined ? {} : { total: listing.total }),
+          },
+          true,
+        );
+        const index = this.#dirCache.get(path);
+        if (index !== undefined) index.complete = listing.complete;
+
+        // A stale snapshot is still served immediately, and refreshed behind the user's
+        // back. Blocking on the network to correct a listing that is minutes old trades a
+        // certainty (a slow command) for a possibility (a changed folder).
+        if (!listing.fresh) this.#refreshInBackground(mount, node, path, limit);
+
+        return {
+          entries: merged.slice(0, limit),
+          ...(listing.cursor === undefined ? {} : { cursor: listing.cursor }),
+          ...(listing.total === undefined ? {} : { total: listing.total }),
+          fromCache: true,
+        };
+      }
+    }
+
     const providerOptions: ListOptions = {
       ...options,
       ...(options.cursor !== undefined && offset === undefined ? { cursor: options.cursor } : {}),
@@ -1045,7 +1463,32 @@ export class Vfs {
     if (offset !== undefined) delete (providerOptions as { cursor?: string }).cursor;
 
     const page = await mount.provider.list(node, providerOptions);
-    const merged = this.#mergeIntoIndex(path, page, options.cursor === undefined && offset === undefined);
+    const isFirstPage = options.cursor === undefined && offset === undefined;
+    const merged = this.#mergeIntoIndex(path, page, isFirstPage);
+
+    // Only un-narrowed pages are worth snapshotting: a filtered page is a fact about a
+    // query, not about the folder, and storing it as though it were the folder is how a
+    // cache starts lying.
+    //
+    // `merged`, not `page.entries`: the provider's raw names are backend text, not
+    // filenames, and storing those would give the cache paths the engine can never
+    // resolve — and would silently merge two items whose names only differ after
+    // deduplication.
+    if (isMatchAll(options.query) && page.appliedQuery === undefined) {
+      this.#record(async () => {
+        await (this.#snapshot as SnapshotStore).putListing({
+          mountId: mount.id,
+          path,
+          entries: merged,
+          page: {
+            ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+            ...(page.total === undefined ? {} : { total: page.total }),
+          },
+          isFirstPage,
+          complete: page.cursor === undefined,
+        });
+      });
+    }
 
     return {
       entries: merged,
@@ -1053,6 +1496,68 @@ export class Vfs {
       ...(page.total === undefined ? {} : { total: page.total }),
       ...(page.appliedQuery === undefined ? {} : { appliedQuery: page.appliedQuery }),
     };
+  }
+
+  /**
+   * Correct a stale snapshot listing after it has already been served.
+   *
+   * Deliberately fire-and-forget and deliberately silent on failure: the user already has
+   * their answer, so the only thing an error here could do is interrupt them with news
+   * about work they never asked for.
+   */
+  #refreshInBackground(mount: Mount, node: VNode | null, path: string, limit: number): void {
+    const queue = this.#prefetchQueue;
+    if (queue === undefined) return;
+    queue.schedule({
+      key: `refresh:${path}`,
+      priority: PREFETCH_PRIORITY.nextPage,
+      path,
+      run: async () => {
+        const page = await mount.provider.list(node, { limit });
+        const merged = this.#mergeIntoIndex(path, page, true);
+        this.#record(async () => {
+          await (this.#snapshot as SnapshotStore).putListing({
+            mountId: mount.id,
+            path,
+            entries: merged,
+            page: {
+              ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+              ...(page.total === undefined ? {} : { total: page.total }),
+            },
+            isFirstPage: true,
+            complete: page.cursor === undefined,
+          });
+        });
+      },
+    });
+  }
+
+  /**
+   * Give a page of provider entries the names and paths this engine would give them.
+   *
+   * Exists for {@link BackgroundSync}, which calls providers directly and would otherwise
+   * store raw backend text as if it were a filename. It reuses the directory's live index
+   * when there is one, so an item keeps the name the user is already looking at, and
+   * allocates from a scratch index when there is not — the same code either way, because
+   * two naming implementations would eventually disagree and the disagreement would look
+   * like a message that cannot be opened.
+   *
+   * The index is not published to the cache: this is a naming question, not a fetch, and
+   * a background sync should not make a folder look freshly listed to the foreground.
+   */
+  canonicalize(path: string, entries: readonly VNode[]): readonly VNode[] {
+    const existing = this.#dirCache.get(path);
+    const allocator = existing?.allocator ?? new NameAllocator();
+    const byId = existing?.byId ?? new Map<string, string>();
+
+    return entries.map((entry) => {
+      let name = byId.get(entry.id);
+      if (name === undefined) {
+        name = allocator.allocate(entry.name);
+        byId.set(entry.id, name);
+      }
+      return { ...entry, name, path: vpath.join(path, name) };
+    });
   }
 
   /**

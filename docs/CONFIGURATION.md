@@ -51,6 +51,7 @@ genuinely unrelated key gets a plain "unknown key" rather than a misleading gues
 | `ui` | object | Display settings. |
 | `notifications` | object | Desktop notification settings. |
 | `keymap` | object | Key rebindings for the opt-in TUI. |
+| `cache` | object | Local Turso/libSQL snapshot, background sync and prefetching. |
 | `ttlMs` | number | Default cache lifetime for listings, in milliseconds. |
 
 ## `mounts`
@@ -420,6 +421,88 @@ you believed you would be told.
 
 On Windows, toasts are attributed to PowerShell unless you set `appId` to a registered
 AUMID. `doctor` says so rather than leaving you to wonder.
+
+## `cache`
+
+Off by default. Turn it on and the tool keeps a local libSQL (Turso) database of what it
+has seen, syncs new mail into it in the background, and answers from it first.
+
+```jsonc
+"cache": {
+  "enabled": true,
+  "recent": 500,
+  "bodies": 25
+}
+```
+
+That is the whole of a useful configuration: keep the last 500 items per folder and
+pre-download 25 bodies a cycle so the messages you are most likely to open are already
+there. Everything below has a working default.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Keep a local snapshot at all. |
+| `path` | string | `snapshot.db` in the cache dir | Where the database file lives. |
+| `driver` | string | `auto` | Backend: `auto`, `libsql`, `libsql-remote`, `node-sqlite`. |
+| `syncUrl` | string | — | Remote Turso database, e.g. `libsql://mail-org.turso.io`. |
+| `authToken` | string | — | Token for it. Use `${env:TURSO_AUTH_TOKEN}`, not a literal. |
+| `recent` | number | 200 | Items kept per folder, and refreshed per sync cycle. The rest are evicted. |
+| `ttlMs` | number | 300000 | How long a snapshot listing is considered fresh. |
+| `intervalMs` | number | 300000 | Background sync period. Floors at 30s. |
+| `depth` | number | 2 | How far below each mount root to sync. |
+| `bodies` | number | 0 | Message bodies to pre-download per folder per cycle. 0 disables. |
+| `vectors` | boolean | `true` | Build embeddings so `find` can match on meaning. |
+| `prefetch` | boolean | `true` | Fetch what you are about to open, before you open it. |
+| `prefetchConcurrency` | number | 2 | Speculative fetches in flight at once. |
+
+### What it buys you
+
+Cold start stops being cold. Opening the shell and typing `ls /mail/Inbox` reads from disk
+instead of waiting on Graph, so the first listing arrives in milliseconds rather than
+seconds. Navigation gets faster still: moving into a folder triggers speculative fetches of
+the places you usually go next, so the folder is often already loaded when you ask for it.
+
+`find` searches the snapshot before touching the network, and merges the live results in as
+they arrive. You see local matches immediately and remote ones when they land. With
+`vectors` on, the local half also matches on meaning, so "quarterly numbers" can find a
+message titled "Q3 financials". `find --local` stops at the snapshot and never contacts a
+source — useful on a plane, and the fastest possible answer.
+
+### `recent`, and why the cache is deliberately incomplete
+
+`recent` caps how many items are kept per folder. A mailbox with 80,000 messages is not
+worth replicating to answer questions about the last fortnight, and trying would make the
+first sync so long that nobody would leave it on.
+
+This shapes what the cache is allowed to answer. A snapshot listing serves an ordinary `ls`
+because the newest items are exactly the ones it holds. A *filtered* `ls` goes to the
+source instead: answering `is:unread` locally could report nothing while an unread message
+from six months ago sits just outside the window, and a wrong answer that looks like a
+right one is worse than a slow one. Search behaves the same way — it never concludes
+absence from the snapshot alone, and `find` says how many results came from it.
+
+### `driver`
+
+`auto` is right unless you have a reason.
+
+- **`libsql`** — the native Turso client. Local file, optional embedded replica of a remote
+  database, and vector similarity computed inside the database. The best option where a
+  prebuilt binary exists.
+- **`libsql-remote`** — the pure-JavaScript client, talking to `syncUrl` over HTTP. Used
+  where the native binary has no build for the platform. Requires `syncUrl`; there is no
+  local file, so this is a network cache rather than an offline one.
+- **`node-sqlite`** — Node's built-in SQLite (22.5+). Local only, no replication, and
+  similarity is computed in-process. Slower on large vector sets, otherwise identical.
+
+Pinning a driver that cannot load is an error at startup with a hint saying why, rather
+than a silent fallback: if you asked for a replica of a shared database, quietly giving you
+a local-only file would be the wrong kind of help.
+
+### When it cannot start
+
+A cache that will not open is a slower program, not a broken one. Startup records the
+reason and carries on with in-memory caching; `cache` prints it on stderr. `cache clear`
+empties it, `cache sync` forces a cycle immediately instead of waiting for the timer.
 
 ## `queries`
 

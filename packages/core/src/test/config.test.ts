@@ -215,6 +215,131 @@ describe('validateConfig', () => {
   });
 });
 
+describe('validateConfig: cache', () => {
+  const withCache = (cache: unknown): unknown => ({ ...minimal, cache });
+
+  it('defaults to no cache block at all', () => {
+    assert.deepEqual(validateConfig(minimal).cache, {});
+  });
+
+  it('accepts a full cache block and keeps every field', () => {
+    const config = validateConfig(
+      withCache({
+        enabled: true,
+        path: '/tmp/snapshot.db',
+        driver: 'libsql',
+        syncUrl: 'libsql://mail-org.turso.io',
+        authToken: '${env:TURSO_AUTH_TOKEN}',
+        recent: 500,
+        ttlMs: 60_000,
+        intervalMs: 120_000,
+        depth: 2,
+        bodies: 25,
+        vectors: true,
+        prefetch: true,
+        prefetchConcurrency: 3,
+      }),
+    );
+    assert.equal(config.cache.driver, 'libsql');
+    assert.equal(config.cache.recent, 500);
+    assert.equal(config.cache.vectors, true);
+    assert.equal(config.cache.authToken, '${env:TURSO_AUTH_TOKEN}');
+  });
+
+  it('accepts every driver it advertises', () => {
+    for (const driver of ['auto', 'libsql', 'libsql-remote', 'node-sqlite']) {
+      assert.equal(validateConfig(withCache({ driver })).cache.driver, driver);
+    }
+  });
+
+  it('rejects a driver it does not have, and lists the ones it does', () => {
+    assert.throws(
+      () => validateConfig(withCache({ driver: 'postgres' })),
+      (error: unknown) =>
+        error instanceof VfsError &&
+        error.code === 'ECONFIG' &&
+        error.message.includes('libsql-remote') &&
+        error.message.includes('node-sqlite'),
+    );
+  });
+
+  it('rejects an auth token with nothing to authenticate to', () => {
+    // Left alone this is the worst kind of misconfiguration: everything appears to work,
+    // because the local file is perfectly functional, and nothing ever reaches the server.
+    assert.throws(
+      () => validateConfig(withCache({ authToken: 'secret' })),
+      (error: unknown) => error instanceof VfsError && /syncUrl/i.test(error.message),
+    );
+  });
+
+  it('accepts a syncUrl without a token, for a database that does not need one', () => {
+    const config = validateConfig(withCache({ syncUrl: 'libsql://local.turso.io' }));
+    assert.equal(config.cache.syncUrl, 'libsql://local.turso.io');
+    assert.equal(config.cache.authToken, undefined);
+  });
+
+  it('rejects negative numbers', () => {
+    for (const key of ['recent', 'ttlMs', 'intervalMs', 'depth', 'bodies', 'prefetchConcurrency']) {
+      assert.throws(
+        () => validateConfig(withCache({ [key]: -1 })),
+        (error: unknown) => error instanceof VfsError && error.message.includes(`cache.${key}`),
+        `expected cache.${key} to reject -1`,
+      );
+    }
+  });
+
+  it('rejects numbers that are not numbers', () => {
+    for (const bad of ['100', null, {}, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () => validateConfig(withCache({ recent: bad })),
+        (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+        `expected cache.recent to reject ${JSON.stringify(bad) ?? String(bad)}`,
+      );
+    }
+  });
+
+  it('accepts zero, because "cache nothing" is a real answer', () => {
+    // bodies: 0 means "index headers but never pre-download a message" — the setting
+    // someone on a metered connection actually wants.
+    assert.equal(validateConfig(withCache({ bodies: 0 })).cache.bodies, 0);
+  });
+
+  it('rejects a flag that is not a boolean', () => {
+    for (const key of ['enabled', 'vectors', 'prefetch']) {
+      assert.throws(
+        () => validateConfig(withCache({ [key]: 'yes' })),
+        (error: unknown) => error instanceof VfsError && error.message.includes(`cache.${key}`),
+        `expected cache.${key} to reject "yes"`,
+      );
+    }
+  });
+
+  it('rejects a blank path rather than quietly writing somewhere unexpected', () => {
+    for (const key of ['path', 'syncUrl', 'authToken']) {
+      const entry = key === 'authToken' ? { authToken: '  ', syncUrl: 'libsql://x' } : { [key]: '  ' };
+      assert.throws(
+        () => validateConfig(withCache(entry)),
+        (error: unknown) => error instanceof VfsError && error.message.includes(`cache.${key}`),
+        `expected cache.${key} to reject whitespace`,
+      );
+    }
+  });
+
+  it('rejects a cache block that is not an object', () => {
+    assert.throws(
+      () => validateConfig(withCache('on')),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+  });
+
+  it('says which file the bad cache setting is in', () => {
+    assert.throws(
+      () => validateConfig(withCache({ driver: 'nope' }), '/etc/mscomms.jsonc'),
+      (error: unknown) => error instanceof VfsError && error.message.includes('/etc/mscomms.jsonc'),
+    );
+  });
+});
+
 describe('resolveAppPaths', () => {
   it('follows XDG on Linux', () => {
     const paths = resolveAppPaths(
