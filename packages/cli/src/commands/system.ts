@@ -18,6 +18,11 @@ import {
   type SqlDriver,
 } from '@mscomms/core';
 import { formatRows } from '../format.js';
+import {
+  resolveMcpServer,
+  resolveTransport,
+  type GraphSharedOptions,
+} from '@mscomms/provider-graph';
 import { OUTPUT_FLAGS, flagBool, modeFrom, quoteCorrection, type Command, type CommandTable } from './types.js';
 
 export function createHelpCommand(table: CommandTable): Command {
@@ -218,6 +223,27 @@ export const doctorCommand: Command = {
           detail: `${error instanceof Error ? error.message : String(error)}${vfsError?.hint === undefined ? '' : ` — ${vfsError.hint}`}`,
         });
       }
+    }
+
+    // How the Microsoft 365 mounts actually reach M365. Worth reporting even when nothing
+    // is wrong: "why is it asking me to sign in?" is only answerable if the tool will say
+    // which way it is set up.
+    const graphMounts = session.config.mounts.filter((mount) => mount.type.startsWith('graph-'));
+    if (graphMounts.length > 0) {
+      const options = graphMounts.map((mount) => (mount.options ?? {}) as GraphSharedOptions);
+      const viaMcp = options.filter((option) => resolveTransport(option) === 'mcp');
+      const prompting = options.length - viaMcp.length;
+      const server = viaMcp[0] === undefined ? undefined : resolveMcpServer(viaMcp[0].mcp ?? {});
+      const total = String(options.length);
+
+      checks.push({
+        name: 'microsoft 365 access',
+        status: 'ok',
+        detail:
+          prompting === 0
+            ? `All ${total} Microsoft 365 source(s) go through the MCP server \`${[server?.command, ...(server?.args ?? [])].join(' ')}\`, which is already signed in. You will not be asked to sign in.`
+            : `${String(prompting)} of ${total} Microsoft 365 source(s) will ask you to sign in with a device code. Set "transport": "mcp" on the mount, or install an MCP server that provides Microsoft 365 access, to avoid that.`,
+      });
     }
 
     checks.push({

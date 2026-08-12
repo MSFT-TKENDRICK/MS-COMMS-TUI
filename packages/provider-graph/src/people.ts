@@ -76,7 +76,13 @@ import {
   type VNode,
 } from '@mscomms/core';
 import type { GraphApi } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import {
+  createClient,
+  htmlToText,
+  preview,
+  validateSharedOptions,
+  type GraphSharedOptions,
+} from './shared.js';
 
 export interface GraphPeopleOptions extends GraphSharedOptions {
   readonly pageSize?: number;
@@ -1789,6 +1795,7 @@ export const graphPeoplePlugin: ProviderPlugin<GraphPeopleOptions> = {
   description:
     'The corporate hierarchy as folders, and every conversation with a person in one list, most owed first.',
   validateOptions(raw) {
+    validateSharedOptions(raw);
     return (raw ?? {}) as GraphPeopleOptions;
   },
   create(options, context) {

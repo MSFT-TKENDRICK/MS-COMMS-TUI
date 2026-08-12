@@ -149,6 +149,8 @@ Read-only unless you grant write scopes. Mail folders become directories; messag
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
+| `transport` | `auto` \| `mcp` \| `device-code` | `auto` | How to reach Microsoft 365. See below. |
+| `mcp` | object | discovered | The MCP server to run: `{ "command": ..., "args": [...], "server": ... }`. |
 | `clientId` | string | Microsoft Graph Command Line Tools | Your own app registration, if the default is blocked. |
 | `tenantId` | string | `common` | Single-tenant directory ID. |
 | `scopes` | string[] | see below | Add `Mail.ReadWrite` to mark messages read. |
@@ -157,12 +159,39 @@ Read-only unless you grant write scopes. Mail folders become directories; messag
 | `includeHiddenFolders` | boolean | `false` | Include folders Outlook hides. |
 | `timeoutMs` | number | 30000 | Per-request timeout. |
 
-Sign-in is the OAuth device code flow: the program prints a URL and a code, you approve in
-a browser, and the refresh token is stored in the data directory. No password is ever
-typed into the terminal.
+#### Reaching Microsoft 365
 
-The default scope set covers both mail and Teams, because one consent prompt is kinder than
-two:
+There are two ways in, and by default you are not asked to choose.
+
+**Through an MCP server (preferred).** If a Microsoft 365 MCP server is configured on the
+machine, the provider talks to it over stdio and the server supplies the identity. Nothing
+signs in, because the sign-in already happened. This is the right answer on a machine where
+you are logged into M365 anyway: a second credential to manage is not a security feature.
+Run `mscomms doctor` to see which path a mount will take before you rely on it.
+
+The server is found in this order, and each step is by *name* — the tool never guesses which
+of your installed servers looks mail-shaped:
+
+1. `mcp.command` in the mount options.
+2. `MSCOMMS_GRAPH_MCP_COMMAND` (split on spaces).
+3. `mcpServers.<name>` in `MSCOMMS_GRAPH_MCP_CONFIG`, then `~/.copilot/mcp-config.json`,
+   then the installed WorkIQ plugin's `.mcp.json`. `<name>` is `mcp.server`, default
+   `workiq`.
+4. Failing all of that, `npx -y @microsoft/workiq@latest mcp`.
+
+**Device code.** The OAuth device code flow: the program prints a URL and a code, you
+approve in a browser, and the refresh token is stored in the data directory. No password is
+ever typed into the terminal. This is the path for machines with no MCP server, and for CI,
+where `MSCOMMS_GRAPH_TOKEN` is injected instead.
+
+`transport: "auto"` picks between them: an explicit `MSCOMMS_GRAPH_TOKEN` or `transport`
+setting wins, otherwise an MCP server is used if one can be found, otherwise device code.
+Set `transport` explicitly to pin the behaviour — a mount that says `"mcp"` fails loudly if
+the server is missing rather than quietly prompting you to sign in.
+
+The scope and `clientId` options apply only to the device-code path; under MCP the server
+already holds the token, so they are ignored. The default scope set covers both mail and
+Teams, because one consent prompt is kinder than two:
 
 ```
 offline_access  User.Read  Mail.Read  MailboxSettings.Read
@@ -185,7 +214,7 @@ Chats, teams, channels and threads become directories; messages become files.
 | `maxReplies` | number | 50 | Replies fetched per thread. |
 | `pageSize` | number | 50 | Messages fetched per request. |
 
-Plus every `graph-mail` authentication option. Teams scopes such as
+Plus every `graph-mail` transport and authentication option. Teams scopes such as
 `ChannelMessage.Read.All` require admin consent in most tenants; without them the provider
 degrades to what it can reach rather than failing outright, and `mounts` reports the
 reduced capability set.
@@ -231,7 +260,8 @@ the people themselves, so `ls Recent` puts whoever is most waiting on you at the
 Mail and chat are **merged**, never grouped by channel, because a reply you missed is
 missed precisely because it arrived in the app you were not looking at.
 
-Two scopes beyond the `graph-mail` set are needed and are in the default:
+Two scopes beyond the `graph-mail` set are needed and are in the default (device-code path
+only — under MCP the server's own consent governs):
 `User.ReadBasic.All` and `People.Read`. `User.Read.All` is better if your tenant will grant
 it — job titles, departments and offices need it, and the provider retries with the basic
 property set when it is refused rather than failing. `/me/people`, the chat roster and the
@@ -601,6 +631,9 @@ no registration.
 | `MSCOMMS_CONFIG` | Config file path. |
 | `MSCOMMS_CONFIG_DIR` | Directory searched for the config file. |
 | `MSCOMMS_DATA_DIR` | Cache, logs, notification history and tokens. |
+| `MSCOMMS_GRAPH_TOKEN` | A pre-issued Graph token. Its presence pins the transport to device-code. |
+| `MSCOMMS_GRAPH_MCP_COMMAND` | The MCP server command line, split on spaces. |
+| `MSCOMMS_GRAPH_MCP_CONFIG` | An MCP config file to read `mcpServers` from, searched first. |
 | `MSCOMMS_PLAIN` | Set to anything to force plain output. |
 | `MSCOMMS_ANNOUNCE` | Set to anything to force sentence-style output. |
 | `NO_COLOR` | Disables colour, whatever `ui.color` says. |

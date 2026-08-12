@@ -1,11 +1,16 @@
 /**
  * Shared plumbing for the Graph-backed providers.
  *
- * Both the mail provider and the Teams provider need the same authenticator. Creating one
- * per mount would mean two device-code prompts on first run, which is exactly the kind of
- * small papercut that makes people stop using a tool. The authenticator is therefore
- * cached per (authority, tenant, client, scope-set, resource identity) for the lifetime of
- * the process.
+ * Both the mail provider and the Teams provider need the same access. Creating one per
+ * mount would mean two sign-in prompts on first run, which is exactly the kind of small
+ * papercut that makes people stop using a tool. Whatever the transport, it is therefore
+ * cached and shared across mounts for the lifetime of the process.
+ *
+ * There are two ways in:
+ *
+ *   - An **MCP server** that already holds the user's M365 access. Preferred when one is
+ *     present, because a machine that is already signed in should never be asked again.
+ *   - The **device-code flow**, for machines with no such server.
  *
  * The Azure DevOps provider reuses `getAuthenticator` too. It is not a Graph client — the
  * API, the base URL and the error semantics are all different — but the sign-in *is* the
@@ -14,8 +19,24 @@
  */
 
 import type { Logger, StateStore } from '@mscomms/core';
+import { VfsError } from '@mscomms/core';
 import { DeviceCodeAuthenticator, DEFAULT_CLIENT_ID, DEFAULT_SCOPES } from './auth.js';
-import { GraphClient } from './client.js';
+import { GraphClient, type GraphApi } from './client.js';
+import {
+  closeAllMcpClients,
+  getMcpClient,
+  hasDiscoverableMcpServer,
+  McpGraphApi,
+  type McpTransportOptions,
+} from './mcp.js';
+
+/**
+ * How a mount reaches Microsoft 365.
+ *
+ * `auto` prefers an already-authenticated MCP server and falls back to signing in, so the
+ * common case — a provisioned work machine — needs no configuration and raises no prompt.
+ */
+export type GraphTransport = 'auto' | 'mcp' | 'device-code';
 
 export interface GraphSharedOptions {
   readonly clientId?: string;
@@ -24,6 +45,8 @@ export interface GraphSharedOptions {
   readonly baseUrl?: string;
   readonly scopes?: readonly string[];
   readonly timeoutMs?: number;
+  readonly transport?: GraphTransport;
+  readonly mcp?: McpTransportOptions;
 }
 
 const authenticators = new Map<string, DeviceCodeAuthenticator>();
@@ -78,7 +101,65 @@ export function getAuthenticator(
   return authenticator;
 }
 
-export function createClient(options: GraphSharedOptions, state: StateStore, logger: Logger): GraphClient {
+/**
+ * Decide how a mount will reach Microsoft 365.
+ *
+ * An explicit `transport` is always honoured, including `device-code` on a machine that
+ * has an MCP server: someone who asks to sign in should be allowed to.
+ */
+export function resolveTransport(options: GraphSharedOptions): Exclude<GraphTransport, 'auto'> {
+  if (options.transport !== undefined && options.transport !== 'auto') return options.transport;
+  // A caller-supplied token already avoids the prompt, and it names the exact audience the
+  // user wants, so it wins over a generic server.
+  const token = process.env['MSCOMMS_GRAPH_TOKEN'];
+  if (token !== undefined && token.trim() !== '') return 'device-code';
+  return hasDiscoverableMcpServer(options.mcp ?? {}) ? 'mcp' : 'device-code';
+}
+
+const TRANSPORTS: readonly GraphTransport[] = ['auto', 'mcp', 'device-code'];
+
+/**
+ * Check the transport options a mount declares.
+ *
+ * The plugins otherwise cast their options through untouched, which means a misspelled
+ * key is silently ignored. For most options that is a cosmetic problem; for this one it
+ * is not, because the visible symptom of `"transprot": "mcp"` is a sign-in prompt the
+ * user explicitly configured the tool to avoid, with nothing on screen to explain it.
+ */
+export function validateSharedOptions(raw: unknown): void {
+  if (raw === undefined || raw === null) return;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw VfsError.config('Mount "options" must be an object.');
+  }
+  const options = raw as Record<string, unknown>;
+
+  const transport = options['transport'];
+  if (transport !== undefined && !TRANSPORTS.includes(transport as GraphTransport)) {
+    throw VfsError.config(
+      `"transport" must be one of ${TRANSPORTS.map((value) => `"${value}"`).join(', ')}, not ${JSON.stringify(transport)}.`,
+    );
+  }
+
+  const mcp = options['mcp'];
+  if (mcp !== undefined && (typeof mcp !== 'object' || mcp === null || Array.isArray(mcp))) {
+    throw VfsError.config('"mcp" must be an object describing the server to run, such as { "command": "npx" }.');
+  }
+  if (mcp !== undefined) {
+    const server = mcp as Record<string, unknown>;
+    if (server['command'] !== undefined && typeof server['command'] !== 'string') {
+      throw VfsError.config('"mcp.command" must be the name of a program to run.');
+    }
+    if (server['args'] !== undefined && !Array.isArray(server['args'])) {
+      throw VfsError.config('"mcp.args" must be a list of arguments.');
+    }
+  }
+}
+
+export function createClient(options: GraphSharedOptions, state: StateStore, logger: Logger): GraphApi {
+  if (resolveTransport(options) === 'mcp') {
+    return new McpGraphApi(getMcpClient(options.mcp ?? {}, logger));
+  }
+
   const authenticator = getAuthenticator(options, state, logger);
   return new GraphClient({
     getToken: () => authenticator.getToken(),
@@ -91,6 +172,9 @@ export function createClient(options: GraphSharedOptions, state: StateStore, log
 export async function resetAllAuth(): Promise<void> {
   for (const authenticator of authenticators.values()) await authenticator.signOut();
   authenticators.clear();
+  // The MCP servers hold no credentials of ours, but leaving them running after an
+  // explicit reset would be surprising.
+  closeAllMcpClients();
 }
 
 /**

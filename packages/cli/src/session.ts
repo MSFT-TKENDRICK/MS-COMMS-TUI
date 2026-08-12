@@ -40,6 +40,7 @@ import {
   type VNode,
   type VfsTarget,
 } from '@mscomms/core';
+import { closeAllMcpClients } from '@mscomms/provider-graph';
 import { DEFAULT_FORMAT, type FormatOptions, type OutputMode } from './format.js';
 
 export interface SessionOptions {
@@ -224,6 +225,9 @@ export class Session {
     await this.vfs.flush().catch(() => undefined);
     await this.snapshot?.close().catch(() => undefined);
     await this.vfs.dispose();
+    // Shared across every Graph mount rather than owned by one, so it is released here
+    // with the session that outlives them all.
+    closeAllMcpClients();
   }
 
   /**

@@ -429,6 +429,58 @@ for both the results and the queue. Every provider gets the fix; only this one n
 same applies to `provider-memory`, whose fixtures can now be graphs (`refs`) rather than
 trees, so the offline demo models the real shape instead of a convenient approximation of it.
 
+## Two ways into Microsoft 365
+
+The three Graph providers reach Microsoft the same way, through one narrow interface in
+`provider-graph/src/client.ts`:
+
+```ts
+interface GraphApi {
+  get<T>(path): Promise<T>;
+  getPage<T>(path): Promise<GraphPage<T>>;
+  getBytes(path): Promise<{ bytes: Uint8Array; contentType: string }>;
+  post<T>(path, body): Promise<T>;
+  patch<T>(path, body): Promise<T>;
+}
+```
+
+Five methods, and `mail.ts`, `chat.ts` and `people.ts` know nothing else about how a request
+is made. There are two implementations behind it, and `createClient` in `shared.ts` is the
+single place that chooses:
+
+**`GraphClient` — HTTPS with a device-code token.** The original path. Prints a URL and a
+code, caches the refresh token in the data directory, and talks to `graph.microsoft.com`.
+
+**`McpGraphApi` — an already-authenticated MCP server over stdio.** Spawns a Microsoft 365
+MCP server, speaks JSON-RPC 2.0 over newline-delimited stdio, and maps each `GraphApi` call
+onto a tool: `get`/`getPage` → `fetch`, `getBytes` → `fetch_blob`, `post` → `do_action`,
+`patch` → `update_entity`. **The server holds the identity**, which is the whole point: on a
+machine where the user is already signed into M365, asking them to sign in again is not a
+security property, it is a second credential to manage and a prompt to dismiss.
+
+`resolveTransport` picks: an explicit `transport` wins, then a non-blank
+`MSCOMMS_GRAPH_TOKEN` (already promptless, and it names an exact audience), then an MCP
+server if one can be discovered, then device code. Discovery is **by name**, never by
+guessing which installed server looks mail-capable.
+
+Three things about this were only learnt by running it, and are worth not rediscovering:
+
+**Relative paths, absolute next links.** The MCP server requires relative entity paths, but
+`@odata.nextLink` is always absolute. Without `toRelativeGraphPath` stripping the origin,
+page one works and page two silently returns nothing — the failure appears as a short list,
+not as an error. A mutation test guards it.
+
+**The payload is not where the protocol says it is.** `tools/call` returns `content: []` and
+puts the real body in `structuredContent`. The parser prefers `structuredContent` and falls
+back to a JSON block in `content[].text`, so the day a server does the conventional thing it
+keeps working.
+
+**A child process is three handles, not one.** The child *and each of its stdio pipes* keep
+the libuv loop alive, so a one-shot command like `mscomms ls /mail` printed its answer and
+then hung forever. `unref()` on all four fixes it; an in-flight request holds the loop open
+via its own timeout timer. Shutdown ends stdin first and only then kills, because on Windows
+the direct child is `cmd.exe` and killing it would orphan the real server.
+
 ## The CLI
 
 **`session.ts`** holds mounts, cwd, the last listing, and display settings. The last listing
@@ -475,7 +527,7 @@ are mechanical rather than aesthetic and are set out in [ACCESSIBILITY.md](ACCES
 
 ## Testing
 
-1148 tests, no test framework — `node --test` and `node:assert`.
+1395 tests, no test framework — `node --test` and `node:assert`.
 
 The load-bearing one is `packages/core/src/testing/conformance.ts`: the provider contract
 expressed as an executable suite that every provider runs, including the example `exec`

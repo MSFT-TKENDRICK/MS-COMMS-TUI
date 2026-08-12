@@ -188,4 +188,25 @@ describe('starter config', () => {
       }
     });
   });
+
+  describe('the outlook mount', () => {
+    it('documents how to pin the transport, since the default is automatic', () => {
+      // Someone who wants to be certain no sign-in can happen needs to find this without
+      // reading the source; someone with no MCP server needs to know the other value exists.
+      assert.match(STARTER_CONFIG, /"transport"/);
+      assert.ok(STARTER_CONFIG.includes('device-code'), 'the fallback transport is not named');
+    });
+
+    it('spells the transport values the way the validator accepts them', () => {
+      // A documented value the validator rejects is worse than no documentation: it is
+      // copied verbatim and then fails.
+      const plugin = builtinRegistry().get('graph-mail');
+      for (const match of STARTER_CONFIG.matchAll(/"transport"\s*:\s*"([^"]+)"/g)) {
+        assert.doesNotThrow(
+          () => plugin.validateOptions?.({ transport: match[1] }),
+          `the starter config suggests transport "${match[1]}", which the validator rejects`,
+        );
+      }
+    });
+  });
 });

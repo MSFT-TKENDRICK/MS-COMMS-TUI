@@ -37,8 +37,14 @@ import {
   type ReadOptions,
   type VNode,
 } from '@mscomms/core';
-import type { GraphClient, GraphPage } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import type { GraphApi, GraphPage } from './client.js';
+import {
+  createClient,
+  htmlToText,
+  preview,
+  validateSharedOptions,
+  type GraphSharedOptions,
+} from './shared.js';
 
 export interface GraphChatOptions extends GraphSharedOptions {
   /** Skip the Teams/channels tree entirely; useful when the tenant blocks those scopes. */
@@ -93,7 +99,7 @@ export class GraphChatProvider implements Provider {
 
   readonly #options: GraphChatOptions;
   readonly #context: ProviderContext;
-  #client: GraphClient | undefined;
+  #client: GraphApi | undefined;
 
   constructor(options: GraphChatOptions, context: ProviderContext) {
     this.#options = options;
@@ -105,7 +111,7 @@ export class GraphChatProvider implements Provider {
     this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
-  get #api(): GraphClient {
+  get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The Teams mount was not initialised.');
     return this.#client;
   }
@@ -540,6 +546,7 @@ export const graphChatPlugin: ProviderPlugin<GraphChatOptions> = {
   displayName: 'Teams and chats (Microsoft Graph)',
   description: 'Chats, teams, channels and threads as directories; messages as files.',
   validateOptions(raw) {
+    validateSharedOptions(raw);
     return (raw ?? {}) as GraphChatOptions;
   },
   create(options, context) {

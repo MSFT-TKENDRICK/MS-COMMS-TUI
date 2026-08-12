@@ -50,6 +50,39 @@ export interface GraphApi {
   patch<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
 }
 
+/**
+ * Turn a raw Graph collection response into a `GraphPage`.
+ *
+ * Shared with the MCP transport rather than reimplemented there. Paging is the one place
+ * where a subtle difference between two transports would show up as "the listing stops
+ * after 50 items" long after the code was written, so both read the envelope the same way.
+ */
+export function toGraphPage<T>(raw: Record<string, unknown>): GraphPage<T> {
+  return {
+    value: (raw['value'] as T[] | undefined) ?? [],
+    ...(typeof raw['@odata.nextLink'] === 'string' ? { nextLink: raw['@odata.nextLink'] } : {}),
+    ...(typeof raw['@odata.deltaLink'] === 'string' ? { deltaLink: raw['@odata.deltaLink'] } : {}),
+  };
+}
+
+const GRAPH_ORIGIN = /^https:\/\/graph\.microsoft\.com(\/(v1\.0|beta))?/i;
+
+/**
+ * Reduce a Graph URL to the tenant-relative path.
+ *
+ * `@odata.nextLink` always comes back absolute, so any transport that addresses Graph by
+ * path — as the MCP one does — has to strip the origin or paging breaks on the second page.
+ */
+export function toRelativeGraphPath(path: string): string {
+  const relative = path.replace(GRAPH_ORIGIN, '');
+  if (/^https?:\/\//i.test(relative)) {
+    throw new VfsError('ENETWORK', `Not a Microsoft Graph URL: ${path}`, {
+      hint: 'This transport can only address Microsoft Graph itself.',
+    });
+  }
+  return relative.startsWith('/') ? relative : `/${relative}`;
+}
+
 export class GraphClient implements GraphApi {
   readonly #getToken: () => Promise<string>;
   readonly #baseUrl: string;
@@ -120,12 +153,7 @@ export class GraphClient implements GraphApi {
   }
 
   async getPage<T>(path: string, options: GraphRequestOptions = {}): Promise<GraphPage<T>> {
-    const raw = await this.get<Record<string, unknown>>(path, options);
-    return {
-      value: (raw['value'] as T[] | undefined) ?? [],
-      ...(typeof raw['@odata.nextLink'] === 'string' ? { nextLink: raw['@odata.nextLink'] } : {}),
-      ...(typeof raw['@odata.deltaLink'] === 'string' ? { deltaLink: raw['@odata.deltaLink'] } : {}),
-    };
+    return toGraphPage<T>(await this.get<Record<string, unknown>>(path, options));
   }
 
   /**
@@ -219,15 +247,26 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     // Non-JSON error body; the status alone will have to do.
   }
 
-  const endpoint = url.replace(/^https:\/\/graph\.microsoft\.com\/v1\.0/, '');
+  return graphFailure(response.status, url, detail, code);
+}
 
-  if (response.status === 401) {
+/**
+ * Map a Graph status code onto the error the UI knows how to explain.
+ *
+ * Split out from the HTTP path so every transport reports the same thing: a 403 on a Teams
+ * endpoint means "ask your tenant admin" no matter which pipe the 403 arrived through, and
+ * a user should never have to learn two vocabularies for the same failure.
+ */
+export function graphFailure(status: number, url: string, detail = '', code = ''): VfsError {
+  const endpoint = url.replace(GRAPH_ORIGIN, '');
+
+  if (status === 401) {
     return new VfsError('EAUTH', 'Microsoft Graph rejected the credentials.', {
       hint: 'The sign-in has expired. Run `mscomms auth --reset` and sign in again.',
     });
   }
 
-  if (response.status === 403) {
+  if (status === 403) {
     const teams = endpoint.includes('/teams') || endpoint.includes('/chats');
     return new VfsError('EACCES', `Access denied${detail === '' ? '' : `: ${detail}`}`, {
       hint: teams
@@ -236,17 +275,25 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     });
   }
 
-  if (response.status === 404) {
+  if (status === 404) {
     return new VfsError('ENOENT', `Microsoft Graph has no ${endpoint}.`, {
       hint: 'The item may have been moved or deleted. Try refreshing the listing.',
     });
   }
 
-  if (code === 'ErrorItemNotFound') {
-    return new VfsError('ENOENT', 'That item no longer exists.');
+  if (status === 429 || status === 503 || status === 504) {
+    return new VfsError('ERATELIMIT', 'Microsoft Graph is throttling requests.', {
+      hint: "Try again shortly. Increasing the mount's ttlMs reduces how often this happens.",
+    });
   }
 
-  return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(response.status)}${detail === '' ? '' : `: ${detail}`}`);
+  if (code === 'ErrorItemNotFound' || code === 'ErrorInvalidIdMalformed') {
+    return new VfsError('ENOENT', 'That item no longer exists.', {
+      hint: 'The id may be stale. Try refreshing the listing.',
+    });
+  }
+
+  return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(status)}${detail === '' ? '' : `: ${detail}`}`);
 }
 
 function sleep(ms: number): Promise<void> {

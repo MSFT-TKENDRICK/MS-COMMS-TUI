@@ -262,8 +262,14 @@ Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Credentials never live in the config. GitHub takes an explicit `token`, then `GH_TOKEN` or
 `GITHUB_TOKEN`, and failing both it borrows the credential from `gh auth login` — so on a
-machine with the GitHub CLI signed in, the `token` line above is unnecessary. The Microsoft
-sources sign in interactively the first time you open them and cache the result.
+machine with the GitHub CLI signed in, the `token` line above is unnecessary.
+
+The Microsoft sources work the same way. If a Microsoft 365 MCP server is configured on the
+machine, they go through it and **you are never asked to sign in**, because the server
+already holds the identity — on a machine you are logged into anyway, a second credential to
+manage is not a security feature. Failing that they fall back to the OAuth device code flow,
+which prompts once and caches the result. `mscomms doctor` reports which path each mount
+will take, so you can check before you rely on it.
 
 ## Add your own source
 
@@ -380,7 +386,7 @@ relevance ranking), cross-source search, cache, the local Turso snapshot with ba
 sync, predictive prefetching and vector search, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1163 tests.
+1395 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been
