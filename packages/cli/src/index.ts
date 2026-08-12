@@ -24,7 +24,7 @@ import {
 import { memoryPlugin } from '@mscomms/provider-memory';
 import { rssPlugin } from '@mscomms/provider-rss';
 import { githubPlugin } from '@mscomms/provider-github';
-import { graphMailPlugin, graphChatPlugin } from '@mscomms/provider-graph';
+import { graphMailPlugin, graphChatPlugin, graphPeoplePlugin } from '@mscomms/provider-graph';
 import { adoBoardsPlugin } from '@mscomms/provider-ado';
 import { execPlugin } from '@mscomms/provider-exec';
 import { Session } from './session.js';
@@ -64,6 +64,7 @@ export function builtinRegistry(logger: Logger = NULL_LOGGER): PluginRegistry {
   registry.register(githubPlugin);
   registry.register(graphMailPlugin);
   registry.register(graphChatPlugin);
+  registry.register(graphPeoplePlugin);
   registry.register(adoBoardsPlugin);
   registry.register(execPlugin);
   // Not an integration: a projection reorganizes the mounts you already have. Registered

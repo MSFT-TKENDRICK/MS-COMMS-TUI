@@ -81,10 +81,28 @@ config or a script.
 
 | Option | Type | Meaning |
 |---|---|---|
-| `fixture` | `"mail"` \| `"chat"` \| `"issues"` \| `"empty"` | Which sample tree to generate. |
+| `fixture` | `"mail"` \| `"chat"` \| `"issues"` \| `"people"` \| `"empty"` | Which sample tree to generate. |
+| `items` | array | Your own fixture, instead of a built-in one. |
 
 `empty` is genuinely empty, which is useful for checking that your scripts handle a folder
-with nothing in it.
+with nothing in it. `people` is a small org chart, and is the one fixture that is a *graph*
+rather than a tree.
+
+A hand-written `items` entry is an object with `id`, `title`, and any of `body`, `summary`,
+`flags`, `author`, `agoMinutes`, `format`, `meta`, `webUrl`, `threadId`, `attachments`, plus
+either `children` (items defined inline, which makes it a folder) or `refs`:
+
+```jsonc
+{ "id": "colleagues", "title": "Colleagues", "refs": ["person-priya", "person-tom"] }
+```
+
+`refs` names items defined elsewhere in the same fixture and lists them here as well. It is
+what lets a fixture model a backend that is not tree-shaped — an org chart, where the same
+person appears under several folders and your manager's `reports` contains you. A referenced
+item is not a copy: it keeps one id, so `find` reports it once however many paths reach it,
+`stat` agrees from every direction, and marking it read from one path marks it read from all
+of them. References may point backwards or form cycles; the only rules are that the id must
+exist and that an item may not reference itself.
 
 ### `rss` — any RSS, RDF or Atom feed
 
@@ -163,6 +181,70 @@ Plus every `graph-mail` authentication option. Teams scopes such as
 `ChannelMessage.Read.All` require admin consent in most tenants; without them the provider
 degrades to what it can reach rather than failing outright, and `mounts` reports the
 reduced capability set.
+
+### `graph-people` — the corporate hierarchy
+
+The people graph as directories. `cd` walks the reporting chain in either direction, and
+every person's folder merges what they have said to you across mail and Teams into one
+list, **most owed first**.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `pageSize` | number | 50 | Directory entries fetched per request. |
+| `commsPerPerson` | number | 25 | Communications merged into one person's listing (max 100). |
+| `allowSend` | boolean | `false` | Enable the actions that write: `mail`, `chat`, `reply`, `read`, `unread`. |
+| `chats` | boolean | `true` | Include Teams chat in the merge. Turn off when the tenant blocks `Chat.Read`. |
+| `signalTtlMs` | number | 60000 | How long the cross-person priority index stays warm. |
+| `maxChainDepth` | number | 12 | Safety valve on the climb up the management chain (max 30). |
+
+Plus every `graph-mail` authentication option.
+
+Seven sections sit at the mount root:
+
+| Section | What is in it |
+|---|---|
+| `Me` | Your own card. Not a folder containing you — `cd Me` lands *on* you. |
+| `Org` | Your management chain, top-most first, in hierarchy order. |
+| `Reports` | People who report to you. |
+| `Colleagues` | Everyone else who reports to your manager. |
+| `Recent` | People you correspond with, most owed first. |
+| `External` | Correspondents outside your organisation. |
+| `Directory` | The tenant directory. `ls -q <name>` looks somebody up. |
+
+Inside a person: `profile.md`, then `manager/`, `reports/` and `peers/`, then their
+communications. The hierarchy folders are cyclic on purpose — your manager's `reports/`
+contains you, so you can wander the org chart without going back to the root.
+
+Ordering is the point of the mount, and it is not by date. A person's list is ranked
+**unread → unanswered → mentioned → everything else → things you sent**, and only then by
+recency inside each band. "Unanswered" is a property of a *thread*, not of a message: a
+colleague who sent four messages in a row is owed one reply, not four. The same rule ranks
+the people themselves, so `ls Recent` puts whoever is most waiting on you at the top.
+Mail and chat are **merged**, never grouped by channel, because a reply you missed is
+missed precisely because it arrived in the app you were not looking at.
+
+Two scopes beyond the `graph-mail` set are needed and are in the default:
+`User.ReadBasic.All` and `People.Read`. `User.Read.All` is better if your tenant will grant
+it — job titles, departments and offices need it, and the provider retries with the basic
+property set when it is refused rather than failing. `/me/people`, the chat roster and the
+directory are each optional: a tenant that withholds any of them loses that source and
+keeps the rest.
+
+Writing is off by default, exactly as `graph-mail` is. Setting `allowSend` also means
+re-running `login`, because the send scopes (`Mail.Send`, `Chat.ReadWrite`,
+`ChatMessage.Send`) are deliberately absent from the default consent — a tool that reads
+your corporate mail is easy to justify installing; one that can send mail as you is a
+different conversation.
+
+```jsonc
+{
+  "path": "/people",
+  "type": "graph-people",
+  "options": { "commsPerPerson": 30 }
+}
+```
+
+To try the shape without a tenant, run `demo` in the shell and explore `/demo-people`.
 
 ### `ado-boards` — Azure DevOps Boards
 

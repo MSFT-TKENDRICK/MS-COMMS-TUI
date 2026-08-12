@@ -17,8 +17,8 @@ and `cat` once instead of learning five clients.
                     │
                    VFS  ── cache ── notify / watcher
                     │
-    ┌───────────┬───┴───────┬────────────┬───────────┐
- graph-mail  graph-chat  ado-boards  github/rss   exec ──► any program, any language
+    ┌───────────┬───────────┬─────┴──────┬────────────┬───────────┐
+ graph-mail  graph-chat  graph-people  ado-boards  github/rss   exec ──► any program, any language
 ```
 
 ## Packages
@@ -228,6 +228,52 @@ rather than counting it, and checks the signal each iteration rather than trusti
 provider to notice, because a Ctrl-C that only works if the backend cooperates is not a
 working Ctrl-C.
 
+## The people graph
+
+`graph-people` is the one provider whose tree is not a containment hierarchy. Everything
+else models "this item is inside that folder"; people model a *graph*, and the mount leans
+into that rather than flattening it.
+
+**The hierarchy is cyclic on purpose.** A person's folder contains `manager/`, `reports/`
+and `peers/`, so your manager's `reports/` contains you, and `Me/manager/…/reports/…`
+eventually comes back round. A tree would have forced a choice between "up" and "down", and
+the question people actually have — *who else is in this part of the org* — needs both.
+The engine tolerates it because its fallback recursive walk is depth- and node-bounded;
+`Org/` exists to give the flat chain when that is what you wanted.
+
+**Priority, not recency, is the ordering.** Both for a person's messages and for the people
+themselves: unread → unanswered → mentioned → everything else → things you sent. "Unanswered"
+is a property of a *thread*, so a colleague who sent four messages in a row is owed one reply
+rather than flagged four times. Providers control their own listing order — the engine only
+re-sorts when explicitly asked — which is what makes this expressible at all.
+
+**Channels are merged, never grouped.** Mail and Teams land in one list per person. Grouping
+by channel reproduces the exact failure the mount exists to fix: a reply is missed precisely
+because it arrived in the app you were not looking at.
+
+**Ranking people is a fixed cost, not a per-person one.** Working out what each person is
+owed from their own correspondence would be one round trip per row, turning `ls Recent` into
+thirty. Instead three mailbox-wide requests — unread inbox, recent sent items, the chat
+roster — build a TTL-cached index keyed by every identifier a person is known by. That last
+part matters: the mailbox knows an address and the chat roster knows a directory id, so the
+index aliases both onto one entry or a colleague becomes two half-people, each carrying half
+their unread count.
+
+**Search is not declared, and the directory lookup says so.** `Directory` pushes a free-text
+term into `$filter=startswith(…)` because `$search` on `/users` needs advanced query
+capabilities many tenants have not enabled. `startswith` is a prefix match while the query
+language means substring, so the provider never sets `appliedQuery` and the engine re-filters
+— the push-down is an optimisation, not a claim.
+
+**A cyclic mount made the engine's search dedupe by identity.** The fallback walk in `vfs.ts`
+was bounded by depth and node count, which is enough to make a cycle terminate but not enough
+to make it *useful*: one unanswered chat came back nine times, once per route the walk
+happened to take, and the node budget went on re-reading folders it had already read. It now
+tracks the provider's own `id` — defined as identifying the item rather than the path to it —
+for both the results and the queue. Every provider gets the fix; only this one needed it. The
+same applies to `provider-memory`, whose fixtures can now be graphs (`refs`) rather than
+trees, so the offline demo models the real shape instead of a convenient approximation of it.
+
 ## The CLI
 
 **`session.ts`** holds mounts, cwd, the last listing, and display settings. The last listing
@@ -264,15 +310,16 @@ date, no reconciliation, no "why does it show a message I deleted last week". A 
 offline mode would sit behind the same provider interface.
 
 **Write-by-default.** The Graph providers ship read-only. `Mail.ReadWrite` is opt-in via
-`scopes`, because a program that reads your mail and one that can alter it are different
-risks and the second should be a decision.
+`scopes`, and `graph-people`'s sending actions are opt-in via `allowSend`, because a program
+that reads your mail and one that can send as you are different risks and the second should
+be a decision.
 
 **A full-screen TUI as the primary interface.** Opt-in, and last on the list. The reasons
 are mechanical rather than aesthetic and are set out in [ACCESSIBILITY.md](ACCESSIBILITY.md).
 
 ## Testing
 
-985 tests, no test framework — `node --test` and `node:assert`.
+1148 tests, no test framework — `node --test` and `node:assert`.
 
 The load-bearing one is `packages/core/src/testing/conformance.ts`: the provider contract
 expressed as an executable suite that every provider runs, including the example `exec`

@@ -29,6 +29,10 @@ const configurations: readonly Configuration[] = [
   { label: 'mail fixture, tiny pages', options: { fixture: 'mail', pageSize: 2 } },
   { label: 'chat fixture', options: { fixture: 'chat' }, sampleQuery: 'is:unread' },
   { label: 'issues fixture', options: { fixture: 'issues' }, sampleQuery: 'kind:file' },
+  // The people fixture is the deepest tree here, and the only one where a directory's
+  // children are a mix of folders, a singular document and dated items.
+  { label: 'people fixture', options: { fixture: 'people' }, sampleQuery: 'is:unanswered' },
+  { label: 'people fixture, tiny pages', options: { fixture: 'people', pageSize: 2 } },
   // An empty backend is the case every provider forgets. `ls` on a brand-new mailbox must
   // be a clean empty listing, not a crash and not a hang.
   { label: 'empty fixture', options: { fixture: 'empty' } },

@@ -1,9 +1,10 @@
 /**
  * Fixture item model.
  *
- * A fixture is a plain tree. It is deliberately serializable so that a user can drop a
- * JSON file into their config and get a working mount without writing any code — which
- * makes this both the test double and the "try before you authenticate" demo mode.
+ * A fixture is a plain tree, or — when items reference each other by id — a graph. It is
+ * deliberately serializable so that a user can drop a JSON file into their config and get
+ * a working mount without writing any code, which makes this both the test double and the
+ * "try before you authenticate" demo mode.
  */
 
 import type { BodyFormat, MetaValue } from '@mscomms/core';
@@ -34,6 +35,16 @@ export interface MemoryItem {
   readonly threadId?: string;
   readonly attachments?: readonly MemoryAttachment[];
   readonly children?: readonly MemoryItem[];
+  /**
+   * Ids of items defined elsewhere in the fixture, listed here as additional children.
+   *
+   * This is what lets a fixture be a *graph* rather than a tree, which some backends
+   * genuinely are: in an org chart your manager's `reports` contains you, and the message
+   * you have not answered is one message however many routes lead to it. A referenced item
+   * keeps the id, the flags and the canonical path of where it was defined, so `find`
+   * reports it once and `stat` agrees from every direction.
+   */
+  readonly refs?: readonly string[];
 }
 
 export interface MemoryAttachment {
@@ -45,7 +56,7 @@ export interface MemoryAttachment {
 
 export interface MemoryProviderOptions {
   /** Built-in fixture to use when `items` is not supplied. */
-  readonly fixture?: 'mail' | 'chat' | 'issues' | 'empty';
+  readonly fixture?: 'mail' | 'chat' | 'issues' | 'people' | 'empty';
   readonly items?: readonly MemoryItem[];
   readonly displayName?: string;
   /** Simulated per-request latency, for exercising cancellation and spinners. */

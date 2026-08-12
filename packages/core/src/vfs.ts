@@ -1146,7 +1146,16 @@ export class Vfs {
     return undefined;
   }
 
-  /** Breadth-first fallback search for providers with no native search. */
+  /**
+   * Breadth-first fallback search for providers with no native search.
+   *
+   * Both `seen` sets exist because a mount's tree is not necessarily a *tree*. The people
+   * graph is genuinely cyclic — your manager's `reports/` contains you — so without them a
+   * search would re-walk the same subtree from every direction, spend its whole node budget
+   * doing it, and report one unread message a dozen times under a dozen paths. Identity is
+   * the provider's own `id`, which is defined as identifying the item rather than the
+   * route taken to it.
+   */
   async #walkSearch(
     root: string,
     query: Query,
@@ -1163,6 +1172,8 @@ export class Vfs {
     let unreadable = 0;
     let firstFailure: string | undefined;
     const contentNeeded = requiresContent(query);
+    const seenItems = new Set<string>();
+    const seenDirectories = new Set<string>();
 
     while (queue.length > 0 && visited < maxNodes && matches.length < limit) {
       // Checked every iteration, not just handed to the provider: a walk can spend
@@ -1189,16 +1200,26 @@ export class Vfs {
         continue;
       }
 
+      // Identity is the provider's own id, scoped to the mount that produced the page —
+      // ids are unique within a provider, and a search from `/` spans several. Above the
+      // mounts the tree is synthetic, finite and acyclic, and a node there *is* its path.
+      const owner = this.findMount(current.path)?.mount.path;
+
       for (const entry of page.entries) {
         visited += 1;
-        const verdict = evaluateQuery(query, entry);
-        if (verdict === true) {
-          matches.push(entry);
-          if (matches.length >= limit) break;
-        } else if (verdict === 'unknown') {
-          undecided += 1;
+        const key = owner === undefined ? `\u0000${entry.path ?? entry.name}` : `${owner}\u0000${entry.id}`;
+        if (!seenItems.has(key)) {
+          seenItems.add(key);
+          const verdict = evaluateQuery(query, entry);
+          if (verdict === true) {
+            matches.push(entry);
+            if (matches.length >= limit) break;
+          } else if (verdict === 'unknown') {
+            undecided += 1;
+          }
         }
-        if (entry.kind === 'dir' && entry.path !== undefined) {
+        if (entry.kind === 'dir' && entry.path !== undefined && !seenDirectories.has(key)) {
+          seenDirectories.add(key);
           queue.push({ path: entry.path, depth: current.depth + 1 });
         }
       }

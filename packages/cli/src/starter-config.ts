@@ -52,6 +52,30 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   "options": { "pageSize": 50 },
     // },
 
+    // --- Your colleagues, as folders ------------------------------------------
+    // Traverse the org chart with \`cd\`: /people/Me/manager/1/reports lists your
+    // manager's other reports. Inside a person's folder you get their profile
+    // plus every mail and chat you have exchanged, merged into one list with
+    // unread first, then messages of theirs you have not answered.
+    //
+    // Sending is off unless you ask for it. With "allowSend": true you can run
+    // \`do 1 message --subject "..." --body "..."\` on a person, or \`do 3 reply\`
+    // on one of their messages. Turning it on requires signing in again so that
+    // consent covers Mail.Send, Chat.ReadWrite and ChatMessage.Send.
+    //
+    // {
+    //   "path": "/people",
+    //   "type": "graph-people",
+    //   "options": {
+    //     "pageSize": 50,
+    //     // How many recent messages to show inside each person's folder.
+    //     "commsPerPerson": 20,
+    //     // "allowSend": true,
+    //     // Set false to leave Teams out and use mail alone.
+    //     // "chats": true,
+    //   },
+    // },
+
     // --- GitHub issues and pull requests --------------------------------------
     // Reads GH_TOKEN or GITHUB_TOKEN from the environment, or run \`gh auth login\`.
     //

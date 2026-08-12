@@ -47,6 +47,12 @@ export const FLAGS = {
   closed: 'closed',
   open: 'open',
   pinned: 'pinned',
+  /** Newest message in a thread came from somebody else: the ball is in your court. */
+  unanswered: 'unanswered',
+  /** Correspondent is outside your own tenant's mail domains. */
+  external: 'external',
+  /** You wrote it. Deliberately distinct from `read`, which only means you saw it. */
+  sent: 'sent',
 } as const;
 
 export type WellKnownFlag = (typeof FLAGS)[keyof typeof FLAGS];
