@@ -124,6 +124,8 @@ export interface SnapshotStats {
   readonly hits: number;
   readonly misses: number;
   readonly writes: number;
+  /** Whether the full-text index exists. False means text search is a LIKE scan. */
+  readonly fts: boolean;
   readonly bytes?: number;
 }
 
@@ -141,6 +143,8 @@ export class SnapshotStore {
   #hits = 0;
   #misses = 0;
   #writes = 0;
+  /** Whether this SQLite build has FTS5. Settled by `#ensureFts` before the store is used. */
+  #fts = false;
 
   private constructor(options: SnapshotOptions) {
     this.#driver = options.driver;
@@ -182,8 +186,11 @@ export class SnapshotStore {
     const row = await this.#driver.get('SELECT value FROM snapshot_meta WHERE key = ?', ['schema_version']);
     const found = row === undefined ? 0 : Number(row['value']);
     if (found === SCHEMA_VERSION) {
-      // Schema is current, but the embedder still has to be checked: it changes
-      // independently of the schema, and only ever on a reopen.
+      // Schema is current, but two things still have to be checked on every open: the
+      // embedder, which changes independently of the schema, and FTS5, which is a property
+      // of the SQLite build rather than of the file — the same snapshot can be opened by
+      // one Node that has the extension and another that does not.
+      await this.#ensureFts();
       await this.#reconcileEmbedder();
       return;
     }
@@ -201,12 +208,37 @@ export class SnapshotStore {
     }
 
     await this.#driver.exec(SCHEMA);
+    await this.#ensureFts();
     await this.#driver.run('INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)', [
       'schema_version',
       String(SCHEMA_VERSION),
     ]);
 
     await this.#reconcileEmbedder();
+  }
+
+  /**
+   * Create the full-text index, and record it if we cannot.
+   *
+   * Losing FTS costs exact-phrase ranking, not search: `candidates` falls back to a LIKE
+   * scan, and vector similarity is unaffected because it is our own arithmetic over blobs.
+   * That is a far better outcome than refusing to cache anything, which is what a failure
+   * here used to cause.
+   */
+  async #ensureFts(): Promise<void> {
+    try {
+      await this.#driver.exec(FTS_SCHEMA);
+      // Creating is not enough to prove it works: a file written by an FTS5-capable build
+      // already has the table, so the CREATE is a no-op that succeeds on a build which
+      // will then fail the first time anyone searches. Query it once to be sure.
+      await this.#driver.all("SELECT rowid FROM node_fts WHERE node_fts MATCH 'probe' LIMIT 1");
+      this.#fts = true;
+    } catch (error) {
+      this.#fts = false;
+      this.#logger.info('No FTS5 in this SQLite build; text search will use a slower scan.', {
+        error: String(error),
+      });
+    }
   }
 
   /**
@@ -360,11 +392,13 @@ export class SnapshotStore {
       const seq = seqById.get(node.id);
       if (seq === undefined) continue;
       const text = body ?? (await this.#storedBody(mountId, node.id));
-      statements.push({ sql: 'DELETE FROM node_fts WHERE rowid = ?', params: [seq] });
-      statements.push({
-        sql: 'INSERT INTO node_fts (rowid, title, author, summary, body) VALUES (?, ?, ?, ?, ?)',
-        params: [seq, node.title, node.author ?? '', node.summary ?? '', text ?? ''],
-      });
+      if (this.#fts) {
+        statements.push({ sql: 'DELETE FROM node_fts WHERE rowid = ?', params: [seq] });
+        statements.push({
+          sql: 'INSERT INTO node_fts (rowid, title, author, summary, body) VALUES (?, ?, ?, ?, ?)',
+          params: [seq, node.title, node.author ?? '', node.summary ?? '', text ?? ''],
+        });
+      }
       if (this.#embedder !== undefined) {
         vectorWork.push({
           seq,
@@ -546,7 +580,7 @@ export class SnapshotStore {
     const scored = new Map<number, { row: SqlRow; text: number; vector: number }>();
 
     if (text !== '') {
-      const match = toFtsMatch(text);
+      const match = this.#fts ? toFtsMatch(text) : undefined;
       if (match !== undefined) {
         try {
           const rows = await this.#driver.all(
@@ -567,6 +601,10 @@ export class SnapshotStore {
         } catch (error) {
           // A malformed MATCH expression must not be fatal — the live search still runs.
           this.#logger.debug('Snapshot text search failed; falling back.', { error: String(error) });
+        }
+      } else if (!this.#fts) {
+        for (const hit of await this.#likeSearch(text, budget, scopeSql, scopeParams)) {
+          scored.set(hit.seq, { row: hit.row, text: hit.score, vector: 0 });
         }
       }
     }
@@ -612,6 +650,63 @@ export class SnapshotStore {
 
     hits.sort((a, b) => b.score - a.score || recency(b.node) - recency(a.node));
     return hits.slice(0, limit);
+  }
+
+  /**
+   * Text search without FTS5: a LIKE scan, ranked by where the term was found.
+   *
+   * This is the substitute when the SQLite build has no full-text extension. It is a table
+   * scan and it cannot do phrase or prefix ranking, but retention caps the table at a size
+   * where that is affordable, and the alternative — a snapshot that answers no text query
+   * at all — would make the local half of search silently useless.
+   *
+   * Terms are ANDed, matching FTS5's default, so adding a word narrows rather than widens.
+   */
+  async #likeSearch(
+    text: string,
+    budget: number,
+    scopeSql: string,
+    scopeParams: readonly SqlValue[],
+  ): Promise<ReadonlyArray<{ seq: number; row: SqlRow; score: number }>> {
+    const terms = text
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((term) => term.length > 0)
+      .slice(0, 8);
+    if (terms.length === 0) return [];
+
+    const params: SqlValue[] = [];
+    const clauses = terms.map((term) => {
+      // LIKE's own wildcards have to be escaped or a subject containing % would match
+      // everything. ESCAPE is explicit because SQLite has no default.
+      const like = `%${term.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+      params.push(like, like, like, like);
+      return `(lower(n.title) LIKE ? ESCAPE '\\' OR lower(COALESCE(n.author, '')) LIKE ? ESCAPE '\\'
+               OR lower(COALESCE(n.summary, '')) LIKE ? ESCAPE '\\'
+               OR lower(COALESCE(d.body, '')) LIKE ? ESCAPE '\\')`;
+    });
+
+    try {
+      const rows = await this.#driver.all(
+        `SELECT n.*, d.body AS doc_body
+         FROM nodes n
+         LEFT JOIN documents d ON d.mount_id = n.mount_id AND d.node_id = n.node_id
+         WHERE ${clauses.join(' AND ')}${scopeSql}
+         ORDER BY COALESCE(n.mtime, n.stored_at) DESC
+         LIMIT ?`,
+        [...params, ...scopeParams, budget],
+      );
+      return rows.map((row) => {
+        // A hit in the title is worth more than one buried in a body. Without bm25 this
+        // is the only ranking signal available, and it is the one that matters most.
+        const haystack = String(row['title'] ?? '').toLowerCase();
+        const inTitle = terms.filter((term) => haystack.includes(term)).length;
+        return { seq: Number(row['seq']), row, score: 0.5 + (0.5 * inTitle) / terms.length };
+      });
+    } catch (error) {
+      this.#logger.debug('Snapshot LIKE search failed.', { error: String(error) });
+      return [];
+    }
   }
 
   /**
@@ -756,7 +851,14 @@ export class SnapshotStore {
     }
     const like = `${normalized}/%`;
     await this.#driver.batch([
-      { sql: 'DELETE FROM node_fts WHERE rowid IN (SELECT seq FROM nodes WHERE path = ? OR path LIKE ?)', params: [normalized, like] },
+      ...(this.#fts
+        ? [
+            {
+              sql: 'DELETE FROM node_fts WHERE rowid IN (SELECT seq FROM nodes WHERE path = ? OR path LIKE ?)',
+              params: [normalized, like],
+            },
+          ]
+        : []),
       { sql: 'DELETE FROM vectors WHERE seq IN (SELECT seq FROM nodes WHERE path = ? OR path LIKE ?)', params: [normalized, like] },
       { sql: 'DELETE FROM documents WHERE path = ? OR path LIKE ?', params: [normalized, like] },
       { sql: 'DELETE FROM nodes WHERE path = ? OR path LIKE ?', params: [normalized, like] },
@@ -766,7 +868,7 @@ export class SnapshotStore {
 
   async clear(): Promise<void> {
     await this.#driver.batch([
-      { sql: 'DELETE FROM node_fts' },
+      ...(this.#fts ? [{ sql: 'DELETE FROM node_fts' }] : []),
       { sql: 'DELETE FROM vectors' },
       { sql: 'DELETE FROM documents' },
       { sql: 'DELETE FROM nodes' },
@@ -822,7 +924,7 @@ export class SnapshotStore {
       const chunk = seqs.slice(i, i + 200);
       const placeholders = chunk.map(() => '?').join(',');
       await this.#driver.batch([
-        { sql: `DELETE FROM node_fts WHERE rowid IN (${placeholders})`, params: chunk },
+        ...(this.#fts ? [{ sql: `DELETE FROM node_fts WHERE rowid IN (${placeholders})`, params: chunk }] : []),
         { sql: `DELETE FROM vectors WHERE seq IN (${placeholders})`, params: chunk },
         {
           sql: `DELETE FROM documents WHERE (mount_id, node_id) IN (SELECT mount_id, node_id FROM nodes WHERE seq IN (${placeholders}))`,
@@ -854,6 +956,7 @@ export class SnapshotStore {
       hits: this.#hits,
       misses: this.#misses,
       writes: this.#writes,
+      fts: this.#fts,
       ...(size === null || size === undefined ? {} : { bytes: Number(size) }),
     };
   }
@@ -941,7 +1044,16 @@ CREATE TABLE IF NOT EXISTS navigation (
   count     INTEGER NOT NULL,
   PRIMARY KEY (from_path, to_path)
 );
+`;
 
+/**
+ * Kept out of {@link SCHEMA} because it is the one statement that can fail on an otherwise
+ * working SQLite. Node's bundled build did not carry the FTS5 extension until v23, so on
+ * Node 22 — an LTS, and inside this program's supported range — creating this table raises
+ * "no such module: fts5". Running it separately lets that be a missing feature rather than
+ * a snapshot that will not open at all.
+ */
+const FTS_SCHEMA = `
 CREATE VIRTUAL TABLE IF NOT EXISTS node_fts USING fts5 (
   title, author, summary, body, tokenize = 'unicode61 remove_diacritics 2'
 );

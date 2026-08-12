@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { describe, it, before, after } from 'node:test';
 
 import { SnapshotStore } from '../snapshot.js';
-import { openSqlDriver, type SqlDriver } from '../sql.js';
+import { openSqlDriver, type SqlDriver, type SqlValue } from '../sql.js';
 import { hashEmbedder } from '../vector.js';
 import { parseQuery, MATCH_ALL } from '../query.js';
 import type { Document, VNode } from '../provider.js';
@@ -538,3 +538,157 @@ suite('SnapshotStore: stats', () => {
     await harness.store.close();
   });
 });
+
+// ---------------------------------------------------------------------------
+// SQLite builds without FTS5
+// ---------------------------------------------------------------------------
+
+/**
+ * A driver that behaves exactly like a SQLite build with no full-text extension: every
+ * statement mentioning fts5 or the index it creates fails the way Node 22's bundled
+ * SQLite fails, and everything else works normally.
+ *
+ * This is not a hypothetical. Node did not ship FTS5 in `node:sqlite` until v23, so on
+ * Node 22 — an LTS, inside this program's supported range — the snapshot used to refuse
+ * to open at all with "no such module: fts5".
+ */
+function withoutFts(driver: SqlDriver): SqlDriver {
+  const blocked = (sql: string): boolean => /fts5|node_fts/i.test(sql);
+  const fail = (): never => {
+    throw new Error('no such module: fts5');
+  };
+  return {
+    ...driver,
+    kind: driver.kind,
+    description: driver.description,
+    nativeVector: driver.nativeVector,
+    exec: async (sql: string) => (blocked(sql) ? fail() : driver.exec(sql)),
+    all: async (sql: string, params?: readonly SqlValue[]) => (blocked(sql) ? fail() : driver.all(sql, params)),
+    get: async (sql: string, params?: readonly SqlValue[]) => (blocked(sql) ? fail() : driver.get(sql, params)),
+    run: async (sql: string, params?: readonly SqlValue[]) => (blocked(sql) ? fail() : driver.run(sql, params)),
+    batch: async (statements: readonly { sql: string; params?: readonly SqlValue[] }[]) =>
+      statements.some((s) => blocked(s.sql)) ? fail() : driver.batch(statements),
+    close: () => driver.close(),
+  } as SqlDriver;
+}
+
+async function openWithoutFts(): Promise<Harness> {
+  const real = await openSqlDriver({ path: ':memory:' });
+  const driver = withoutFts(real);
+  const harness = { driver, now: Date.parse('2024-06-04T09:00:00Z') } as {
+    driver: SqlDriver;
+    now: number;
+    store: SnapshotStore;
+  };
+  harness.store = await SnapshotStore.open({ driver, embedder: hashEmbedder(64), now: () => harness.now });
+  return harness as Harness;
+}
+
+suite('SnapshotStore: a SQLite build without FTS5', () => {
+  it('opens anyway, because a missing index is not a missing cache', async () => {
+    const harness = await openWithoutFts();
+    const stats = await harness.store.stats();
+    assert.equal(stats.fts, false);
+    await harness.store.close();
+  });
+
+  it('still stores and serves listings', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness);
+    const listing = await harness.store.listing('/mail/Inbox');
+    assert.equal(listing?.entries.length, 3);
+    await harness.store.close();
+  });
+
+  it('still answers a text search, by scanning instead of indexing', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness);
+    const hits = await harness.store.candidates(parseQuery('outage'), { semantic: false });
+    assert.deepEqual(
+      hits.map((hit) => hit.node.title),
+      ['Server outage postmortem'],
+    );
+    await harness.store.close();
+  });
+
+  it('ANDs its terms, so a second word narrows the result', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness);
+    const both = await harness.store.candidates(parseQuery('budget review'), { semantic: false });
+    assert.deepEqual(
+      both.map((hit) => hit.node.title),
+      ['Q3 budget review'],
+    );
+    const neither = await harness.store.candidates(parseQuery('budget outage'), { semantic: false });
+    assert.deepEqual(neither, []);
+    await harness.store.close();
+  });
+
+  it('finds a word that appears only in a body, which needs the body: prefix', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness);
+    await harness.store.putDocument('mail', INBOX[1] as VNode, {
+      title: 'Server outage postmortem',
+      headers: [],
+      body: 'The quarterly budget was not the cause.',
+      format: 'text',
+    });
+    // Bare terms are metadata-only by design, so this is the query that proves the scan
+    // reaches document bodies at all — the same reach FTS5 has.
+    const hits = await harness.store.candidates(parseQuery('body:quarterly'), { semantic: false });
+    assert.deepEqual(
+      hits.map((hit) => hit.node.title),
+      ['Server outage postmortem'],
+    );
+    await harness.store.close();
+  });
+
+  it('ranks a title hit above one found elsewhere', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness, [
+      node('a.eml', 'r1', { title: 'Unrelated subject', summary: 'mentions budget in passing', mtime: new Date('2024-06-03T09:00:00Z') }),
+      node('b.eml', 'r2', { title: 'Budget review', summary: 'nothing else', mtime: new Date('2024-06-01T09:00:00Z') }),
+    ]);
+    const hits = await harness.store.candidates(parseQuery('budget'), { semantic: false });
+    assert.equal(hits.length, 2);
+    // Without bm25 this ordering is the only ranking signal there is, and it has to beat
+    // recency: the older message is the one whose subject the user typed.
+    assert.equal(hits[0]?.node.title, 'Budget review');
+    await harness.store.close();
+  });
+
+  it('treats LIKE wildcards in the query as literal text', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness, [
+      node('discount.eml', 'p1', { title: '50% off everything', mtime: new Date('2024-06-01T09:00:00Z') }),
+      node('plain.eml', 'p2', { title: 'Ordinary message', mtime: new Date('2024-06-02T09:00:00Z') }),
+    ]);
+    // Unescaped, "%" is LIKE's match-anything and this would return both rows — a search
+    // that silently matches everything is worse than one that matches nothing.
+    const hits = await harness.store.candidates(parseQuery('50%'), { semantic: false });
+    assert.deepEqual(
+      hits.map((hit) => hit.node.title),
+      ['50% off everything'],
+    );
+    await harness.store.close();
+  });
+
+  it('still does semantic search, which never needed FTS5 in the first place', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness);
+    const stats = await harness.store.stats();
+    assert.equal(stats.vectors, 3);
+    await harness.store.close();
+  });
+
+  it('can evict and clear without tripping over the index it does not have', async () => {
+    const harness = await openWithoutFts();
+    await seedInbox(harness);
+    await harness.store.invalidate('/mail/Inbox');
+    assert.equal(await harness.store.listing('/mail/Inbox'), undefined);
+    await harness.store.clear();
+    assert.equal((await harness.store.stats()).nodes, 0);
+    await harness.store.close();
+  });
+});
+

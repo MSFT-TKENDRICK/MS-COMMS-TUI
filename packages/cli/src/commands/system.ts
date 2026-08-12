@@ -497,6 +497,12 @@ export const cacheCommand: Command = {
           `${driver.nativeVector ? ', vector search in the database' : ', vector search in this process'}.\n`,
       );
 
+      // Worth saying out loud: without FTS5 the local half of `find` still works but ranks
+      // by a scan, and someone comparing two machines deserves to know which they are on.
+      if (!snapshot.fts) {
+        session.writeError('No FTS5 in this SQLite build, so local text search scans instead of using an index.\n');
+      }
+
       // Only shown when the log exists, which means only when it was switched on. A line
       // saying "auditing: off" on every run would be noise about a feature you declined.
       const audit = await auditSummary(driver);

@@ -495,6 +495,11 @@ absence from the snapshot alone, and `find` says how many results came from it.
 - **`node-sqlite`** — Node's built-in SQLite (22.5+). Local only, no replication, and
   similarity is computed in-process. Slower on large vector sets, otherwise identical.
 
+Node did not bundle the FTS5 extension in `node:sqlite` until v23, so on Node 22 this
+driver has no full-text index. That is a missing feature, not a failure: the snapshot
+opens, caches and pre-fetches as usual, semantic search is unaffected, and text search
+falls back to a scan. `cache` says so when it happens.
+
 Pinning a driver that cannot load is an error at startup with a hint saying why, rather
 than a silent fallback: if you asked for a replica of a shared database, quietly giving you
 a local-only file would be the wrong kind of help.

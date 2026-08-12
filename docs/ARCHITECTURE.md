@@ -173,6 +173,16 @@ Vector support is *probed*, not inferred from the driver name — it depends on 
 that actually loaded. Guessing would turn "your SQLite is older than you thought" into an
 unexplained query failure halfway through a search.
 
+FTS5 is probed the same way, and for a reason found by running the code rather than
+reasoning about it: Node did not bundle the extension in `node:sqlite` until v23, so on
+Node 22 — an LTS, inside the supported range — creating the index raises "no such module:
+fts5". That used to abort `SnapshotStore.open`, which meant the entire snapshot silently
+did not work on a supported runtime. Now the index is created separately from the rest of
+the schema and its absence is recorded, so text search degrades to a LIKE scan while
+listings, retention, prefetch and vector similarity carry on unaffected. The probe runs on
+every open rather than once, because FTS5 is a property of the SQLite build and the same
+file can be opened by two different Nodes.
+
 ### What it stores, and what it refuses to
 
 Listings, item metadata, message bodies, an FTS5 index, and float32 embeddings — capped at
