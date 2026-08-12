@@ -143,11 +143,17 @@ on the default branch and the project's repository config has been trusted in th
 settings.
 
 The Run script adapts to where it is started. In a real terminal — the app's Run panel is a
-genuine pty, as is any IDE terminal — it opens the **full-screen two-pane view**, mounting
-the demo data first if this machine has no sources configured, so the button always lands on
-something you can navigate. In the app's log pane, where nothing can be typed, it drives the
-line shell from a short canned transcript instead, so the log shows the tool working rather
-than a prompt nobody can answer.
+genuine pty, as is any IDE terminal — it opens the **full-screen two-pane view** on your own
+accounts. In the app's log pane, where nothing can be typed, it drives the line shell from a
+short canned transcript instead, so the log shows the tool working rather than a prompt
+nobody can answer.
+
+It never mounts the sample data on its own. Fixtures that appear without being asked for are
+indistinguishable from real data that is wrong, so a machine with nothing configured is told
+how to connect an account rather than handed props; `MSCOMMS_RUN_DEMO=1` asks for them
+deliberately. And because the Microsoft device-code prompt is written to stderr — invisible
+underneath an alternate screen buffer — a machine that has never signed in does that first,
+on an ordinary screen, where the code can actually be read.
 
 That is the opposite of what `mscomms` does on its own, and deliberately so: the line shell
 is the binary's default [for accessibility reasons](#keyboard-and-accessibility), and a
@@ -159,6 +165,7 @@ thing, so that is the one place the full-screen view is assumed rather than requ
 | --- | --- |
 | `MSCOMMS_RUN_TUI=0` | Use the line shell instead of the full-screen view. |
 | `MSCOMMS_RUN_DEMO=1` | Mount the sample data. Off unless asked for: the Run button shows your accounts, not fixtures. |
+| `MSCOMMS_RUN_SIGNIN=0` | Skip the Microsoft sign-in that otherwise happens before the pane opens. |
 | `MSCOMMS_RUN_INTERACTIVE=0/1` | Override the terminal check that picks between a live interface and the transcript. |
 | `MSCOMMS_RUN_SCRIPT=<file>` | Use a file of commands as the transcript. |
 | `MSCOMMS_RUN_BUILD=0` | Skip the rebuild and run the last successful build as-is. |
