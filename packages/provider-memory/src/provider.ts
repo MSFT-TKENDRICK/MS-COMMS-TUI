@@ -51,6 +51,7 @@ export class MemoryProvider implements Provider {
 
   readonly #entries = new Map<string, Entry>();
   readonly #roots: string[] = [];
+  readonly #pendingRefs: Array<[string, readonly string[]]> = [];
   readonly #options: MemoryProviderOptions;
   readonly #now: () => number;
   readonly #pageSize: number;
@@ -84,6 +85,7 @@ export class MemoryProvider implements Provider {
     const items = options.items ?? FIXTURES[options.fixture ?? 'mail'] ?? [];
     const base = this.#now();
     for (const item of items) this.#roots.push(this.#index(item, null, base));
+    this.#linkRefs();
   }
 
   #index(item: MemoryItem, parentId: string | null, base: number): string {
@@ -103,7 +105,39 @@ export class MemoryProvider implements Provider {
     };
     this.#entries.set(item.id, entry);
     for (const child of item.children ?? []) entry.children.push(this.#index(child, item.id, base));
+    if (item.refs !== undefined) this.#pendingRefs.push([item.id, item.refs]);
     return item.id;
+  }
+
+  /**
+   * Second pass: attach referenced children now that every id exists.
+   *
+   * It has to be a second pass because a reference is routinely backwards — `Colleagues`
+   * lists people the `Directory` below it defines — and a fixture author should not have to
+   * topologically sort their own org chart. A reference never sets `parentId`, so the
+   * place an item was *defined* stays its canonical path however many folders point at it.
+   */
+  #linkRefs(): void {
+    for (const [id, refs] of this.#pendingRefs) {
+      const entry = this.#entries.get(id);
+      if (entry === undefined) continue;
+      for (const ref of refs) {
+        if (!this.#entries.has(ref)) {
+          throw VfsError.config(
+            `Fixture item "${id}" references "${ref}", which does not exist.`,
+            'A `refs` entry must name the id of an item defined somewhere in the same fixture.',
+          );
+        }
+        if (ref === id) {
+          throw VfsError.config(
+            `Fixture item "${id}" references itself.`,
+            'A folder cannot be its own child; reference a different item.',
+          );
+        }
+        if (!entry.children.includes(ref)) entry.children.push(ref);
+      }
+    }
+    this.#pendingRefs.length = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -199,8 +233,14 @@ export class MemoryProvider implements Provider {
     const stack = [...startIds];
     // Breadth-ish traversal with an explicit stack: a fixture is small, but recursing on
     // provider-supplied data is how you get a stack overflow from a malformed config.
+    // `seen` is what makes a referenced graph safe to search: without it an org chart walks
+    // manager → reports → manager for ever, and reports the same unanswered message once
+    // per route rather than once.
+    const seen = new Set<string>();
     while (stack.length > 0) {
       const id = stack.shift() as string;
+      if (seen.has(id)) continue;
+      seen.add(id);
       const entry = this.#entries.get(id);
       if (entry === undefined) continue;
       stack.push(...entry.children);
@@ -360,7 +400,7 @@ export class MemoryProvider implements Provider {
   #toNode(id: string): VNode {    const entry = this.#entries.get(id);
     if (entry === undefined) throw VfsError.notFound(id);
     const item = entry.item;
-    const isDir = item.children !== undefined;
+    const isDir = item.children !== undefined || item.refs !== undefined;
     const body = item.body ?? '';
 
     const unread = entry.children.reduce((count, childId) => {
@@ -369,7 +409,7 @@ export class MemoryProvider implements Provider {
     }, 0);
 
     return {
-      name: isDir ? item.title : `${timestampPrefix(entry.mtime)} ${item.title}${extensionFor(item)}`,
+      name: nameFor(item, entry.mtime, isDir),
       kind: isDir ? 'dir' : 'file',
       title: item.title,
       id: item.id,
@@ -414,9 +454,23 @@ export class MemoryProvider implements Provider {
   }
 }
 
+/**
+ * A dated item is named for when it arrived, because that is how a listing of a hundred
+ * near-identical subjects stays navigable. A singular document — a person's profile, of
+ * which there is exactly one per folder — is named for what it is instead, so that the
+ * obvious `cat .../profile.md` works without first running `ls` to discover the date.
+ */
+function nameFor(item: MemoryItem, mtime: Date, isDir: boolean): string {
+  if (isDir) return item.title;
+  if (item.subtype === 'profile') return `${item.title}${extensionFor(item)}`;
+  return `${timestampPrefix(mtime)} ${item.title}${extensionFor(item)}`;
+}
+
 function extensionFor(item: MemoryItem): string {
   switch (item.subtype) {
     case 'issue':
+    case 'profile':
+    case 'chat':
       return '.md';
     case 'message':
       return '.eml';

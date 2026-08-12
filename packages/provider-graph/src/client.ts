@@ -28,7 +28,29 @@ export interface GraphPage<T> {
   readonly deltaLink?: string;
 }
 
-export class GraphClient {
+export interface GraphRequestOptions {
+  readonly signal?: AbortSignal;
+  readonly headers?: Record<string, string>;
+}
+
+/**
+ * The subset of the client the providers actually use.
+ *
+ * It exists so a provider can be exercised without a tenant, a token or a network. The
+ * class below uses `#private` fields, which makes it *nominally* typed — a hand-written
+ * stub object is not assignable to `GraphClient` no matter how faithfully it matches.
+ * Depending on this interface instead is what makes the people provider's tree shape,
+ * priority ordering and reply detection testable at all.
+ */
+export interface GraphApi {
+  get<T>(path: string, options?: GraphRequestOptions): Promise<T>;
+  getPage<T>(path: string, options?: GraphRequestOptions): Promise<GraphPage<T>>;
+  getBytes(path: string, options?: GraphRequestOptions): Promise<Uint8Array>;
+  post<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
+  patch<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
+}
+
+export class GraphClient implements GraphApi {
   readonly #getToken: () => Promise<string>;
   readonly #baseUrl: string;
   readonly #timeoutMs: number;
@@ -41,7 +63,7 @@ export class GraphClient {
     this.#maxRetries = options.maxRetries ?? 3;
   }
 
-  async get<T>(path: string, options: { signal?: AbortSignal; headers?: Record<string, string> } = {}): Promise<T> {
+  async get<T>(path: string, options: GraphRequestOptions = {}): Promise<T> {
     const url = path.startsWith('http') ? path : `${this.#baseUrl}${path.startsWith('/') ? '' : '/'}${path}`;
     let attempt = 0;
 
@@ -97,7 +119,7 @@ export class GraphClient {
     }
   }
 
-  async getPage<T>(path: string, options: { signal?: AbortSignal } = {}): Promise<GraphPage<T>> {
+  async getPage<T>(path: string, options: GraphRequestOptions = {}): Promise<GraphPage<T>> {
     const raw = await this.get<Record<string, unknown>>(path, options);
     return {
       value: (raw['value'] as T[] | undefined) ?? [],
@@ -106,7 +128,75 @@ export class GraphClient {
     };
   }
 
-  async getBytes(path: string, options: { signal?: AbortSignal } = {}): Promise<Uint8Array> {
+  /**
+   * Sending mail, starting a chat, posting a message.
+   *
+   * Deliberately not retried on anything other than throttling: `get` can be replayed
+   * safely, but replaying a POST is how a user ends up sending the same mail twice. A 429
+   * is the exception, because Graph rejected the request outright rather than performing
+   * it, and it tells us exactly how long to wait.
+   */
+  async post<T>(path: string, body: unknown, options: GraphRequestOptions = {}): Promise<T> {
+    return this.#write<T>('POST', path, body, options);
+  }
+
+  /** Property updates: marking a message read, flagging it. Same non-retry reasoning. */
+  async patch<T>(path: string, body: unknown, options: GraphRequestOptions = {}): Promise<T> {
+    return this.#write<T>('PATCH', path, body, options);
+  }
+
+  async #write<T>(
+    method: 'POST' | 'PATCH',
+    path: string,
+    body: unknown,
+    options: GraphRequestOptions,
+  ): Promise<T> {
+    const url = path.startsWith('http') ? path : `${this.#baseUrl}${path.startsWith('/') ? '' : '/'}${path}`;
+    let attempt = 0;
+
+    for (;;) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+      options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+
+      try {
+        const token = await this.#getToken();
+        const response = await fetch(url, {
+          method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: 'application/json',
+            'content-type': 'application/json',
+            ...options.headers,
+          },
+          body: JSON.stringify(body ?? {}),
+          signal: controller.signal,
+        });
+
+        if (response.status === 429 && attempt < this.#maxRetries) {
+          attempt += 1;
+          await sleep(Math.max(1, Number(response.headers.get('retry-after') ?? '5')) * 1000);
+          continue;
+        }
+
+        if (!response.ok) throw await describeFailure(response, url);
+        // sendMail and several other actions answer 202 Accepted with no body.
+        if (response.status === 202 || response.status === 204) return {} as T;
+        const text = await response.text();
+        return (text === '' ? {} : JSON.parse(text)) as T;
+      } catch (error) {
+        if (error instanceof VfsError) throw error;
+        if (controller.signal.aborted) {
+          throw new VfsError('ETIMEDOUT', 'Microsoft Graph did not respond in time.');
+        }
+        throw new VfsError('ENETWORK', `Could not reach Microsoft Graph: ${String(error)}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  async getBytes(path: string, options: GraphRequestOptions = {}): Promise<Uint8Array> {
     const url = path.startsWith('http') ? path : `${this.#baseUrl}${path.startsWith('/') ? '' : '/'}${path}`;
     const token = await this.#getToken();
     const response = await fetch(url, {
