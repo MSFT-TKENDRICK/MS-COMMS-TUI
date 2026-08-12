@@ -82,4 +82,35 @@ describe('parseGlobals: the rest', () => {
     assert.equal(globals.tui, true);
     assert.deepEqual(globals.rest, []);
   });
+
+  it('records --demo without swallowing a command', () => {
+    const globals = parseGlobals(['--demo']);
+    assert.equal(globals.demo, true);
+    assert.deepEqual(globals.rest, []);
+  });
+
+  it('means the same thing before and after a command', () => {
+    // The desktop app's Run script passes `--demo` with no command, but a user reaching for
+    // it will write `mscomms ls /demo-mail --demo` as readily as the other way round.
+    const before = parseGlobals(['--demo', 'ls', '/demo-mail']);
+    const after = parseGlobals(['ls', '/demo-mail', '--demo']);
+
+    assert.equal(before.demo, true);
+    assert.equal(after.demo, true);
+    assert.equal(before.rest[0], 'ls');
+    assert.equal(after.rest[0], 'ls');
+  });
+
+  it('combines --demo with --tui, which is what the Run button sends', () => {
+    const globals = parseGlobals(['--tui', '--demo']);
+    assert.equal(globals.tui, true);
+    assert.equal(globals.demo, true);
+    // Neither flag may be mistaken for a command, or the pane never opens.
+    assert.deepEqual(globals.rest, []);
+  });
+
+  it('defaults --demo off, so a configured user never gets sample mounts', () => {
+    assert.equal(parseGlobals([]).demo, false);
+    assert.equal(parseGlobals(['ls', '/mail']).demo, false);
+  });
 });

@@ -1,40 +1,63 @@
 /**
- * Start the shell — the GitHub Copilot desktop app's Run script entry point.
+ * Start MS-COMMS-TUI — the GitHub Copilot desktop app's Run script entry point.
  *
- * The app runs a project's `run` script through the platform shell (`cmd.exe /C` on
- * Windows, `sh -c` elsewhere) and pipes its stdout into the log pane. Two consequences
- * shape this file:
+ * The app starts a project's `run` script through the platform shell (`cmd.exe /C` on
+ * Windows, `sh -c` elsewhere), on one of two surfaces: a **terminal panel**, which is a real
+ * pty you can type into, or a **log pane**, which is a one-way pipe. The script has to be
+ * right on both, which is what shapes this file:
  *
- * 1. **Nobody can type into it.** `mscomms` with no arguments starts an interactive shell,
- *    which under the log pane would sit at a prompt forever with no way to answer. The
- *    app's stdin still claims to be a tty, so checking stdin alone reports a typist who
- *    does not exist; stdout being a pipe is the honest signal. There, this drives the same
- *    shell from a canned script instead, so the log shows a real transcript proving the
- *    whole chain — install, build, VFS, query engine, formatter — actually works.
+ * 1. **The log pane has no typist.** `mscomms` with no arguments starts an interactive
+ *    interface, which there would sit at a prompt forever with no way to answer. Its stdin
+ *    still claims to be a tty, so checking stdin alone reports a typist who does not exist;
+ *    stdout being a pipe is the honest signal. There, this drives the line shell from a
+ *    canned script instead, so the log shows a real transcript proving the whole chain —
+ *    install, build, VFS, query engine, formatter — actually works.
  * 2. **The build may be missing or stale.** The Run button can be pressed on a workspace
  *    whose Setup script never ran, and it is pressed constantly on one whose sources have
  *    just been edited. Rather than failing with a stack trace about a missing module, or
  *    quietly running last week's code, this brings `dist/` up to date first.
  *
- * In a real terminal (the app's terminal canvas, an IDE terminal, any shell) you get the
- * ordinary interactive shell, and arguments are passed straight through:
+ * In a real terminal — the app's Run panel is a genuine pty, as is any IDE or OS terminal —
+ * this opens the **full-screen two-pane view**. That is the opposite of what the `mscomms`
+ * binary does on its own, and the difference is deliberate rather than an oversight.
  *
- *   node scripts/app-run.mjs                          the shell
- *   node scripts/app-run.mjs --tui                    the opt-in full-screen pane
+ * `mscomms` defaults to the line shell because a full-screen pane is hostile to screen
+ * readers (see the essay at the top of `packages/cli/src/shell.ts`), and a command someone
+ * types must not ambush them with an alternate screen buffer. None of that reasoning
+ * applies to a green play button in a windowed GUI: clicking it is already a sighted,
+ * pointer-driven act, it says "show me the thing", and the project is called MS-COMMS-TUI.
+ * So the flag the shell docs describe as "one flag away" is the one this passes. Anyone who
+ * wants the line shell from the Run button gets it with MSCOMMS_RUN_TUI=0, and the binary's
+ * own default is untouched — `npm start` and `mscomms` still land on the line shell.
+ *
+ * A pane needs something in it, but the answer to an unconfigured machine is to say so, not
+ * to fill the tree with fixtures: sample data that appears without being asked for is
+ * indistinguishable from real data that is wrong, and a Run button that silently shows
+ * make-believe teaches you to distrust it. So this never adds `--demo` on its own. When
+ * nothing is mounted it prints how to connect a real account and opens the pane anyway,
+ * empty and honest. `MSCOMMS_RUN_DEMO=1` asks for the fixtures deliberately.
+ *
+ * Arguments are passed straight through and suppress all of the above:
+ *
+ *   node scripts/app-run.mjs                          the full-screen view
+ *   node scripts/app-run.mjs --shell                  the line shell instead
  *   node scripts/app-run.mjs ls /mail/Inbox           one shot, then exit
  *
- * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the choice above, MSCOMMS_RUN_BUILD=0 skips
- * the rebuild, and MSCOMMS_RUN_SCRIPT points at a file of commands to use instead of the
- * built-in transcript.
+ * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the terminal check, MSCOMMS_RUN_TUI=0 falls
+ * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_BUILD=0
+ * skips the rebuild, and MSCOMMS_RUN_SCRIPT points at a file of commands to use instead of
+ * the built-in transcript.
  */
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { build } from './lib/build.mjs';
 import { ROOT, flag } from './lib/npm.mjs';
 
 const BIN = join(ROOT, 'packages', 'cli', 'dist', 'bin.js');
+const CORE = join(ROOT, 'packages', 'core', 'dist', 'index.js');
 const SETUP = join(ROOT, 'scripts', 'app-setup.mjs');
 const MODULES = join(ROOT, 'node_modules');
 
@@ -57,6 +80,25 @@ const TRANSCRIPT = ['demo', 'ls /demo-mail/Inbox', 'cat 3', 'find /demo-mail -q 
  */
 function isInteractive() {
   return flag('MSCOMMS_RUN_INTERACTIVE', process.stdin.isTTY === true && process.stdout.isTTY === true);
+}
+
+/**
+ * Whether this machine already has real sources, so the sample data would be clutter.
+ *
+ * Asks the program's own config loader rather than reimplementing the search: the path is
+ * platform-specific and the file is JSONC, and a second copy of either rule here would be a
+ * copy that eventually disagrees with the one users actually experience. Any failure counts
+ * as "nothing configured", which is the safe direction — the worst case is four extra demo
+ * mounts in a pane that would otherwise have been empty.
+ */
+async function hasConfiguredMounts() {
+  try {
+    const { resolveAppPaths, loadConfig } = await import(pathToFileURL(CORE).href);
+    const config = await loadConfig(resolveAppPaths().configFile, { required: false });
+    return config.mounts.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function transcript() {
@@ -122,7 +164,7 @@ async function ensureBuilt() {
 
 async function runTranscript(lines) {
   console.log('No interactive terminal here, so running a scripted session instead.');
-  console.log('Open a terminal and run `npm start` for the real thing.');
+  console.log('Open this workspace in a terminal panel for the full-screen view.');
   console.log('');
   for (const line of lines) console.log(`  /> ${line}`);
   console.log('');
@@ -140,15 +182,45 @@ async function runTranscript(lines) {
   });
 }
 
+/**
+ * Tell someone with no sources how to get some.
+ *
+ * Written to stderr, which the full-screen view leaves alone: the alternate screen buffer
+ * would swallow anything on stdout the moment the pane opens, so a hint printed there would
+ * exist for a few milliseconds and then be gone. On stderr it stays in the scrollback and is
+ * still there after quitting, which is when someone actually goes looking for it.
+ */
+function explainEmpty() {
+  console.error('No sources are configured, so the pane will be empty.');
+  console.error('');
+  console.error('  npm start -- init          write a starter config, then uncomment a source');
+  console.error('  npm start -- doctor        check the config and the connections');
+  console.error('');
+  console.error('GitHub needs only GH_TOKEN or `gh auth login`; Outlook and Teams sign in');
+  console.error('interactively the first time you open them.');
+  console.error('Set MSCOMMS_RUN_DEMO=1 to browse sample data instead.');
+  console.error('');
+}
+
 async function main() {
   const built = await ensureBuilt();
   if (built !== 0) return built;
 
   const args = process.argv.slice(2);
   // An explicit command is scriptable by definition: run it as given, whatever the streams
-  // look like. Only the argument-free case has to guess.
-  if (args.length > 0 || isInteractive()) return spawnNode([BIN, ...args], { stdio: 'inherit' });
-  return runTranscript(transcript());
+  // look like, and with none of the choices below imposed on top of it.
+  if (args.length > 0) return spawnNode([BIN, ...args], { stdio: 'inherit' });
+  if (!isInteractive()) return runTranscript(transcript());
+
+  const launch = [];
+  if (flag('MSCOMMS_RUN_TUI', true)) launch.push('--tui');
+  // Fixtures only on request. Asking the config loader is still worth it when they were not
+  // requested, because an empty pane deserves an explanation — but the explanation is how to
+  // connect an account, not four folders of invented mail.
+  if (flag('MSCOMMS_RUN_DEMO', false)) launch.push('--demo');
+  else if (!(await hasConfiguredMounts())) explainEmpty();
+
+  return spawnNode([BIN, ...launch], { stdio: 'inherit' });
 }
 
 process.exitCode = await main();
