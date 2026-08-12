@@ -43,14 +43,20 @@
  *   node scripts/app-run.mjs --shell                  the line shell instead
  *   node scripts/app-run.mjs ls /mail/Inbox           one shot, then exit
  *
+ * 3. **A sign-in cannot happen behind the pane.** The Microsoft device-code prompt is written
+ *    to stderr, which is right for a command line and useless underneath an alternate screen
+ *    buffer: the code and the URL land somewhere invisible and opening /mail looks like a
+ *    hang. So on a machine that has never signed in, that happens here first, on an ordinary
+ *    screen, before the pane is entered.
+ *
  * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the terminal check, MSCOMMS_RUN_TUI=0 falls
- * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_BUILD=0
- * skips the rebuild, and MSCOMMS_RUN_SCRIPT points at a file of commands to use instead of
- * the built-in transcript.
+ * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_SIGNIN=0
+ * skips the sign-in step, MSCOMMS_RUN_BUILD=0 skips the rebuild, and MSCOMMS_RUN_SCRIPT
+ * points at a file of commands to use instead of the built-in transcript.
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { build } from './lib/build.mjs';
@@ -88,17 +94,65 @@ function isInteractive() {
  * Asks the program's own config loader rather than reimplementing the search: the path is
  * platform-specific and the file is JSONC, and a second copy of either rule here would be a
  * copy that eventually disagrees with the one users actually experience. Any failure counts
- * as "nothing configured", which is the safe direction — the worst case is four extra demo
- * mounts in a pane that would otherwise have been empty.
+ * as "nothing configured", which is the safe direction — the worst case is a hint printed
+ * for someone who did not need it.
  */
-async function hasConfiguredMounts() {
+async function loadSources() {
   try {
     const { resolveAppPaths, loadConfig } = await import(pathToFileURL(CORE).href);
-    const config = await loadConfig(resolveAppPaths().configFile, { required: false });
-    return config.mounts.length > 0;
+    const paths = resolveAppPaths();
+    const config = await loadConfig(paths.configFile, { required: false });
+    return { paths, mounts: config.mounts };
+  } catch {
+    return { paths: undefined, mounts: [] };
+  }
+}
+
+/** Sources that sign in interactively the first time something asks them for data. */
+const INTERACTIVE_SOURCE = /^(graph-|ado-)/;
+
+/**
+ * Whether a Microsoft sign-in has already been completed and cached.
+ *
+ * Looks for the cache rather than the config because the question is about this machine's
+ * history, not its intentions. Scanning for the key beats reconstructing which mount id
+ * happened to authenticate first: the file is named after whichever mount got there, and
+ * that is an ordering detail no caller should have to predict.
+ */
+function hasCachedSignIn(stateDir) {
+  try {
+    return readdirSync(stateDir)
+      .filter((name) => name.endsWith('.json'))
+      .some((name) => readFileSync(join(stateDir, name), 'utf8').includes('"graph:tokens"'));
   } catch {
     return false;
   }
+}
+
+/**
+ * Get the Microsoft sign-in over with before the full-screen view opens.
+ *
+ * The device-code prompt is written to stderr, which is right for a command line and fatal
+ * behind an alternate screen buffer: the pane is already drawn over the whole terminal, so
+ * the code and the URL land somewhere invisible and the first attempt to open /mail looks
+ * like a hang with no way to discover what it wants. Doing it here means it happens once, on
+ * an ordinary screen, where the code can be read and typed.
+ *
+ * Only for a machine that has never signed in — after that the refresh token answers and
+ * this would be a network round trip for nothing.
+ */
+async function signInFirst(mounts, paths) {
+  if (!flag('MSCOMMS_RUN_SIGNIN', true)) return;
+  if (paths === undefined || hasCachedSignIn(paths.stateDir)) return;
+
+  const mount = mounts.find((candidate) => INTERACTIVE_SOURCE.test(candidate.type));
+  if (mount === undefined) return;
+
+  console.error(`Signing in before opening the pane, so the code below is visible.`);
+  // Listing is the cheapest thing that needs a token. Its output scrolls away when the pane
+  // opens; the sign-in it performs is the part that lasts.
+  await spawnNode([BIN, 'ls', mount.path, '--plain'], { stdio: 'inherit' });
+  console.error('');
 }
 
 function transcript() {
@@ -214,11 +268,17 @@ async function main() {
 
   const launch = [];
   if (flag('MSCOMMS_RUN_TUI', true)) launch.push('--tui');
-  // Fixtures only on request. Asking the config loader is still worth it when they were not
-  // requested, because an empty pane deserves an explanation — but the explanation is how to
-  // connect an account, not four folders of invented mail.
-  if (flag('MSCOMMS_RUN_DEMO', false)) launch.push('--demo');
-  else if (!(await hasConfiguredMounts())) explainEmpty();
+
+  // Fixtures only on request. The config is still worth loading when they were not, because
+  // both remaining questions need it: whether an empty pane deserves an explanation, and
+  // whether a sign-in has to happen while its prompt can still be seen.
+  if (flag('MSCOMMS_RUN_DEMO', false)) {
+    launch.push('--demo');
+  } else {
+    const { paths, mounts } = await loadSources();
+    if (mounts.length === 0) explainEmpty();
+    else await signInFirst(mounts, paths);
+  }
 
   return spawnNode([BIN, ...launch], { stdio: 'inherit' });
 }
