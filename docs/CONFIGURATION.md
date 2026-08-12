@@ -454,6 +454,7 @@ there. Everything below has a working default.
 | `vectors` | boolean | `true` | Build embeddings so `find` can match on meaning. |
 | `prefetch` | boolean | `true` | Fetch what you are about to open, before you open it. |
 | `prefetchConcurrency` | number | 2 | Speculative fetches in flight at once. |
+| `audit` | boolean | `false` | Record every provider fetch in an AgentFS `tool_calls` log. |
 
 ### What it buys you
 
@@ -503,6 +504,39 @@ a local-only file would be the wrong kind of help.
 A cache that will not open is a slower program, not a broken one. Startup records the
 reason and carries on with in-memory caching; `cache` prints it on stderr. `cache clear`
 empties it, `cache sync` forces a cycle immediately instead of waiting for the timer.
+
+### AgentFS: exporting and auditing
+
+The snapshot is a SQLite database, which means [Turso
+AgentFS](https://github.com/tursodatabase/agentfs) can be pointed straight at it. Two
+features come from that.
+
+**`cache export <path>`** writes the snapshot out as an AgentFS filesystem: a single file
+containing your mail as a real directory tree, one `.eml` per message, with a manifest at
+the root. Anything that speaks AgentFS can then mount and read it.
+
+```
+> cache export ~/mail-snapshot.db
+Exported 78 items into 6 folders, 30 without bodies (19.8 KB).
+```
+
+Messages whose bodies were never downloaded are exported as headers only — the folder
+structure is still complete. Items that cannot be written for any reason are skipped and
+counted rather than aborting the export; refusing to write four thousand good messages
+because one has an unrepresentable name is not a trade worth making.
+
+**`"audit": true`** records every provider fetch in a `tool_calls` table inside the
+snapshot: what was called, which path, how long it took, and whether it failed. `cache`
+then summarises it:
+
+```
+Audit: 34 recorded fetches.
+```
+
+The log deliberately holds paths and result *shapes* — a body's length, an entry count —
+and never message content. An audit trail that quietly became a second copy of your mail
+would be worse than the problem it solves. For the same reason it is off by default, it is
+never copied into an exported file, and a failure to write it can never interrupt syncing.
 
 ## `queries`
 

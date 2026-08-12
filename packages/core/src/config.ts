@@ -112,6 +112,12 @@ export interface CacheConfig {
   readonly prefetch?: boolean;
   /** Speculative fetches in flight at once. */
   readonly prefetchConcurrency?: number;
+  /**
+   * Record every provider fetch in an AgentFS `tool_calls` log. Off by default: it is a
+   * write per fetch, and a program that reads your mail should not start keeping a record
+   * of what it read without being told to.
+   */
+  readonly audit?: boolean;
 }
 
 export interface AppConfig {
@@ -470,7 +476,7 @@ function validateCache(entry: unknown): CacheConfig {
     }
     out[key] = value;
   }
-  for (const key of ['enabled', 'vectors', 'prefetch'] as const) {
+  for (const key of ['enabled', 'vectors', 'prefetch', 'audit'] as const) {
     const value = raw[key];
     if (value === undefined) continue;
     if (typeof value !== 'boolean') {

@@ -31,6 +31,7 @@
 import { NULL_LOGGER } from './logging.js';
 import type { Document, ListPage, Logger, Provider, VNode } from './provider.js';
 import { DEFAULT_RECENT } from './snapshot.js';
+import type { ToolCallsLike } from './agentfs.js';
 import type { SnapshotStore } from './snapshot.js';
 import * as vpath from './vpath.js';
 
@@ -80,6 +81,12 @@ export interface BackgroundSyncOptions {
   readonly bodies?: number;
   /** Cap on directories touched per cycle, so one enormous account cannot monopolise. */
   readonly maxDirectoriesPerCycle?: number;
+  /**
+   * Where to record provider calls. Absent means no audit trail is kept — the feature is
+   * opt-in because it is a write per fetch, and a program that reads mail should not start
+   * keeping records of you without being asked to.
+   */
+  readonly audit?: ToolCallsLike;
 }
 
 export interface SyncStatus {
@@ -106,6 +113,7 @@ export class BackgroundSync {
   readonly #concurrency: number;
   readonly #bodies: number;
   readonly #maxDirectories: number;
+  readonly #audit: ToolCallsLike | undefined;
 
   #timer: NodeJS.Timeout | undefined;
   #inFlight: Promise<SyncStatus> | undefined;
@@ -131,6 +139,55 @@ export class BackgroundSync {
     this.#concurrency = Math.max(1, options.concurrency ?? 2);
     this.#bodies = Math.max(0, options.bodies ?? 0);
     this.#maxDirectories = Math.max(1, options.maxDirectoriesPerCycle ?? 64);
+    this.#audit = options.audit;
+  }
+
+  /**
+   * Run a provider call and record it in the AgentFS tool-call log.
+   *
+   * This program reads corporate mail in the background, on a timer, without anyone
+   * watching. "Which mailboxes did it touch, when, and did it fail" should therefore be a
+   * question with a real answer rather than an assurance, and `tool_calls` is an
+   * insert-only table the specification provides for exactly that.
+   *
+   * Only the path and the shape of the result are recorded — never message content. An
+   * audit trail that quietly became a second copy of your mail would be a worse privacy
+   * problem than the one it set out to solve.
+   *
+   * Auditing never fails the call it is auditing. A cache that cannot write its log is a
+   * program with a gap in its history, not a program that stops fetching mail.
+   */
+  async #audited<T>(name: string, parameters: unknown, run: () => Promise<T>, describe: (value: T) => unknown): Promise<T> {
+    if (this.#audit === undefined) return run();
+    const startedAt = Math.floor(this.#now() / 1000);
+    const startedMs = this.#now();
+    try {
+      const value = await run();
+      await this.#record(name, startedAt, startedMs, parameters, describe(value), undefined);
+      return value;
+    } catch (error) {
+      await this.#record(name, startedAt, startedMs, parameters, undefined, String(error));
+      throw error;
+    }
+  }
+
+  async #record(
+    name: string,
+    startedAt: number,
+    startedMs: number,
+    parameters: unknown,
+    result: unknown,
+    error: string | undefined,
+  ): Promise<void> {
+    try {
+      // The specification requires duration_ms to equal (completed_at - started_at) * 1000,
+      // so completed_at is derived from the elapsed milliseconds rather than sampled again.
+      const elapsedMs = Math.max(0, this.#now() - startedMs);
+      const completedAt = startedAt + Math.round(elapsedMs / 1000);
+      await this.#audit?.record(name, startedAt, completedAt, parameters, result, error);
+    } catch (failure) {
+      this.#logger.debug('could not write the audit record', { name, error: String(failure) });
+    }
   }
 
   get status(): SyncStatus {
@@ -279,11 +336,17 @@ export class BackgroundSync {
 
     do {
       if (signal.aborted) break;
-      const page: ListPage = await mount.provider.list(node, {
-        limit: Math.min(pageSize, this.#recent - seen.length),
-        ...(cursor === undefined ? {} : { cursor }),
-        signal,
-      });
+      const page: ListPage = await this.#audited(
+        'provider.list',
+        { path, mount: mount.id },
+        () =>
+          mount.provider.list(node, {
+            limit: Math.min(pageSize, this.#recent - seen.length),
+            ...(cursor === undefined ? {} : { cursor }),
+            signal,
+          }),
+        (result) => ({ entries: result.entries.length, more: result.cursor !== undefined }),
+      );
       const withPaths = this.#host.canonicalize(path, page.entries);
       await this.#snapshot.putListing({
         mountId: mount.id,
@@ -326,6 +389,9 @@ export class BackgroundSync {
   async #syncBodies(mount: SyncMount, entries: readonly VNode[], signal: AbortSignal): Promise<void> {
     if (this.#bodies === 0) return;
     if (!mount.provider.capabilities.has('read') || mount.provider.read === undefined) return;
+    // Bound to a local so the narrowing above survives into the closure below. `read` is
+    // optional on the provider, and a deferred call loses what the guard proved.
+    const read = mount.provider.read.bind(mount.provider);
 
     const newest = entries
       .filter((entry) => entry.kind === 'file')
@@ -339,7 +405,13 @@ export class BackgroundSync {
       const existing = await this.#snapshot.document(entry.path);
       if (existing !== undefined) continue;
       try {
-        const doc: Document = await mount.provider.read(entry, { signal });
+        const doc: Document = await this.#audited(
+          'provider.read',
+          { path: entry.path, mount: mount.id },
+          () => read(entry, { signal }),
+          // Length, not text. The point is that a body was fetched, not what it said.
+          (result) => ({ format: result.format, bytes: result.body.length }),
+        );
         await this.#snapshot.putDocument(mount.id, entry, doc);
         this.#bodyCount += 1;
       } catch (error) {
@@ -359,3 +431,4 @@ export class BackgroundSync {
 function childPath(parent: string, node: VNode): string {
   return vpath.join(parent, node.name);
 }
+

@@ -216,6 +216,53 @@ that started before it. And the model learns only from unfiltered navigation: a 
 `ls` is someone interrogating a folder, not moving to it, and counting it would poison the
 model with places nobody went.
 
+### AgentFS, and why the gap was the driver
+
+[Turso AgentFS](https://github.com/tursodatabase/agentfs) specifies a filesystem *as a
+SQLite schema* — inodes, dentries, chunked file data, an insert-only `tool_calls` log and a
+key-value store. That is an unusually good fit here, because this program's whole premise
+is that comms are already a filesystem. Its tree can be written out as an actual one.
+
+The interesting part was making it run at all. The `agentfs-sdk` package depends on
+`@tursodatabase/database`, which publishes no build for win32-arm64, so importing the
+package's entry point fails with *"Cannot find native binding."* The obvious reading is
+that AgentFS is unavailable on this platform.
+
+That reading is wrong, and reading the SDK's shipped source rather than its documentation
+is what showed it. `AgentFS`, `ToolCalls` and `KvStore` take the database as a
+**constructor argument** and use only `exec` and `prepare`/`run`/`get`/`all`. The database
+type is imported *type-only*, so it erases at compile time and the classes have no runtime
+dependency on the native module whatsoever. **The missing piece is the driver, not the
+filesystem** — and `sql.ts` is already a driver. A twelve-line adapter from `SqlDriver` to
+the shape AgentFS expects is the entire integration:
+
+```ts
+{ exec: (sql) => driver.exec(sql),
+  prepare: (sql) => ({ run: (...a) => driver.run(sql, a), /* get, all */ }) }
+```
+
+So `agentfs.ts` imports the submodules directly (resolved via `import.meta.resolve`, which
+locates the package without executing its entry point) when the public entry fails, and
+falls back to it automatically when the native binding *is* present. The tests drive the
+real, unmodified SDK — and check that it stamps `schema_version` itself, which is how we
+know we are testing AgentFS rather than a reimplementation of it.
+
+Two things are built on top:
+
+**`cache export <path>`** turns the snapshot into a mountable filesystem. `NameAllocator`
+matters more here than anywhere else: `fs_dentry` has `UNIQUE(parent_ino, name)`, so two
+messages that collide on a name would not error — the second would silently overwrite the
+first. Losing a message quietly is the worst failure this code could have. Export failures
+are collected and reported rather than thrown, and rendered messages collapse newlines in
+header values, because a subject containing `\r\nFrom: ceo@…` must not be able to forge a
+sender in the file that comes out.
+
+**`"audit": true`** records provider fetches in `tool_calls`. It stores paths and result
+shapes — a byte count, an entry count — and never content: an audit log that became a
+second copy of your mail would be worse than the problem it solves. It is off by default,
+excluded from exports, and wrapped so that a failure to record can never interrupt the
+sync it is recording.
+
 ## The graph model
 
 A tree is a projection of a graph, not the other way around. A message has an author, a

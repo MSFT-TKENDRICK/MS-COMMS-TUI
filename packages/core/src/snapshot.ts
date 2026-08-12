@@ -456,6 +456,32 @@ export class SnapshotStore {
     return row === undefined ? 0 : Number(row['n']);
   }
 
+  /**
+   * Every cached node, shallowest first, for callers that need the whole tree rather than
+   * one directory — exporting to AgentFS, most obviously.
+   *
+   * Ordered by path depth then path so that a consumer building a filesystem meets `/mail`
+   * before `/mail/Inbox`, and never has to create a parent it has not seen yet. Sorting in
+   * SQL keeps the whole tree from being pulled into memory just to be re-sorted.
+   *
+   * This does not count as a cache hit or miss: it is bulk export, not a lookup that the
+   * hit rate is trying to describe, and folding it in would flatter the statistics.
+   */
+  async entries(): Promise<ReadonlyArray<{ node: VNode; path: string; mountId: string }>> {
+    const rows = await this.#driver.all(
+      `SELECT *, (LENGTH(path) - LENGTH(REPLACE(path, '/', ''))) AS depth
+         FROM nodes ORDER BY depth ASC, path ASC`,
+    );
+    return rows.map((row) => ({
+      node: rowToNode(row),
+      // Carried alongside rather than read back off the node: `VNode.path` is optional
+      // because providers do not set it, and a caller building a filesystem needs a string
+      // it can rely on, not one it has to assert.
+      path: String(row['path']),
+      mountId: String(row['mount_id']),
+    }));
+  }
+
   async node(path: string): Promise<VNode | undefined> {
     const row = await this.#driver.get('SELECT * FROM nodes WHERE path = ?', [vpath.normalize(path)]);
     if (row === undefined) {

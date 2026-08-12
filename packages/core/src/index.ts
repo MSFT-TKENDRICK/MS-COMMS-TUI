@@ -297,3 +297,15 @@ export {
   type ProjectionOptions,
   type ProjectionProviderOptions,
 } from './projection.js';
+
+export { agentFsDatabase, loadAgentFs, resetAgentFsCache } from './agentfs.js';
+export type {
+  AgentFsDatabase,
+  AgentFsStatement,
+  AgentFsLike,
+  AgentFsModule,
+  ToolCallsLike,
+  KvStoreLike,
+} from './agentfs.js';
+export { exportToAgentFs } from './agentfs-export.js';
+export type { AgentFsExportOptions, AgentFsExportResult } from './agentfs-export.js';

@@ -5,6 +5,7 @@ import { openSqlDriver } from '../sql.js';
 import { SnapshotStore } from '../snapshot.js';
 import { BackgroundSync, type SyncHost, type SyncMount } from '../sync.js';
 import { NameAllocator } from '../naming.js';
+import { agentFsDatabase, loadAgentFs, type ToolCallsLike } from '../agentfs.js';
 import type { Capability, Document, ListPage, Provider, VNode } from '../provider.js';
 
 // ---------------------------------------------------------------------------
@@ -572,3 +573,107 @@ describe('BackgroundSync: lifecycle', () => {
     await snapshot.close();
   });
 });
+
+
+describe('BackgroundSync: the audit trail', () => {
+  async function auditFor(): Promise<{ audit: ToolCallsLike; close: () => Promise<void> }> {
+    const driver = await openSqlDriver({ path: ':memory:' });
+    const { ToolCalls } = await loadAgentFs();
+    const audit = (await ToolCalls.fromDatabase(agentFsDatabase(driver))) as ToolCallsLike;
+    return { audit, close: () => driver.close() };
+  }
+
+  it('records the calls a cycle made, with paths but never message bodies', async () => {
+    const snapshot = await store();
+    const { audit, close } = await auditFor();
+    const { provider } = fakeProvider({
+      tree: { '/mail': [file('a', '/mail', 5_000)] },
+      capabilities: ['list', 'read'],
+    });
+
+    const sync = new BackgroundSync({
+      host: hostFor([{ id: 'mail', path: '/mail', provider }]),
+      snapshot,
+      bodies: 1,
+      audit,
+    });
+    await sync.runOnce();
+
+    const recent = await audit.getRecent(0, 50);
+    const names = recent.map((row) => row['name']);
+    assert.ok(names.includes('provider.list'));
+    assert.ok(names.includes('provider.read'));
+
+    // The whole point of the restraint in #audited: the log says a body was fetched and
+    // how big it was, never what it said. An audit trail that becomes a second copy of
+    // your mail is worse than the problem it solves.
+    const read = recent.find((row) => row['name'] === 'provider.read');
+    const serialised = JSON.stringify(read);
+    assert.match(serialised, /\/mail\/a/);
+    assert.doesNotMatch(serialised, /body of a/);
+
+    await close();
+    await snapshot.close();
+  });
+
+  it('records a failed call with its error instead of dropping it', async () => {
+    const snapshot = await store();
+    const { audit, close } = await auditFor();
+    const { provider } = fakeProvider({ tree: { '/mail': [] }, failOn: '/mail' });
+
+    const sync = new BackgroundSync({
+      host: hostFor([{ id: 'mail', path: '/mail', provider }]),
+      snapshot,
+      audit,
+    });
+    await sync.runOnce();
+
+    const recent = await audit.getRecent(0, 50);
+    assert.equal(recent.length, 1);
+    // A cache that silently fetches nothing looks identical to an empty mailbox. The
+    // failure is the single most useful thing in the log.
+    assert.match(String(recent[0]?.['error']), /403 Forbidden/);
+    await close();
+    await snapshot.close();
+  });
+
+  it('keeps syncing when the audit store itself is broken', async () => {
+    const snapshot = await store();
+    const { provider, recorded } = fakeProvider({ tree: { '/mail': [file('a', '/mail')] } });
+    const broken: ToolCallsLike = {
+      record: async () => {
+        throw new Error('disk full');
+      },
+      getRecent: async () => [],
+      getStats: async () => [],
+    };
+
+    const sync = new BackgroundSync({
+      host: hostFor([{ id: 'mail', path: '/mail', provider }]),
+      snapshot,
+      audit: broken,
+    });
+    const status = await sync.runOnce();
+
+    // Bookkeeping must never be able to stop the work it is bookkeeping for.
+    assert.equal(recorded.lists.length, 1);
+    assert.equal(status.items, 1);
+    assert.equal((await snapshot.listing('/mail'))?.entries.length, 1);
+    await snapshot.close();
+  });
+
+  it('writes nothing at all when no audit store is configured', async () => {
+    const snapshot = await store();
+    const { provider } = fakeProvider({ tree: { '/mail': [file('a', '/mail')] } });
+    const sync = new BackgroundSync({ host: hostFor([{ id: 'mail', path: '/mail', provider }]), snapshot });
+    await sync.runOnce();
+
+    // Opt-in means opt-in: the snapshot database must not grow an audit table because
+    // background sync happened to run.
+    const driver = snapshot.driver;
+    const row = await driver.get("SELECT name FROM sqlite_master WHERE name = 'tool_calls'");
+    assert.equal(row, undefined);
+    await snapshot.close();
+  });
+});
+

@@ -17,6 +17,7 @@
     "build": "tsc --build"
   },
   "dependencies": {
-    "@libsql/client": "^0.17.4"
+    "@libsql/client": "^0.17.4",
+    "agentfs-sdk": "^0.6.4"
   }
 }

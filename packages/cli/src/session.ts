@@ -31,10 +31,13 @@ import {
   resolveSecret,
   stateFileFor,
   vpath,
+  agentFsDatabase,
+  loadAgentFs,
   type AppConfig,
   type AppPaths,
   type BuiltMount,
   type Logger,
+  type ToolCallsLike,
   type VNode,
   type VfsTarget,
 } from '@mscomms/core';
@@ -265,6 +268,19 @@ export class Session {
       });
       await this.vfs.warmPredictor().catch(() => undefined);
 
+      // The audit log lives in the same database as the snapshot, so it needs no
+      // configuration beyond being switched on. If AgentFS cannot load — no native
+      // binding, an incompatible version — sync still runs, just without the record.
+      let audit: ToolCallsLike | undefined;
+      if (cache.audit === true) {
+        try {
+          const { ToolCalls } = await loadAgentFs();
+          audit = (await ToolCalls.fromDatabase(agentFsDatabase(driver))) as ToolCallsLike;
+        } catch (error) {
+          this.logger.warn('audit log unavailable; syncing without it', { message: String(error) });
+        }
+      }
+
       this.sync = new BackgroundSync({
         host: this.vfs,
         snapshot,
@@ -273,6 +289,7 @@ export class Session {
         ...(cache.recent === undefined ? {} : { recent: cache.recent }),
         ...(cache.depth === undefined ? {} : { depth: cache.depth }),
         ...(cache.bodies === undefined ? {} : { bodies: cache.bodies }),
+        ...(audit === undefined ? {} : { audit }),
       });
       this.sync.start();
     } catch (error) {
@@ -493,3 +510,4 @@ export function defaultConfigCandidates(paths: AppPaths): string[] {
     join(homedir(), '.mscomms.json'),
   ];
 }
+

@@ -147,11 +147,18 @@ absence from the cache alone, and `find` tells you how many results came from it
 The whole thing is an accelerator: if it cannot open, the shell starts anyway and `cache`
 says why. Details in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#cache).
 
+Because the snapshot is SQLite, [Turso AgentFS](https://github.com/tursodatabase/agentfs)
+can be pointed at it. `cache export ~/mail.db` writes your mail out as a real AgentFS
+filesystem — one `.eml` per message, folders intact — that anything speaking AgentFS can
+mount. Setting `"audit": true` additionally records every fetch the background sync made in
+AgentFS's `tool_calls` log: paths and result sizes, never message content.
+
 ## Install
 
-Node 20.11 or newer. One runtime dependency, `@libsql/client`, which backs the optional
+Node 20.11 or newer. Two runtime dependencies: `@libsql/client`, which backs the optional
 local snapshot — the on-disk Turso database that makes a cold start fast and search
-instant. Everything else is this repo's own workspace packages.
+instant — and `agentfs-sdk`, which reads and writes that snapshot as a filesystem.
+Everything else is this repo's own workspace packages.
 
 The snapshot is **off by default**: turning it on writes corporate mail to a file on your
 machine, and that is a decision to make deliberately rather than to inherit. `cache enable`

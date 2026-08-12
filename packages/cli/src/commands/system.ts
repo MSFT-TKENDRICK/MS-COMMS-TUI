@@ -9,7 +9,14 @@
  */
 
 import { performance } from 'node:perf_hooks';
-import { VfsError, isVfsError, QUERY_FIELD_HELP } from '@mscomms/core';
+import {
+  VfsError,
+  isVfsError,
+  QUERY_FIELD_HELP,
+  exportToAgentFs,
+  openSqlDriver,
+  type SqlDriver,
+} from '@mscomms/core';
 import { formatRows } from '../format.js';
 import { OUTPUT_FLAGS, flagBool, modeFrom, quoteCorrection, type Command, type CommandTable } from './types.js';
 
@@ -363,9 +370,9 @@ export const cacheCommand: Command = {
   name: 'cache',
   group: 'system',
   summary: 'Show how much is cached and how well the cache is working.',
-  usage: 'cache [clear|sync]',
+  usage: 'cache [clear|sync|export <path>]',
   args: ['action'],
-  maxPositional: 1,
+  maxPositional: 2,
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
     const action = args.positional[0];
@@ -396,8 +403,46 @@ export const cacheCommand: Command = {
       return;
     }
 
+    if (action === 'export') {
+      const target = args.positional[1];
+      if (target === undefined) {
+        throw VfsError.invalid(
+          'Nowhere to export to.',
+          'Give a file to write, for example: cache export ~/mail.agentfs.db',
+        );
+      }
+      if (session.snapshot === undefined) {
+        throw VfsError.invalid(
+          'There is no local snapshot to export.',
+          'Set "cache": { "enabled": true } in your config, then run "cache sync".',
+        );
+      }
+
+      const driver = await openSqlDriver({ path: target });
+      try {
+        const result = await exportToAgentFs({ driver, snapshot: session.snapshot });
+        session.print(
+          `Exported ${count(result.files, 'item')} into ${count(result.directories, 'folder')}` +
+            `${result.stubs === 0 ? '' : `, ${String(result.stubs)} without bodies`} (${formatBytes(result.bytes)}).`,
+        );
+        // Chrome, not data: someone piping the line above wants the counts, and this is
+        // the bit that tells a human what the file is actually for.
+        session.writeError(`Wrote an AgentFS filesystem to ${target}.\n`);
+        session.writeError(`Mount it with: agentfs mount ${target} ./mnt\n`);
+        for (const { path, reason } of result.skipped) {
+          session.writeError(`Skipped ${path}: ${reason}\n`);
+        }
+      } finally {
+        await driver.close();
+      }
+      return;
+    }
+
     if (action !== undefined) {
-      throw VfsError.invalid(`Unknown action "${action}".`, 'Use "cache", "cache clear" or "cache sync".');
+      throw VfsError.invalid(
+        `Unknown action "${action}".`,
+        'Use "cache", "cache clear", "cache sync" or "cache export <path>".',
+      );
     }
 
     const stats = session.vfs.cacheStats;
@@ -451,9 +496,38 @@ export const cacheCommand: Command = {
         `Storage: ${driver.description}` +
           `${driver.nativeVector ? ', vector search in the database' : ', vector search in this process'}.\n`,
       );
+
+      // Only shown when the log exists, which means only when it was switched on. A line
+      // saying "auditing: off" on every run would be noise about a feature you declined.
+      const audit = await auditSummary(driver);
+      if (audit !== undefined) session.writeError(audit);
     }
   },
 };
+
+/**
+ * A one-line summary of the audit log, or nothing at all if there isn't one. Read
+ * straight from the table rather than through AgentFS: `cache` runs on every prompt in
+ * the shell and should not pay to load an SDK to tell you a feature is off.
+ */
+async function auditSummary(driver: SqlDriver): Promise<string | undefined> {
+  try {
+    const present = await driver.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'");
+    if (present === undefined) return undefined;
+    const row = await driver.get(
+      "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS failed FROM tool_calls",
+    );
+    const total = Number(row?.['total'] ?? 0);
+    if (total === 0) return undefined;
+    const failed = Number(row?.['failed'] ?? 0);
+    const trouble = failed === 0 ? '' : `, ${String(failed)} failed`;
+    return `Audit: ${count(total, 'recorded fetch', 'recorded fetches')}${trouble}.\n`;
+  } catch {
+    // A summary of the bookkeeping is the least important thing on screen; it must never
+    // be the reason `cache` reports an error.
+    return undefined;
+  }
+}
 
 function rate(hits: number, misses: number): string {
   const total = hits + misses;
@@ -572,3 +646,4 @@ export function systemCommands(table: CommandTable): readonly Command[] {
     quitCommand,
   ];
 }
+
