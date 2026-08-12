@@ -19,6 +19,8 @@
     "packages/provider-exec"
   ],
   "scripts": {
+    "setup": "node scripts/app-setup.mjs",
+    "start": "node scripts/app-run.mjs",
     "build": "tsc --build",
     "clean": "tsc --build --clean",
     "typecheck": "tsc --build --force",
