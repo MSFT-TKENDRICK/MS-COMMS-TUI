@@ -55,6 +55,15 @@ interface StubOptions {
   /** Throw on every call after the first N. Used to test stale-cache fallback. */
   readonly failAfter?: number;
   readonly pageSize?: number;
+  /**
+   * Where this stub is mounted, so search hits can report an honest absolute path.
+   * `mountStub` fills it in; a provider in the wild learns this from its context.
+   */
+  readonly mountPath?: string;
+  /** Make `search` reject, standing in for a revoked scope or a rate limit. */
+  readonly searchThrows?: string;
+  /** Make `search` take this long, standing in for a backend that has stopped answering. */
+  readonly searchDelayMs?: number;
 }
 
 class StubProvider implements Provider {
@@ -146,6 +155,9 @@ class StubProvider implements Provider {
 
   #search(parent: VNode | null, _query: unknown, _options: ListOptions): Promise<ListPage> {
     this.searchCalls += 1;
+    if (this.#options.searchThrows !== undefined) {
+      return Promise.reject(new VfsError('EAUTH', this.#options.searchThrows));
+    }
     // Deliberately returns EVERYTHING under the root, ignoring the query. Combined with
     // `overclaimQuery` this is the exact shape of the bug the honesty guard exists for.
     const hits: VNode[] = [];
@@ -158,7 +170,7 @@ class StubProvider implements Provider {
               ? node
               : this.#options.parentPathOnly
                 ? { ...node, parentPath }
-                : { ...node, parentPath, path: `/m/${parentPath}${item.name}` },
+                : { ...node, parentPath, path: `${this.#options.mountPath ?? '/m'}/${parentPath}${item.name}` },
           );
         } else {
           walk(item.children, `${parentPath}${item.name}/`);
@@ -166,17 +178,19 @@ class StubProvider implements Provider {
       }
     };
     walk(this.#childrenOf(parent).items, parent === null ? '' : `${parent.id}/`);
-    return Promise.resolve({
+    const page: ListPage = {
       entries: hits,
       total: hits.length,
       ...this.#claim(_query),
-    });
+    };
+    if (this.#options.searchDelayMs === undefined) return Promise.resolve(page);
+    return new Promise((resolve) => setTimeout(() => resolve(page), this.#options.searchDelayMs));
   }
 }
 
 function mountStub(vfs: Vfs, options: StubOptions, path = '/m'): StubProvider {
-  const provider = new StubProvider(options);
-  const mount: Mount = { path, id: 'stub', provider };
+  const provider = new StubProvider({ mountPath: path, ...options });
+  const mount: Mount = { path, id: path.slice(1).replaceAll('/', '-'), provider };
   vfs.mount(mount);
   return provider;
 }
@@ -516,6 +530,211 @@ describe('Vfs: search', () => {
     assert.equal(provider.listCalls, 7);
   });
 });
+
+/**
+ * Searching every source at once.
+ *
+ * The properties here are all about honesty under partial failure. A search that spans
+ * four backends can be partly wrong in ways a single-source search cannot: one tenant
+ * revokes a scope, one feed hangs, one repository rate-limits. Every test below asks the
+ * same question in a different shape — when something goes wrong, does the user find out?
+ */
+describe('Vfs: cross-source search', () => {
+  function twoSources(vfs: Vfs, options: Partial<StubOptions> = {}): void {
+    mountStub(vfs, { tree: TREE }, '/mail');
+    mountStub(
+      vfs,
+      { tree: [{ name: 'General', children: [{ name: 'budget.md', title: 'Budget chat' }] }], ...options },
+      '/chat',
+    );
+  }
+
+  it('uses each source\'s own search index rather than walking the tree', async () => {
+    // Walking a synthetic root breadth-first shares one node budget across every source,
+    // so whichever mount sorts first eats it and the rest silently return nothing.
+    const vfs = new Vfs();
+    const mail = mountStub(vfs, { tree: TREE }, '/mail');
+    const chat = mountStub(vfs, { tree: [{ name: 'General', children: [{ name: 'budget.md', title: 'Budget chat' }] }] }, '/chat');
+    await vfs.search('/', parseQuery('budget'));
+    assert.equal(mail.searchCalls, 1);
+    assert.equal(chat.searchCalls, 1);
+  });
+
+  it('reports what each source did, including the ones that produced nothing', async () => {
+    const vfs = new Vfs();
+    twoSources(vfs);
+    const result = await vfs.search('/', parseQuery('budget'));
+    assert.equal(result.sources?.length, 2);
+    assert.deepEqual(
+      result.sources?.map((source) => source.id).sort(),
+      ['chat', 'mail'],
+      'a source that answered must appear even when it contributed no hits',
+    );
+    assert.ok(result.sources?.every((source) => source.status === 'ok'));
+    assert.ok(result.sources?.every((source) => source.native), 'both stubs can search natively');
+  });
+
+  it('keeps going when one source fails, and names the one that did', async () => {
+    // The whole point of asking four backends is that three of them can still answer.
+    const vfs = new Vfs();
+    twoSources(vfs, { searchThrows: 'the token expired' });
+    const result = await vfs.search('/', parseQuery('budget'));
+
+    assert.ok(result.entries.length > 0, 'the healthy source still returned results');
+    assert.ok(result.entries.every((entry) => entry.path?.startsWith('/mail')));
+
+    const broken = result.sources?.find((source) => source.id === 'chat');
+    assert.equal(broken?.status, 'failed');
+    assert.match(broken?.error ?? '', /token expired/);
+  });
+
+  it('drops a source that misses its deadline instead of hanging', async () => {
+    // A hung tenant must not make the tool look frozen; to someone reading one line at a
+    // time that is indistinguishable from a crash.
+    const vfs = new Vfs();
+    twoSources(vfs, { searchDelayMs: 5_000 });
+    const started = Date.now();
+    const result = await vfs.search('/', parseQuery('budget'), { sourceTimeoutMs: 50 });
+
+    assert.ok(Date.now() - started < 2_000, 'the slow source must not hold up the rest');
+    assert.equal(result.sources?.find((source) => source.id === 'chat')?.status, 'timeout');
+    assert.equal(result.sources?.find((source) => source.id === 'mail')?.status, 'ok');
+    assert.ok(result.entries.length > 0);
+  });
+
+  it('restricts to the named sources', async () => {
+    const vfs = new Vfs();
+    twoSources(vfs);
+    const result = await vfs.search('/', parseQuery('budget'), { sources: ['chat'] });
+    assert.deepEqual(result.sources?.map((source) => source.id), ['chat']);
+    assert.ok(result.entries.every((entry) => entry.path?.startsWith('/chat')));
+  });
+
+  it('accepts a source named by mount path as readily as by id', async () => {
+    const vfs = new Vfs();
+    twoSources(vfs);
+    const result = await vfs.search('/', parseQuery('budget'), { sources: ['/chat'] });
+    assert.deepEqual(result.sources?.map((source) => source.id), ['chat']);
+  });
+
+  it('says so when a named source does not exist, rather than returning nothing', async () => {
+    // Silently returning an empty list would read as "no such mail", which is a false
+    // negative — the worst answer this program can give.
+    const vfs = new Vfs();
+    twoSources(vfs);
+    await assert.rejects(
+      () => vfs.search('/', parseQuery('budget'), { sources: ['nope'] }),
+      (error: unknown) => {
+        assert.match((error as Error).message, /No source matches/);
+        assert.match((error as { hint?: string }).hint ?? '', /chat|mail/);
+        return true;
+      },
+    );
+  });
+
+  it('orders merged results by relevance, not by which mount sorted first', async () => {
+    // `/chat` sorts before `/mail`, so a stable-but-unranked merge would always bury the
+    // better match. Across unrelated backends the query is the only shared ordering.
+    const vfs = new Vfs();
+    mountStub(vfs, { tree: [{ name: 'Inbox', children: [{ name: 'a.eml', title: 'budget' }] }] }, '/mail');
+    mountStub(vfs, { tree: [{ name: 'General', children: [{ name: 'b.md', title: 'Re: rebudgeting later' }] }] }, '/chat');
+    const result = await vfs.search('/', parseQuery('budget'));
+    assert.equal(result.ranked, true);
+    assert.deepEqual(result.entries.map((entry) => entry.title), ['budget', 'Re: rebudgeting later']);
+  });
+
+  it('honours an explicit sort instead of ranking', async () => {
+    const vfs = new Vfs();
+    twoSources(vfs);
+    const result = await vfs.search('/', parseQuery('budget'), { sort: { field: 'name', direction: 'desc' } });
+    assert.equal(result.ranked, false);
+  });
+
+  it('offers no cursor, because a merged search has nothing honest to resume from', async () => {
+    // Resuming would mean juggling N provider cursors and re-ranking against results the
+    // user has already seen. A cursor that quietly loses or repeats items is worse than
+    // none, so truncation is reported instead.
+    const vfs = new Vfs();
+    twoSources(vfs);
+    const result = await vfs.search('/', parseQuery('budget'), { limit: 1 });
+    assert.equal(result.entries.length, 1);
+    assert.equal(result.cursor, undefined);
+    assert.ok(result.sources?.some((source) => source.truncated), 'the cut-off must be visible somewhere');
+  });
+
+  it('still walks a source that has no search of its own', async () => {
+    const vfs = new Vfs();
+    mountStub(vfs, { tree: TREE }, '/mail');
+    mountStub(
+      vfs,
+      {
+        tree: [{ name: 'General', children: [{ name: 'budget.md', title: 'Budget chat' }] }],
+        capabilities: ['list', 'read'],
+      },
+      '/chat',
+    );
+    const result = await vfs.search('/', parseQuery('budget'));
+    assert.equal(result.sources?.find((source) => source.id === 'chat')?.native, false);
+    assert.ok(result.entries.some((entry) => entry.path?.startsWith('/chat')));
+  });
+
+  it('propagates a caller-initiated abort as an error, not as a source failure', async () => {
+    // The user pressing Ctrl-C is not a backend problem, and reporting it as one would
+    // hide a real cancellation behind a plausible-looking "source failed" line.
+    const vfs = new Vfs();
+    twoSources(vfs);
+    await assert.rejects(() => vfs.search('/', parseQuery('budget'), { signal: AbortSignal.abort() }));
+  });
+
+  it('reports a walked source as partial when some of its folders could not be read', async () => {
+    // The dangerous case is not a source that fails outright — that is loud. It is a
+    // source that answers, having quietly skipped half of itself, so "no results" reads
+    // as "not there" when it actually means "I could not look".
+    const vfs = new Vfs();
+    mountStub(vfs, { tree: TREE }, '/mail');
+    mountStub(vfs, { tree: TREE, capabilities: ['list', 'read'], failAfter: 1 }, '/chat');
+
+    const result = await vfs.search('/', parseQuery('budget'));
+    const chat = result.sources?.find((source) => source.id === 'chat');
+    assert.equal(chat?.status, 'partial');
+    assert.match(chat?.error ?? '', /could not be read/);
+    assert.match(chat?.error ?? '', /network went away/);
+    // A partial source must not take the healthy one down with it.
+    assert.equal(result.sources?.find((source) => source.id === 'mail')?.status, 'ok');
+    assert.ok(result.entries.some((entry) => entry.path?.startsWith('/mail')));
+  });
+
+  it('counts unreadable folders on a single-source walk too', async () => {
+    // Same blind spot, no federation involved: `find /news -q x` must be able to say it
+    // did not see everything.
+    const vfs = new Vfs();
+    mountStub(vfs, { tree: TREE, capabilities: ['list', 'read'], failAfter: 1 }, '/mail');
+    const result = await vfs.search('/mail', parseQuery('budget'));
+    assert.equal(result.unreadable, 2, 'Inbox and Archive both failed to list');
+    assert.match(result.unreadableError ?? '', /network went away/);
+  });
+
+  it('leaves unreadable unset when the whole walk succeeded', async () => {
+    // Absence of the field is what lets the CLI stay quiet on the happy path.
+    const vfs = new Vfs();
+    mountStub(vfs, { tree: TREE, capabilities: ['list', 'read'] }, '/mail');
+    const result = await vfs.search('/mail', parseQuery('budget'));
+    assert.equal(result.unreadable, undefined);
+    assert.equal(result.unreadableError, undefined);
+  });
+
+  it('does not swallow a cancellation as an unreadable folder', async () => {
+    // A walk absorbs failures on purpose. Cancellation is not a failure, and absorbing it
+    // would mean the walk kept going after the user asked it to stop.
+    const vfs = new Vfs();
+    mountStub(vfs, { tree: TREE, capabilities: ['list', 'read'] }, '/mail');
+    await assert.rejects(
+      () => vfs.search('/mail', parseQuery('budget'), { signal: AbortSignal.abort() }),
+      (error: Error) => error.name === 'AbortError' || /abort/i.test(error.message),
+    );
+  });
+});
+
 
 describe('Vfs: reading', () => {
   it('reads a file and caches the document', async () => {

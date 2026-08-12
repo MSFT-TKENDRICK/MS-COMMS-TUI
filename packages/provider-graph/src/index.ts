@@ -3,7 +3,7 @@ export type { DeviceCodeAuthOptions } from './auth.js';
 export { GraphClient } from './client.js';
 export type { GraphApi, GraphClientOptions, GraphPage, GraphRequestOptions } from './client.js';
 export { getAuthenticator, createClient, resetAllAuth, htmlToText, preview } from './shared.js';
-export type { GraphSharedOptions } from './shared.js';
+export type { GraphSharedOptions, AuthenticatorIdentity } from './shared.js';
 export { GraphMailProvider, graphMailPlugin } from './mail.js';
 export type { GraphMailOptions } from './mail.js';
 export { GraphChatProvider, graphChatPlugin } from './chat.js';
