@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { openSqlDriver, type LibsqlModule, type SqlDriver } from '../sql.js';
+import { openSqlDriver, type LibsqlModule, type SqlDriver, type SqlDriverKind } from '../sql.js';
 import { VfsError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
@@ -110,64 +110,20 @@ describe('openSqlDriver: choosing a backend', () => {
     await driver.close();
   });
 
-  it('uses the Turso database directly when there is no local option but there is a URL', async () => {
-    const web = fakeLibsql();
-    const warnings: string[] = [];
-
-    const driver = await openSqlDriver({
-      path: ':memory:',
-      syncUrl: 'libsql://mail-org.turso.io',
-      loadLibsql: async () => {
-        throw Object.assign(new Error('Cannot find module'), { code: 'MODULE_NOT_FOUND' });
-      },
-      loadLibsqlWeb: async () => web.module,
-      onWarning: (message) => warnings.push(message),
-    });
-
-    assert.equal(driver.kind, 'libsql-remote');
-    // Reads now cross the network, which is a real change in behaviour and has to be said
-    // out loud rather than discovered as "why is this suddenly slow".
-    assert.match(warnings.join('\n'), /directly/);
-    await driver.close();
-  });
-
-  it('does not reach for the remote client when there is nowhere to connect', async () => {
-    let attempted = false;
-    const driver = await openSqlDriver({
-      path: ':memory:',
-      loadLibsql: async () => {
-        throw Object.assign(new Error('Cannot find module'), { code: 'MODULE_NOT_FOUND' });
-      },
-      loadLibsqlWeb: async () => {
-        attempted = true;
-        return fakeLibsql().module;
-      },
-    });
-
-    // Without a URL the HTTP client is not a snapshot, it is a round trip per keystroke.
-    assert.equal(attempted, false);
-    assert.equal(driver.kind, 'node-sqlite');
-    await driver.close();
-  });
-
-  it('warns when replication was asked for and cannot be delivered', async () => {
+  it('warns when it falls back, rather than quietly being slower at similarity', async () => {
     const warnings: string[] = [];
     const driver = await openSqlDriver({
       path: ':memory:',
-      syncUrl: 'libsql://mail-org.turso.io',
       loadLibsql: async () => {
         throw Object.assign(new Error('Cannot find module'), { code: 'MODULE_NOT_FOUND' });
-      },
-      loadLibsqlWeb: async () => {
-        throw new Error('offline');
       },
       onWarning: (message) => warnings.push(message),
     });
 
-    // Silently running un-replicated when the user asked for replication is the kind of
-    // thing only discovered during an incident.
+    // Losing in-database vector functions is a real change in behaviour, and finding out
+    // by noticing search got slower is not finding out.
     assert.equal(driver.kind, 'node-sqlite');
-    assert.match(warnings.join('\n'), /local-only/);
+    assert.match(warnings.join('\n'), /native libSQL binary/);
     await driver.close();
   });
 
@@ -190,18 +146,17 @@ describe('openSqlDriver: choosing a backend', () => {
         assert.ok(error instanceof VfsError);
         assert.equal(error.code, 'ECONFIG');
         // Screen-reader users cannot skim a stack trace for the fix, so it is in the hint.
-        assert.match(error.hint ?? '', /node-sqlite|libsql-remote/);
+        assert.match(error.hint ?? '', /node-sqlite/);
         return true;
       },
     );
   });
 
-  it('refuses the remote driver with nothing to connect to', async () => {
-    await assert.rejects(openSqlDriver({ path: ':memory:', driver: 'libsql-remote' }), (error: unknown) => {
-      assert.ok(error instanceof VfsError);
-      assert.match(error.hint ?? '', /cache\.syncUrl/);
-      return true;
-    });
+  it('offers no driver that could reach a database off this machine', () => {
+    // A compile-time guarantee written as a runtime one: if a networked tier is ever added
+    // back, this is the test that has to be deliberately deleted to do it.
+    const kinds: readonly SqlDriverKind[] = ['libsql', 'node-sqlite'];
+    assert.deepEqual([...kinds].sort(), ['libsql', 'node-sqlite']);
   });
 });
 
@@ -210,63 +165,28 @@ describe('openSqlDriver: choosing a backend', () => {
 // ---------------------------------------------------------------------------
 
 describe('openSqlDriver: libSQL configuration', () => {
-  it('opens a plain local file with no replication', async () => {
+  it('opens a plain local file', async () => {
     const fake = fakeLibsql();
     const driver = await openSqlDriver({ path: '/tmp/snap.db', loadLibsql: async () => fake.module });
 
     assert.equal(fake.config?.['url'], 'file:///tmp/snap.db');
-    assert.equal(fake.config?.['syncUrl'], undefined);
-    // No remote means no `sync` method at all, rather than one that quietly does nothing:
-    // the engine feature-detects it to decide whether to offer `cache sync`.
-    assert.equal(driver.sync, undefined);
     assert.equal(fake.syncs, 0);
     await driver.close();
   });
 
-  it('configures an embedded replica and pulls once before anybody reads', async () => {
+  it('passes libSQL nothing that could turn the file into a replica', async () => {
     const fake = fakeLibsql();
-    const driver = await openSqlDriver({
-      path: '/tmp/snap.db',
-      syncUrl: 'libsql://mail-org.turso.io',
-      authToken: 'secret',
-      loadLibsql: async () => fake.module,
-    });
+    const driver = await openSqlDriver({ path: '/tmp/snap.db', loadLibsql: async () => fake.module });
 
-    assert.equal(fake.config?.['syncUrl'], 'libsql://mail-org.turso.io');
-    assert.equal(fake.config?.['authToken'], 'secret');
-    // Otherwise the first session against an existing remote looks like a cold cache and
-    // re-fetches everything it already has.
-    assert.equal(fake.syncs, 1);
-    assert.equal(typeof driver.sync, 'function');
-    assert.match(driver.description, /embedded replica of libsql:\/\/mail-org\.turso\.io/);
-    await driver.close();
-  });
-
-  it('converts the sync interval from milliseconds to seconds', async () => {
-    const fake = fakeLibsql();
-    const driver = await openSqlDriver({
-      path: '/tmp/snap.db',
-      syncUrl: 'libsql://mail-org.turso.io',
-      syncIntervalMs: 30_000,
-      loadLibsql: async () => fake.module,
-    });
-
-    // libSQL counts seconds; the rest of this codebase counts milliseconds. Passing 30000
-    // straight through would mean an eight-hour sync interval.
-    assert.equal(fake.config?.['syncInterval'], 30);
-    await driver.close();
-  });
-
-  it('never rounds a small interval down to zero', async () => {
-    const fake = fakeLibsql();
-    const driver = await openSqlDriver({
-      path: '/tmp/snap.db',
-      syncUrl: 'libsql://x.turso.io',
-      syncIntervalMs: 200,
-      loadLibsql: async () => fake.module,
-    });
-
-    assert.equal(fake.config?.['syncInterval'], 1);
+    // The snapshot holds message bodies. `syncUrl` is the single key that would send them
+    // to a hosted database, so the assertion is about the whole config object and not just
+    // that one name: anything replication-shaped reaching the client is a defect.
+    const config = fake.config ?? {};
+    assert.deepEqual(Object.keys(config), ['url']);
+    for (const key of ['syncUrl', 'authToken', 'syncInterval']) {
+      assert.equal(config[key], undefined, `libSQL was given "${key}"`);
+    }
+    assert.equal(fake.syncs, 0, 'a local file has nothing to pull from');
     await driver.close();
   });
 

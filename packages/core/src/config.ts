@@ -88,14 +88,10 @@ export interface CacheConfig {
   readonly path?: string;
   /**
    * Which backend to open the snapshot with. `auto` takes the best this platform can
-   * load: the native libSQL client, else a direct Turso connection when `syncUrl` is set,
-   * else Node's built-in SQLite. See docs/ARCHITECTURE.md.
+   * load: the native libSQL client, else Node's built-in SQLite. Both store the same
+   * schema in the same local file. See docs/ARCHITECTURE.md.
    */
-  readonly driver?: 'auto' | 'libsql' | 'libsql-remote' | 'node-sqlite';
-  /** Remote Turso database to replicate from, e.g. `libsql://mail-org.turso.io`. */
-  readonly syncUrl?: string;
-  /** Auth token, normally an `${env:TURSO_AUTH_TOKEN}` reference rather than a literal. */
-  readonly authToken?: string;
+  readonly driver?: 'auto' | 'libsql' | 'node-sqlite';
   /** How many items to keep per folder. The "n most recent"; everything older is evicted. */
   readonly recent?: number;
   /** Freshness window for a snapshot listing, in milliseconds. */
@@ -443,7 +439,17 @@ function validateConfigBody(raw: unknown, sourcePath?: string): AppConfig {
   };
 }
 
-const CACHE_DRIVERS = new Set(['auto', 'libsql', 'libsql-remote', 'node-sqlite']);
+const CACHE_DRIVERS = new Set(['auto', 'libsql', 'node-sqlite']);
+
+/**
+ * Settings that used to point the snapshot at a hosted database.
+ *
+ * These are rejected rather than ignored. `validateCache` builds its result from a list of
+ * keys it knows, so an unrecognised one is dropped without a word — and "I configured
+ * replication and it silently did nothing" is exactly the sort of quiet failure that
+ * leaves somebody believing their mail is somewhere it is not.
+ */
+const REMOTE_KEYS = ['syncUrl', 'authToken', 'syncInterval', 'syncIntervalMs'] as const;
 
 function validateCache(entry: unknown): CacheConfig {
   const raw = asObject(entry, 'cache') as Record<string, unknown>;
@@ -456,13 +462,12 @@ function validateCache(entry: unknown): CacheConfig {
     );
   }
 
-  // A remote replica is the one setting that can silently do nothing: the local file works
-  // perfectly on its own, so a typo'd `syncUrl` would look like a working cache that
-  // mysteriously never matches the server.
-  if (raw['authToken'] !== undefined && raw['syncUrl'] === undefined) {
+  for (const key of REMOTE_KEYS) {
+    if (raw[key] === undefined) continue;
     throw VfsError.config(
-      'cache.authToken is set but cache.syncUrl is not.',
-      'An auth token only means something with a remote database. Add "syncUrl", or remove the token.',
+      `cache.${key} is not supported: the snapshot is local to this machine.`,
+      'It holds message bodies, so it is deliberately never replicated to a hosted database. ' +
+        `Remove "${key}".`,
     );
   }
 
@@ -484,7 +489,7 @@ function validateCache(entry: unknown): CacheConfig {
     }
     out[key] = value;
   }
-  for (const key of ['path', 'syncUrl', 'authToken'] as const) {
+  for (const key of ['path'] as const) {
     const value = raw[key];
     if (value === undefined) continue;
     if (typeof value !== 'string' || value.trim() === '') {

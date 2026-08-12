@@ -2,34 +2,39 @@
  * The SQL layer under the local snapshot store.
  *
  * The snapshot is a libSQL (Turso) database, and `@libsql/client` is a real dependency of
- * this package. That buys the things the snapshot actually wants: an embedded replica that
- * syncs against a remote Turso database, `vector32`/`vector_distance_cos` evaluated inside
- * the database, and `libsql_vector_idx` for approximate nearest-neighbour search.
+ * this package. That buys `vector32`/`vector_distance_cos` evaluated inside the database
+ * and `libsql_vector_idx` for approximate nearest-neighbour search.
  *
- * WHY THERE IS STILL A FALLBACK. `@libsql/client` reaches local files through the native
+ * THE SNAPSHOT IS LOCAL, AND ONLY LOCAL. libSQL will happily replicate to a hosted Turso
+ * database, and this layer deliberately does not. The snapshot holds corporate mail —
+ * subjects, participants and message bodies — so shipping it to a database outside the
+ * machine it was read on turns a cache into an exfiltration route, and one config line
+ * would be all it took. There is no `syncUrl`, so there is nothing to point at a server:
+ * the capability is absent rather than discouraged. `cache.syncUrl` and `cache.authToken`
+ * are rejected by the config validator instead of ignored, because a setting that looks
+ * accepted and silently does nothing is its own kind of lie.
+ *
+ * WHY THERE IS A FALLBACK. `@libsql/client` reaches local files through the native
  * `libsql` module, which ships prebuilt binaries for darwin-arm64, darwin-x64, win32-x64
  * and the common Linux triples — but not win32-arm64. On that platform importing the
  * package throws at load. This is a portability problem, not a policy: the fallback exists
  * so a Windows-on-ARM machine gets a working local cache instead of a stack trace, and it
  * says so out loud rather than quietly pretending to be the real thing.
  *
- * So there are three ways this opens, in preference order:
+ * So there are two ways this opens, in preference order:
  *
- *   1. `libsql`        — native client. Local file, optional embedded replica, native
- *                        vector functions. What almost everybody gets.
- *   2. `libsql-remote` — `@libsql/client/web`, pure JavaScript over HTTP. No native module,
- *                        so it works anywhere, but it needs a remote Turso database because
- *                        it cannot open a local file. Native vectors, evaluated remotely.
- *   3. `node-sqlite`   — Node's built-in SQLite. Local file only, no replication and no
- *                        vector functions, so similarity is scored in this process instead.
+ *   1. `libsql`      — native client. Local file, native vector functions. What almost
+ *                      everybody gets.
+ *   2. `node-sqlite` — Node's built-in SQLite. Local file, no vector functions, so
+ *                      similarity is scored in this process instead.
  *
- * All three read and write the same schema, because libSQL is SQLite's file format and
- * dialect — the same file opens in Turso's client, in the `turso` CLI, and in Node.
+ * Both read and write the same schema, because libSQL is SQLite's file format and dialect
+ * — the same file opens in Turso's client, in the `turso` CLI, and in Node.
  *
  * The interface is async even though `node:sqlite` is entirely synchronous. Shaping a seam
  * around the *less* demanding of the backends is how you end up unable to add the others;
- * libSQL's network calls genuinely are async, so the contract is async and the synchronous
- * driver resolves immediately.
+ * libSQL's calls genuinely are async, so the contract is async and the synchronous driver
+ * resolves immediately.
  */
 
 import { mkdir } from 'node:fs/promises';
@@ -47,11 +52,11 @@ export interface SqlStatement {
   readonly params?: readonly SqlValue[];
 }
 
-export type SqlDriverKind = 'libsql' | 'libsql-remote' | 'node-sqlite';
+export type SqlDriverKind = 'libsql' | 'node-sqlite';
 
 export interface SqlDriver {
   readonly kind: SqlDriverKind;
-  /** Human label for `cache status`, e.g. "libSQL embedded replica of libsql://…". */
+  /** Human label for `cache status`, e.g. "libSQL at /home/me/.local/share/…". */
   readonly description: string;
   /**
    * True when the backend provides libSQL's `vector32`/`vector_distance_cos` functions,
@@ -71,35 +76,20 @@ export interface SqlDriver {
   run(sql: string, params?: readonly SqlValue[]): Promise<{ changes: number }>;
   /** Run every statement in one transaction, rolling back the lot on failure. */
   batch(statements: readonly SqlStatement[]): Promise<void>;
-  /** Pull from / push to the remote replica. Absent unless replicating. */
-  sync?(): Promise<void>;
   close(): Promise<void>;
 }
 
 export interface SqlDriverOptions {
-  /** Local database file. `:memory:` is honoured by the local drivers. */
+  /** Local database file. `:memory:` is honoured by both drivers. */
   readonly path: string;
-  /**
-   * Remote libSQL/Turso database, e.g. `libsql://mail-org.turso.io`.
-   *
-   * With the native client this makes the local file an embedded replica: reads stay
-   * local and fast, writes go to the remote, and `sync()` reconciles the two. Without it
-   * — on a platform with no prebuilt binary — the remote is used directly over HTTP.
-   */
-  readonly syncUrl?: string;
-  readonly authToken?: string;
-  /** How often the embedded replica pulls from the remote, in milliseconds. */
-  readonly syncIntervalMs?: number;
   /** Pin a driver instead of taking the best one this platform can load. */
   readonly driver?: SqlDriverKind | 'auto';
   /** Injected by tests to stand in for the native client. */
   readonly loadLibsql?: () => Promise<LibsqlModule>;
-  /** Injected by tests to stand in for the HTTP-only client. */
-  readonly loadLibsqlWeb?: () => Promise<LibsqlModule>;
   readonly onWarning?: (message: string) => void;
 }
 
-/** The one export this module needs from either `@libsql/client` entry point. */
+/** The one export this module needs from `@libsql/client`. */
 export interface LibsqlModule {
   createClient(config: Config): Client;
 }
@@ -130,53 +120,20 @@ export async function openSqlDriver(options: SqlDriverOptions): Promise<SqlDrive
           `Could not open the snapshot with @libsql/client: ${describe(error)}`,
           nativeUnavailable(error)
             ? `The native libSQL binary is not published for ${process.platform}-${process.arch}. ` +
-                'Set `cache.driver` to "node-sqlite" for a local-only snapshot, or to ' +
-                '"libsql-remote" with `cache.syncUrl` to use a Turso database directly.'
-            : 'Check `cache.path`, `cache.syncUrl` and `cache.authToken`.',
+                'Set `cache.driver` to "node-sqlite", which stores the same schema in the same file.'
+            : 'Check `cache.path`.',
         );
       }
-    }
-  }
-
-  // Only worth trying when there is somewhere remote to talk to: this client has no local
-  // storage at all, so without a URL it is not a snapshot, it is a network round trip per
-  // keystroke — which is the exact thing the snapshot exists to remove.
-  const remoteUrl = options.syncUrl;
-  if (want === 'libsql-remote' && remoteUrl === undefined) {
-    throw VfsError.config(
-      'The libsql-remote driver has no local storage, so it needs a database to talk to.',
-      'Set `cache.syncUrl` to your Turso database URL, or use the "libsql" or "node-sqlite" driver.',
-    );
-  }
-  if ((want === 'auto' || want === 'libsql-remote') && remoteUrl !== undefined) {
-    try {
-      const driver = await openLibsqlRemote(options, remoteUrl);
-      if (want === 'auto') {
+      if (want === 'auto' && nativeUnavailable(error)) {
         warn(
-          `Using the Turso database at ${remoteUrl} directly: the native libSQL binary is ` +
-            `not published for ${process.platform}-${process.arch}, so there is no local ` +
-            'embedded replica and reads go over the network.',
-        );
-      }
-      return driver;
-    } catch (error) {
-      failures.push(`libsql-remote: ${describe(error)}`);
-      if (want === 'libsql-remote') {
-        throw VfsError.config(
-          `Could not reach the Turso database at ${remoteUrl}: ${describe(error)}`,
-          'Check `cache.syncUrl` and `cache.authToken`.',
+          `The native libSQL binary is not published for ${process.platform}-${process.arch}; ` +
+            "using Node's built-in SQLite, so similarity is scored in this process.",
         );
       }
     }
   }
 
   if (want === 'auto' || want === 'node-sqlite') {
-    if (options.syncUrl !== undefined && want === 'auto') {
-      warn(
-        `Replication to ${options.syncUrl} is unavailable on ${process.platform}-${process.arch}; ` +
-          'the snapshot is local-only.',
-      );
-    }
     try {
       return await openNodeSqlite(options);
     } catch (error) {
@@ -201,56 +158,21 @@ async function openLibsql(options: SqlDriverOptions): Promise<SqlDriver> {
 
   await ensureParentDirectory(options.path);
 
-  const syncUrl = options.syncUrl;
-  const config = {
-    url: toFileUrl(options.path),
-    ...(syncUrl === undefined ? {} : { syncUrl }),
-    ...(options.authToken === undefined ? {} : { authToken: options.authToken }),
-    ...(options.syncIntervalMs === undefined
-      ? {}
-      : // libSQL counts this in seconds; the rest of this codebase counts milliseconds,
-        // and silently reinterpreting 30_000 as eight hours would be a memorable bug.
-        { syncInterval: Math.max(1, Math.round(options.syncIntervalMs / 1000)) }),
-  } as Config;
-
-  const client = module.createClient(config);
-
-  // Pull once before anybody reads. Otherwise the first session against an existing
-  // remote database looks like a cold cache and re-fetches everything it already has.
-  if (syncUrl !== undefined) await client.sync();
+  // A file URL and nothing else. `createClient` treats `syncUrl` as the switch that turns
+  // a local file into an embedded replica, so the absence of that key here is the whole
+  // local-only guarantee: there is no branch that could add it.
+  const client = module.createClient({ url: toFileUrl(options.path) } as Config);
 
   return await fromLibsqlClient(client, {
     kind: 'libsql',
-    description:
-      syncUrl === undefined
-        ? `libSQL at ${options.path}`
-        : `libSQL embedded replica of ${syncUrl} at ${options.path}`,
-    canSync: syncUrl !== undefined,
-  });
-}
-
-async function openLibsqlRemote(options: SqlDriverOptions, url: string): Promise<SqlDriver> {
-  const module =
-    options.loadLibsqlWeb === undefined
-      ? ((await import('@libsql/client/web')) as unknown as LibsqlModule)
-      : await options.loadLibsqlWeb();
-
-  const client = module.createClient({
-    url,
-    ...(options.authToken === undefined ? {} : { authToken: options.authToken }),
-  } as Config);
-
-  return await fromLibsqlClient(client, {
-    kind: 'libsql-remote',
-    description: `Turso at ${url} (no local replica)`,
-    canSync: false,
+    description: `libSQL at ${options.path}`,
   });
 }
 
 /** Both libSQL entry points expose the same `Client`, so they share one adapter. */
 async function fromLibsqlClient(
   client: Client,
-  meta: { kind: SqlDriverKind; description: string; canSync: boolean },
+  meta: { kind: SqlDriverKind; description: string },
 ): Promise<SqlDriver> {
   const all = async (sql: string, params: readonly SqlValue[] = []): Promise<readonly SqlRow[]> => {
     const result = await client.execute({ sql, args: params.map(normalize) });
@@ -280,13 +202,6 @@ async function fromLibsqlClient(
         'write',
       );
     },
-    ...(meta.canSync
-      ? {
-          sync: async () => {
-            await client.sync();
-          },
-        }
-      : {}),
     async close() {
       client.close();
     },

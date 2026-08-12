@@ -153,21 +153,29 @@ slower program, never a broken one. Nothing in the read path treats its absence 
 
 ### The storage seam
 
-`sql.ts` defines a small async interface — `all`, `get`, `run`, `batch`, `exec` — and three
+`sql.ts` defines a small async interface — `all`, `get`, `run`, `batch`, `exec` — and two
 implementations chosen at open time:
 
-| Driver | Storage | Replication | Vector similarity |
-|---|---|---|---|
-| `libsql` | local file | embedded replica of a remote | in the database |
-| `libsql-remote` | none, HTTP only | is the remote | in the database |
-| `node-sqlite` | local file | none | in this process |
+| Driver | Storage | Vector similarity |
+|---|---|---|
+| `libsql` | local file | in the database |
+| `node-sqlite` | local file | in this process |
 
 The seam exists because of a fact about the world, not a preference: the native libSQL
 binary has no prebuilt for every platform this program runs on — win32-arm64 among them —
-and the pure-JS client cannot open a local file. Neither alone covers the matrix. `auto`
-takes the best available and says which one it took in `cache`; pinning one that cannot
-load is a startup error with a hint, because silently handing someone a local-only file
-when they asked for a replica of a shared database is the wrong kind of help.
+and on those platforms importing it throws at load. `auto` takes the best available and
+says which one it took in `cache`; pinning one that cannot load is a startup error with a
+hint, because a stack trace at startup is a worse answer than a working local cache.
+
+**The snapshot never leaves the machine.** libSQL will replicate a local file to a hosted
+Turso database by setting one key, `syncUrl`, and this layer deliberately does not offer
+it. The snapshot holds subjects, participants and message bodies, so a replica is an
+export of corporate mail to somebody else's server, and one config line is too short a
+distance between "cache" and "exfiltration". The capability is *absent* rather than
+discouraged: `createClient` is handed a file URL and nothing else, and `cache.syncUrl` and
+`cache.authToken` are rejected by the config validator rather than ignored — a setting
+that looks accepted and silently does nothing would leave somebody believing their mail is
+somewhere it is not.
 
 Vector support is *probed*, not inferred from the driver name — it depends on the build
 that actually loaded. Guessing would turn "your SQLite is older than you thought" into an

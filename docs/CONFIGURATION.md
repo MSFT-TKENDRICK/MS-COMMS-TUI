@@ -443,9 +443,7 @@ there. Everything below has a working default.
 |---|---|---|---|
 | `enabled` | boolean | `false` | Keep a local snapshot at all. |
 | `path` | string | `snapshot.db` in the cache dir | Where the database file lives. |
-| `driver` | string | `auto` | Backend: `auto`, `libsql`, `libsql-remote`, `node-sqlite`. |
-| `syncUrl` | string | — | Remote Turso database, e.g. `libsql://mail-org.turso.io`. |
-| `authToken` | string | — | Token for it. Use `${env:TURSO_AUTH_TOKEN}`, not a literal. |
+| `driver` | string | `auto` | Backend: `auto`, `libsql`, `node-sqlite`. |
 | `recent` | number | 200 | Items kept per folder, and refreshed per sync cycle. The rest are evicted. |
 | `ttlMs` | number | 300000 | How long a snapshot listing is considered fresh. |
 | `intervalMs` | number | 300000 | Background sync period. Floors at 30s. |
@@ -482,18 +480,34 @@ from six months ago sits just outside the window, and a wrong answer that looks 
 right one is worse than a slow one. Search behaves the same way — it never concludes
 absence from the snapshot alone, and `find` says how many results came from it.
 
+### The snapshot is local
+
+There is no setting that points the snapshot at a hosted database, and that is deliberate.
+
+libSQL supports it — one key, `syncUrl`, turns a local file into a replica of a Turso
+database — but the snapshot holds subjects, participants and message bodies. Replicating
+it is an export of corporate mail to a server outside the machine it was read on, and one
+config line is too short a distance between "cache" and "exfiltration". So the capability
+is absent rather than discouraged: the client is handed a file path and nothing else.
+
+`cache.syncUrl` and `cache.authToken` are *rejected* rather than ignored. A key that is
+quietly dropped looks like a key that worked, and someone would be left believing their
+mail is somewhere it is not.
+
+Everything the snapshot does — search, vectors, prefetch, the audit log — works entirely
+on the local file. Nothing is lost by this.
+
 ### `driver`
 
 `auto` is right unless you have a reason.
 
-- **`libsql`** — the native Turso client. Local file, optional embedded replica of a remote
-  database, and vector similarity computed inside the database. The best option where a
-  prebuilt binary exists.
-- **`libsql-remote`** — the pure-JavaScript client, talking to `syncUrl` over HTTP. Used
-  where the native binary has no build for the platform. Requires `syncUrl`; there is no
-  local file, so this is a network cache rather than an offline one.
-- **`node-sqlite`** — Node's built-in SQLite (22.5+). Local only, no replication, and
-  similarity is computed in-process. Slower on large vector sets, otherwise identical.
+- **`libsql`** — the native Turso client. Local file, with vector similarity computed
+  inside the database. The best option where a prebuilt binary exists.
+- **`node-sqlite`** — Node's built-in SQLite (22.5+). Local file, and similarity is
+  computed in-process. Slower on large vector sets, otherwise identical.
+
+Both store the same schema in the same file, so a snapshot written by one opens in the
+other, and in the `turso` CLI.
 
 Node did not bundle the FTS5 extension in `node:sqlite` until v23, so on Node 22 this
 driver has no full-text index. That is a missing feature, not a failure: the snapshot
@@ -501,8 +515,9 @@ opens, caches and pre-fetches as usual, semantic search is unaffected, and text 
 falls back to a scan. `cache` says so when it happens.
 
 Pinning a driver that cannot load is an error at startup with a hint saying why, rather
-than a silent fallback: if you asked for a replica of a shared database, quietly giving you
-a local-only file would be the wrong kind of help.
+than a silent fallback. On a platform with no prebuilt binary, `auto` says which driver it
+took, because losing in-database vector functions is a real change and noticing that
+search got slower is not a good way to find out.
 
 ### When it cannot start
 

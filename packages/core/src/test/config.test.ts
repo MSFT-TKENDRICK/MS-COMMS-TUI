@@ -228,8 +228,6 @@ describe('validateConfig: cache', () => {
         enabled: true,
         path: '/tmp/snapshot.db',
         driver: 'libsql',
-        syncUrl: 'libsql://mail-org.turso.io',
-        authToken: '${env:TURSO_AUTH_TOKEN}',
         recent: 500,
         ttlMs: 60_000,
         intervalMs: 120_000,
@@ -238,16 +236,18 @@ describe('validateConfig: cache', () => {
         vectors: true,
         prefetch: true,
         prefetchConcurrency: 3,
+        audit: true,
       }),
     );
     assert.equal(config.cache.driver, 'libsql');
     assert.equal(config.cache.recent, 500);
     assert.equal(config.cache.vectors, true);
-    assert.equal(config.cache.authToken, '${env:TURSO_AUTH_TOKEN}');
+    assert.equal(config.cache.audit, true);
+    assert.equal(config.cache.path, '/tmp/snapshot.db');
   });
 
   it('accepts every driver it advertises', () => {
-    for (const driver of ['auto', 'libsql', 'libsql-remote', 'node-sqlite']) {
+    for (const driver of ['auto', 'libsql', 'node-sqlite']) {
       assert.equal(validateConfig(withCache({ driver })).cache.driver, driver);
     }
   });
@@ -258,24 +258,39 @@ describe('validateConfig: cache', () => {
       (error: unknown) =>
         error instanceof VfsError &&
         error.code === 'ECONFIG' &&
-        error.message.includes('libsql-remote') &&
+        error.message.includes('libsql') &&
         error.message.includes('node-sqlite'),
     );
   });
 
-  it('rejects an auth token with nothing to authenticate to', () => {
-    // Left alone this is the worst kind of misconfiguration: everything appears to work,
-    // because the local file is perfectly functional, and nothing ever reaches the server.
+  it('no longer offers a driver that reaches a database off this machine', () => {
     assert.throws(
-      () => validateConfig(withCache({ authToken: 'secret' })),
-      (error: unknown) => error instanceof VfsError && /syncUrl/i.test(error.message),
+      () => validateConfig(withCache({ driver: 'libsql-remote' })),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
     );
   });
 
-  it('accepts a syncUrl without a token, for a database that does not need one', () => {
-    const config = validateConfig(withCache({ syncUrl: 'libsql://local.turso.io' }));
-    assert.equal(config.cache.syncUrl, 'libsql://local.turso.io');
-    assert.equal(config.cache.authToken, undefined);
+  describe('the snapshot is local, and says so', () => {
+    // These keys are rejected rather than ignored. `validateCache` builds its result from
+    // the keys it knows about, so an unrecognised one would be dropped in silence — and
+    // "I configured replication and nothing happened" leaves somebody believing their
+    // mail is somewhere it is not.
+    for (const key of ['syncUrl', 'authToken', 'syncInterval', 'syncIntervalMs']) {
+      it(`rejects cache.${key} instead of quietly dropping it`, () => {
+        assert.throws(
+          () => validateConfig(withCache({ [key]: 'libsql://mail-org.turso.io' })),
+          (error: unknown) =>
+            error instanceof VfsError && error.code === 'ECONFIG' && error.message.includes(`cache.${key}`),
+        );
+      });
+    }
+
+    it('says why, not just no', () => {
+      assert.throws(
+        () => validateConfig(withCache({ syncUrl: 'libsql://mail-org.turso.io' })),
+        (error: unknown) => error instanceof VfsError && /local to this machine/i.test(error.message),
+      );
+    });
   });
 
   it('rejects negative numbers', () => {
@@ -315,14 +330,10 @@ describe('validateConfig: cache', () => {
   });
 
   it('rejects a blank path rather than quietly writing somewhere unexpected', () => {
-    for (const key of ['path', 'syncUrl', 'authToken']) {
-      const entry = key === 'authToken' ? { authToken: '  ', syncUrl: 'libsql://x' } : { [key]: '  ' };
-      assert.throws(
-        () => validateConfig(withCache(entry)),
-        (error: unknown) => error instanceof VfsError && error.message.includes(`cache.${key}`),
-        `expected cache.${key} to reject whitespace`,
-      );
-    }
+    assert.throws(
+      () => validateConfig(withCache({ path: '  ' })),
+      (error: unknown) => error instanceof VfsError && error.message.includes('cache.path'),
+    );
   });
 
   it('rejects a cache block that is not an object', () => {

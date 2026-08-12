@@ -145,7 +145,10 @@ nothing while an unread message sits just outside the window. Search never concl
 absence from the cache alone, and `find` tells you how many results came from it.
 
 The whole thing is an accelerator: if it cannot open, the shell starts anyway and `cache`
-says why. Details in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#cache).
+says why. The database stays on your machine — libSQL can replicate to a hosted Turso
+database and this deliberately does not, because a snapshot of your mail on somebody
+else's server is a different thing from a cache. Details in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#cache).
 
 Because the snapshot is SQLite, [Turso AgentFS](https://github.com/tursodatabase/agentfs)
 can be pointed at it. `cache export ~/mail.db` writes your mail out as a real AgentFS

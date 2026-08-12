@@ -28,7 +28,6 @@ import {
   openSqlDriver,
   parseQuery,
   resolveAppPaths,
-  resolveSecret,
   stateFileFor,
   vpath,
   agentFsDatabase,
@@ -241,12 +240,9 @@ export class Session {
 
     try {
       const embedder = cache.vectors === false ? undefined : hashEmbedder();
-      const authToken = cache.authToken === undefined ? undefined : await resolveSecret(cache.authToken);
       const driver = await openSqlDriver({
         path: cache.path ?? join(this.paths.cacheDir, 'snapshot.db'),
         ...(cache.driver === undefined ? {} : { driver: cache.driver }),
-        ...(cache.syncUrl === undefined ? {} : { syncUrl: cache.syncUrl }),
-        ...(authToken === undefined ? {} : { authToken }),
         onWarning: (message) => {
           this.logger.warn(message);
         },

@@ -195,6 +195,9 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
   // mailbox, so it is honest about what it can answer: a plain \`ls\` comes from
   // the snapshot, a filtered one goes to the source, and search never concludes
   // "no results" from local data alone.
+  //
+  // The database never leaves this machine. It holds message bodies, so there is
+  // deliberately no setting that points it at a hosted database.
   // ---------------------------------------------------------------------------
   // "cache": {
   //   "enabled": true,
@@ -211,11 +214,6 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
   //   // what was called, which path, how long, and whether it failed. Paths and
   //   // sizes only, never message content. Shown in \`cache\`.
   //   // "audit": true,
-  //
-  //   // Replicate from a shared Turso database. The local file still works on
-  //   // its own; this only adds a remote to sync with.
-  //   // "syncUrl": "libsql://mail-org.turso.io",
-  //   // "authToken": "\${env:TURSO_AUTH_TOKEN}",
   // },
 
   // ---------------------------------------------------------------------------

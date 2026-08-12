@@ -168,22 +168,24 @@ describe('starter config', () => {
       assert.equal(revived.cache?.bodies, 25);
     });
 
-    it('leaves the remote and the audit log commented, since both are opt-in', () => {
-      assert.equal(revived.cache?.syncUrl, undefined);
-      assert.equal(revived.cache?.authToken, undefined);
+    it('leaves the audit log commented, since it is opt-in', () => {
       assert.equal(revived.cache?.audit, undefined);
     });
 
-    it('names only keys the validator accepts, including the nested ones', () => {
-      // The nested examples stay commented above, so validate them on their own too:
-      // an unknown key here is rejected, which is what catches a renamed option.
-      const inner = uncommentSection(
-        STARTER_CONFIG.replace(/\/\/\s*"(audit|syncUrl|authToken)":/g, '"$1":'),
-        'cache',
-      );
-      const config = validateConfig(parseJsonc(inner));
-      assert.equal(config.cache?.audit, true);
-      assert.equal(config.cache?.syncUrl, 'libsql://mail-org.turso.io');
+    it('names only keys the validator accepts, including the nested one', () => {
+      // The audit example stays commented above, so validate it on its own too: this is
+      // what catches a renamed option before it reaches somebody's config.
+      const inner = uncommentSection(STARTER_CONFIG.replace(/\/\/\s*"(audit)":/g, '"$1":'), 'cache');
+      assert.equal(validateConfig(parseJsonc(inner)).cache?.audit, true);
+    });
+
+    it('suggests nothing that would send the snapshot off this machine', () => {
+      // The starter config is where people copy settings from, so a `syncUrl` example
+      // here would be a standing invitation to replicate a mailbox to a hosted database.
+      // The validator rejects those keys; this stops us from suggesting them anyway.
+      for (const key of ['syncUrl', 'authToken', 'turso.io']) {
+        assert.ok(!STARTER_CONFIG.includes(key), `the starter config mentions "${key}"`);
+      }
     });
   });
 });
