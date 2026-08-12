@@ -120,6 +120,12 @@ export function conformanceTests(options: ConformanceOptions): readonly Conforma
       assert.equal(typeof provider.actions, 'function', 'capability "actions" declared without actions()');
       assert.equal(typeof provider.invoke, 'function', 'capability "actions" declared without invoke()');
     }
+    if (provider.capabilities.has('graph')) {
+      assert.ok(provider.graph !== undefined, 'capability "graph" is declared but graph is missing');
+      assert.equal(typeof provider.graph?.schema, 'function', 'graph must expose schema()');
+      assert.equal(typeof provider.graph?.roots, 'function', 'graph must expose roots()');
+      assert.equal(typeof provider.graph?.neighbors, 'function', 'graph must expose neighbors()');
+    }
   });
 
   test('declares every capability it implements', async (provider) => {
@@ -137,6 +143,12 @@ export function conformanceTests(options: ConformanceOptions): readonly Conforma
       assert.ok(
         provider.capabilities.has(capability as never),
         `${String(method)}() is implemented but capability "${capability}" is not declared`,
+      );
+    }
+    if (provider.graph !== undefined) {
+      assert.ok(
+        provider.capabilities.has('graph'),
+        'graph is implemented but capability "graph" is not declared',
       );
     }
   });

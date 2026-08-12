@@ -16,6 +16,7 @@ import {
   PluginRegistry,
   isVfsError,
   loadConfig,
+  projectionPlugin,
   resolveAppPaths,
   type AppConfig,
   type Logger,
@@ -31,6 +32,7 @@ import { Shell } from './shell.js';
 import { Tui } from './tui/app.js';
 import { CommandTable, parseLine, surplusMessage, tokenize } from './commands/types.js';
 import { navigationCommands } from './commands/navigate.js';
+import { graphCommands } from './commands/graph.js';
 import { readCommands } from './commands/read.js';
 import { searchCommands } from './commands/search.js';
 import { watchCommands } from './commands/watch.js';
@@ -49,6 +51,7 @@ export function buildCommandTable(): CommandTable {
   table.registerAll(navigationCommands);
   table.registerAll(readCommands);
   table.registerAll(searchCommands);
+  table.registerAll(graphCommands);
   table.registerAll(watchCommands);
   table.registerAll(systemCommands(table));
   return table;
@@ -64,6 +67,9 @@ export function builtinRegistry(logger: Logger = NULL_LOGGER): PluginRegistry {
   registry.register(graphPeoplePlugin);
   registry.register(adoBoardsPlugin);
   registry.register(execPlugin);
+  // Not an integration: a projection reorganizes the mounts you already have. Registered
+  // alongside them because from the user's side it is just another mount type.
+  registry.register(projectionPlugin);
   return registry;
 }
 

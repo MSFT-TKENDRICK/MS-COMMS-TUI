@@ -15,6 +15,7 @@
 
 import { TtlCache, type CacheStats } from './cache.js';
 import { VfsError, toVfsError } from './errors.js';
+import { GraphSpace, treeGraphSource, type GraphSourceEntry } from './graph.js';
 import { NameAllocator, sanitizeSegment } from './naming.js';
 import {
   evaluateQuery,
@@ -259,6 +260,49 @@ export class Vfs {
     this.#mounts.clear();
     this.#dirCache.clear();
     this.#docCache.clear();
+  }
+
+  // -------------------------------------------------------------------------
+  // Graph view
+  // -------------------------------------------------------------------------
+
+  /**
+   * Every mount, as one graph.
+   *
+   * Built fresh on each call rather than cached, so a mount added mid-session is
+   * projectable without a restart, and a mount that has gone away stops appearing.
+   *
+   * A provider that declares `graph` supplies its own typed nodes and edges. Everything
+   * else is wrapped in {@link treeGraphSource}, which exposes exactly the graph its tree
+   * already implies. That fallback is what makes "write a projection over all your
+   * sources" true of sources whose authors never heard of projections — including
+   * `exec` plugins written in Python.
+   */
+  graphSpace(): GraphSpace {
+    const entries: GraphSourceEntry[] = [];
+    for (const mount of this.mounts) {
+      const declared =
+        mount.provider.capabilities.has('graph') && mount.provider.graph !== undefined
+          ? mount.provider.graph
+          : undefined;
+      entries.push({
+        alias: mount.id,
+        mountId: mount.id,
+        mountPath: mount.path,
+        source:
+          declared ??
+          treeGraphSource(
+            this,
+            {
+              id: mount.id,
+              path: mount.path,
+              ...(mount.description === undefined ? {} : { description: mount.description }),
+            },
+            { supportsSearch: mount.provider.capabilities.has('search') },
+          ),
+      });
+    }
+    return new GraphSpace(entries);
   }
 
   // -------------------------------------------------------------------------
@@ -608,10 +652,20 @@ export class Vfs {
    * A source may be named by its id (`mail`), its mount path (`/mail`) or the last
    * segment of that path, because those are the three things the user actually sees and
    * none of them is obviously the "real" one.
+   *
+   * Derived mounts — projections — are dropped from an un-narrowed fan-out. They hold no
+   * items of their own, so including one means returning every hit twice and spending part
+   * of a bounded, ranked budget on the copy. Naming one explicitly opts it back in, since
+   * `--source by-person` is unambiguous about what was meant. If *everything* beneath the
+   * root is derived there is nothing else to ask, so they are kept: a view of a source is a
+   * far better answer than no answer.
    */
   #mountsBeneath(root: string, sources?: readonly string[]): readonly Mount[] {
     const beneath = this.mounts.filter((mount) => vpath.contains(root, mount.path));
-    if (sources === undefined || sources.length === 0) return beneath;
+    if (sources === undefined || sources.length === 0) {
+      const independent = beneath.filter((mount) => mount.provider.derived !== true);
+      return independent.length > 0 ? independent : beneath;
+    }
 
     const wanted = new Set(
       sources.map((name) => name.trim().toLocaleLowerCase()).filter((name) => name !== ''),

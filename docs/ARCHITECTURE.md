@@ -25,7 +25,7 @@ and `cat` once instead of learning five clients.
 
 | Package | Contains |
 |---|---|
-| `@mscomms/core` | Paths, naming, the provider contract, the VFS engine, query language, cache, config, notifications, watches |
+| `@mscomms/core` | Paths, naming, the provider contract, the VFS engine, query language, the graph model and mapping surface, GraphQL projections, cache, config, notifications, watches |
 | `@mscomms/cli` | The shell, commands, completion, formatting |
 | `@mscomms/provider-*` | memory, rss, github, graph, ado, exec |
 
@@ -47,6 +47,19 @@ and covered in [PLUGINS.md](PLUGINS.md#names-are-yours-to-choose-and-it-matters)
 
 **`query.ts`** — parse, evaluate, rank and re-serialise `from:dana is:unread after:7d`,
 including the Lucene modifiers (wildcards, fuzzy, proximity, ranges, boosts).
+
+**`graph.ts`** — the graph model: typed nodes, named edges, and the tree-shaped default
+every provider gets whether or not it declared one. See below.
+
+**`mapping.ts`** — the declarative surface an integration author uses instead of
+implementing `Provider` by hand. Covered in [PLUGINS.md](PLUGINS.md#the-mapping-surface).
+
+**`graphql.ts`** — a lexer and parser for the subset of GraphQL a projection needs. No
+dependency, for the reason above; the subset is deliberate and documented in
+[PROJECTIONS.md](PROJECTIONS.md).
+
+**`projection.ts`** — evaluating a query against the graph space, and the `projection`
+mount type that turns the result back into a tree.
 
 **`cache.ts`** — TTL cache for listings and documents, with explicit invalidation.
 
@@ -80,11 +93,14 @@ The cost is a resolution step before every call, which the cache absorbs.
 A provider declares a `Set<Capability>`. The engine checks membership before offering a
 feature, so a provider without `search` gets local filtering instead of an error.
 
-The subtlety that has caused real bugs here more than once: the engine also checks
-`'search' in provider`, and **an own property whose value is `undefined` still answers
-true**. So optional methods must be `delete`d, not assigned `undefined`. The conformance
-suite asserts the set and the object shape agree, in both directions, because they drifted
-apart twice during development.
+The subtlety that has caused real bugs here more than once: the engine calls the method when
+the capability is declared, so an optional method that is present but cannot be honoured is
+a crash, and one that is absent while the capability is declared is the same crash from the
+other side. Optional methods therefore have to genuinely not be installed — which a
+prototype method cannot manage, since `delete` will not remove it from an instance. The
+pattern is an optional field assigned in the constructor, and the conformance suite asserts
+the set and the object shape agree in both directions, because they drifted apart twice
+during development and once more while the mapping surface was being written.
 
 The `exec` tier adds one more rule: when a mount's config lists `capabilities`, that is a
 ceiling and is intersected with what the plugin declares. Not a sandbox — the plugin is an
@@ -110,6 +126,44 @@ A boost or a slop value that vanished on the way out would make two different qu
 render identically, and the engine would then trust a filter that was never applied.
 Every new AST field is therefore covered by a round-trip test.
 
+## The graph model
+
+A tree is a projection of a graph, not the other way around. A message has an author, a
+thread, a folder and a set of attachments. A tree can show exactly one of those as
+"contains" and has to drop the rest — which is fine right up until a user decides that the
+one the provider picked is the wrong one.
+
+So the model underneath the VFS is a graph. Every mount exposes a `GraphSource`: typed
+nodes with scalar fields, named edges between them, and roots to start a walk from. The
+tree you see is one traversal of that graph, along whichever edge the provider nominated as
+`childEdge`. `/by-person` is a different traversal of the same data, and it is the same
+kind of object — a mount, with listing, paging, caching, search and `cat`.
+
+Three consequences are worth stating.
+
+**Every source is projectable, including the ones that predate this.** A provider that
+declares a `GraphSource` is used verbatim. A provider that has never heard of graphs gets
+the graph its tree already implies — `children`, `descendants` and `parent`. Nothing opts
+in, because a cross-source query that silently omitted a source would be indistinguishable
+from a source with nothing in it, and that is a mail client losing mail.
+
+**The graph space is assembled per operation, not per session.** `Vfs.graphSpace()` walks
+the current mount table each time it is called, and `ProviderContext.graph` is a function
+rather than a value so that a projection built before the mounts it reads still sees them.
+Config order stops being load-bearing, and a mount added mid-session with `mount` shows up
+in an existing projection without a restart.
+
+**Limits are promises, not hints.** `MappingRequest.limit` is pushed down so a backend can
+use it, but the engine caps the result regardless. A mapping that ignores the limit — most
+will — must not be able to turn a bounded query into an unbounded fetch, and a projection
+that can span every mount you own is exactly where that matters.
+
+The query language over this is GraphQL, chosen because it is the standard notation for
+"select this shape from a graph" and because users who have met it once do not need to
+learn a second one. It is hand-parsed, like every other format here, and the subset is
+described in [PROJECTIONS.md](PROJECTIONS.md). A projection cannot contain a mutation: it
+is a view, and acting on something is `do`, which works normally on anything inside one.
+
 ## Searching every source at once
 
 `Vfs.search` on a synthetic directory — the root, or any ancestor of several mounts —
@@ -121,7 +175,21 @@ to notice: one shared node budget means whichever mount sorts first consumes it,
 rest return nothing. "No results in Teams" and "never got as far as Teams" then look
 identical.
 
-Four properties hold it together:
+### Views are not sources
+
+Fanning out assumes every mount beneath the root is an independent source. A projection
+breaks that assumption twice over: it holds nothing of its own, so it returns items the
+real sources already returned, and it spends a share of a bounded, ranked budget doing it.
+Searching `/` across two sources and one projection over them gave back a majority of
+duplicates, and the sources being duplicated were the ones squeezed out to make room.
+
+So `Provider.derived` marks a mount whose contents come from other mounts, and an
+un-narrowed fan-out skips it. It is still searched from inside (`find /by-person`) and
+still searched when named (`find / --source by-person`), because at that point the user
+has said which tree they mean. If everything beneath the root is derived they are kept
+rather than dropped: a view of a source is a better answer than no answer.
+
+Four properties hold the fan-out itself together:
 
 **Isolation.** One provider throwing must not abort the others. The whole reason to ask
 four backends is that three can still answer.
@@ -251,13 +319,16 @@ are mechanical rather than aesthetic and are set out in [ACCESSIBILITY.md](ACCES
 
 ## Testing
 
-468 tests, no test framework — `node --test` and `node:assert`.
+1148 tests, no test framework — `node --test` and `node:assert`.
 
 The load-bearing one is `packages/core/src/testing/conformance.ts`: the provider contract
 expressed as an executable suite that every provider runs, including the example `exec`
 plugin driven over a real child process in both transport modes. It has caught, among other
 things, a provider exposing `search()` while declaring it unsupported, another exposing every
-optional method regardless of capabilities, and an example plugin quietly ignoring `limit`.
+optional method regardless of capabilities, an example plugin quietly ignoring `limit`, and
+— because a mapping and a projection are both providers — three bugs in the graph work:
+optional methods left on the prototype, search results missing `parentPath` at a mount root,
+and a graph traversal that pushed `limit` down without enforcing it.
 
 `packages/cli/src/test/readline-contract.test.ts` pins an undocumented Node behaviour the
 completion design depends on — that readline *replaces* the matched text rather than

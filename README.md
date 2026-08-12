@@ -184,6 +184,45 @@ backend, in any language:
 `examples/notes-plugin.mjs` is a complete, dependency-free reference implementation with
 the whole protocol documented in its header. See [docs/PLUGINS.md](docs/PLUGINS.md).
 
+In TypeScript there is a shorter route. Describe the kinds of thing your API has and how
+they connect, and `defineMapping` builds the paging, naming, search and graph for you:
+
+```ts
+export const trackerPlugin = defineMapping({
+  type: 'tracker',
+  displayName: 'Tracker',
+  setup: (options) => ({
+    types: [{ name: 'Issue', key: (i) => i.id, title: (i) => i.title }],
+    roots: [{ name: 'issues', type: 'Issue', universal: true, resolve: () => fetchIssues() }],
+  }),
+});
+```
+
+See [the mapping surface](docs/PLUGINS.md#the-mapping-surface).
+
+## Rearrange the tree to match how you think
+
+The folders a source ships with are one opinion about navigation. Outlook gives you folders
+because Outlook has folders; it does not know you think in people, or in weeks, or in
+"things I have not replied to".
+
+Because every mounted source is exposed as a graph rather than only a tree, you can say so —
+in GraphQL, across all of them at once, mounted back as an ordinary directory tree:
+
+```jsonc
+{ "path": "/by-person", "type": "projection",
+  "options": { "query": "{ all(filter: \"is:unread\") @flatten @group(by: \"author\") { name mtime } }" } }
+```
+
+```sh
+mscomms schema                                      # what can I select?
+mscomms graphql '{ all(filter: "is:unread") { name source } }'
+```
+
+That mount lists, pages, caches, searches and completes like any other, and `cat` on a
+message inside it opens the real message. Sources that never heard of graphs get the one
+their tree implies, so nothing has to opt in. See [docs/PROJECTIONS.md](docs/PROJECTIONS.md).
+
 ## Keyboard and accessibility
 
 - **Everything is a typed command.** There is no mouse, and no keystroke you must discover.
@@ -231,6 +270,7 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the VFS, providers and cache fit together, and why |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config key, every built-in provider's options |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | Writing a backend, in TypeScript or any other language |
+| [docs/PROJECTIONS.md](docs/PROJECTIONS.md) | Reorganizing your tree with a GraphQL query over every source |
 | [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md) | The reasoning behind the interface decisions |
 | [docs/PRIOR-ART.md](docs/PRIOR-ART.md) | What twenty-odd earlier projects got right and wrong |
 
@@ -238,8 +278,9 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 
 Working and tested: the VFS engine, the query language (including Lucene syntax and
 relevance ranking), cross-source search, cache, notifications, the line shell, tab
-completion, the opt-in full-screen pane (`--tui`), and the memory, RSS, GitHub, Graph,
-Azure DevOps and exec providers. 953 tests.
+completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
+GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
+1148 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been

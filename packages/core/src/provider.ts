@@ -24,6 +24,7 @@
  *    owns scheduling, backoff and coalescing so providers stay trivial.
  */
 
+import type { GraphSource, GraphSpace } from './graph.js';
 import type { Query } from './query.js';
 
 // ---------------------------------------------------------------------------
@@ -274,6 +275,15 @@ export const CAPABILITIES = [
   'poll',
   'actions',
   'attachments',
+  /**
+   * Declares a first-class graph, via the `graph` property.
+   *
+   * Optional in a way the others are not: a provider without it is still projectable,
+   * because the engine derives the graph its tree already implies. Declaring it means
+   * "I have typed nodes and named edges of my own", which is what lets a projection
+   * reorganize around a thread, an assignee or a label rather than only around folders.
+   */
+  'graph',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -313,11 +323,25 @@ export interface ProviderContext {
   /** Directory the provider may use for larger caches. Created on demand. */
   readonly cacheDir: string;
   /**
+   * Directory the config was loaded from, when there was one. Options that name a
+   * companion file resolve against it so a config directory stays self-contained.
+   */
+  readonly configDir?: string;
+  /**
    * Secret lookup. Resolves `${env:NAME}` style references from config and never returns
    * secrets that were written literally into a config file, so credentials stay out of
    * version control.
    */
   secret(ref: string): Promise<string | undefined>;
+  /**
+   * Every graph-mapped source the host has, resolved on demand.
+   *
+   * A function rather than a value because mounts are built in config order, and a
+   * provider that composes the others — a projection — must not capture a half-built
+   * mount table. Absent when the host does not compose providers at all, which is why
+   * anything using it says so plainly rather than failing later.
+   */
+  graph?(): GraphSpace | Promise<GraphSpace>;
 }
 
 /**
@@ -347,6 +371,23 @@ export interface Provider {
   readonly id: string;
   readonly displayName: string;
   readonly capabilities: ReadonlySet<Capability>;
+
+  /**
+   * True when this mount's contents come from other mounts rather than from a backend of
+   * its own — a projection being the built-in case.
+   *
+   * It exists for cross-source search. Fanning out across "every mount beneath here"
+   * silently assumes every mount is an independent source, and a view breaks that in two
+   * ways at once: it returns the same items a real source already returned, and it spends
+   * a share of a merged, ranked result budget doing so. Searching `/` with one projection
+   * over two sources gives back mostly duplicates, and the sources being duplicated are
+   * the ones pushed out to make room.
+   *
+   * So a derived mount is left out of a fan-out that was not asked for by name. It is
+   * still searched normally from inside (`find /by-person`), and still searched when named
+   * explicitly (`find / --source by-person`), because at that point the user means it.
+   */
+  readonly derived?: boolean;
 
   init?(): Promise<void>;
   dispose?(): Promise<void>;
@@ -381,6 +422,17 @@ export interface Provider {
     node: VNode,
     attachmentId: string,
   ): Promise<{ name: string; contentType: string; data: Uint8Array }>;
+
+  /**
+   * A first-class graph over the same data. Only present when `graph` is declared.
+   *
+   * A provider that omits it loses nothing except expressiveness: the engine wraps the
+   * tree in a graph source that exposes `children`, `descendants` and `parent`, so every
+   * mount is projectable whether or not its author thought about projections. Declaring
+   * one means naming your own types and edges, which is what lets a user's projection say
+   * "group these by assignee" about a thing the engine has never heard of.
+   */
+  readonly graph?: GraphSource;
 }
 
 // ---------------------------------------------------------------------------

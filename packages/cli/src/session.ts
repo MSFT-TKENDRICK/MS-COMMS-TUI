@@ -13,7 +13,7 @@
  */
 
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import {
   FileStateStore,
@@ -155,6 +155,13 @@ export class Session {
       logger: this.logger,
       stateFor: (mountId) => new FileStateStore(stateFileFor(this.paths.stateDir, mountId)),
       cacheDirFor: (mountId) => join(this.paths.cacheDir, mountId),
+      // Resolved lazily so a projection mounted before the sources it reads still sees
+      // them: mounts are built in config order, but the space is asked for on use.
+      graphSpace: () => this.vfs.graphSpace(),
+      configDir:
+        this.config.sourcePath === undefined
+          ? this.paths.configDir
+          : dirname(this.config.sourcePath),
     });
 
     const broken: BuiltMount[] = [];

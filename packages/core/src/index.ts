@@ -155,3 +155,88 @@ export {
   type BuiltMount,
   type MountBuilderOptions,
 } from './registry.js';
+
+// ---------------------------------------------------------------------------
+// Graph model, mapping surface, and projections
+//
+// The tree is one view of the data, not the data. These four modules are what make
+// that true: a graph model, a declarative way to map an integration onto it, a query
+// parser, and an engine that turns a query back into a tree.
+// ---------------------------------------------------------------------------
+
+export {
+  BUILTIN_NODE_FIELDS,
+  GraphSpace,
+  graphFieldText,
+  graphFieldValue,
+  isBuiltinNodeField,
+  safeGraphName,
+  treeGraphSource,
+  type GraphArgDef,
+  type GraphArgValue,
+  type GraphEdgeDef,
+  type GraphFieldDef,
+  type GraphFieldValue,
+  type GraphNode,
+  type GraphRootDef,
+  type GraphScalar,
+  type GraphSchema,
+  type GraphSelection,
+  type GraphSource,
+  type GraphSourceEntry,
+  type GraphTreeHost,
+  type GraphTypeDef,
+  type TreeGraphOptions,
+} from './graph.js';
+
+export {
+  MappedProvider,
+  defineMapping,
+  type MappedEdge,
+  type MappedField,
+  type MappedRoot,
+  type MappedType,
+  type Mapping,
+  type MappingPluginSpec,
+  type MappingRequest,
+} from './mapping.js';
+
+export {
+  argsOf,
+  findDirective,
+  parseGraphQL,
+  resolveVariables,
+  responseName,
+  tokenizeGraphQL,
+  valueOf,
+  type GqlArgument,
+  type GqlDirective,
+  type GqlDocument,
+  type GqlField,
+  type GqlFragment,
+  type GqlFragmentSpread,
+  type GqlInlineFragment,
+  type GqlOperation,
+  type GqlRuntimeValue,
+  type GqlSelection,
+  type GqlTypeRef,
+  type GqlValue,
+  type GqlVariableDef,
+} from './graphql.js';
+
+export {
+  ProjectionProvider,
+  UNIVERSAL_ROOTS,
+  executeProjection,
+  expandSelections,
+  parseOrderBy,
+  pickOperation,
+  printProjectionSchema,
+  projectionPlugin,
+  resolveProjectionField,
+  sortGraphNodes,
+  type ExecuteOptions,
+  type JsonValue,
+  type ProjectionOptions,
+  type ProjectionProviderOptions,
+} from './projection.js';

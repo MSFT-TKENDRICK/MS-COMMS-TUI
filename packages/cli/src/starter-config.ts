@@ -136,6 +136,24 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   "type": "exec",
     //   "options": { "command": ["python3", "~/bin/my-feed.py"] },
     // },
+
+    // --- A tree of your own shape ---------------------------------------------
+    // A projection is not a source. It reorganizes the mounts above into a
+    // different tree, described as a GraphQL query over all of them at once, and
+    // mounts the result as ordinary folders you can ls, cat, find and complete.
+    //
+    // Try the query at the prompt first: \`schema\` shows what you can select and
+    // \`graphql '{ all { name source } }'\` runs one. See docs/PROJECTIONS.md.
+    //
+    // {
+    //   "path": "/by-person",
+    //   "type": "projection",
+    //   "options": {
+    //     "query": "{ all @flatten @group(by: \\"author\\") { name mtime } }",
+    //     // Or, once it outgrows a single line, keep it next to this file:
+    //     // "queryFile": "./by-person.graphql",
+    //   },
+    // },
   ],
 
   // ---------------------------------------------------------------------------

@@ -1,18 +1,23 @@
 # Writing a provider
 
-There are two ways to add a source. Pick the second one unless you have a reason not to.
+There are three ways to add a source.
 
-| | `exec` plugin | TypeScript provider |
-|---|---|---|
-| Language | Any | TypeScript or JavaScript |
-| Distribution | A file. Point the config at it. | An npm package or a module path |
-| Isolation | Separate process | In-process |
-| Speed | One IPC round trip per request | Direct call |
-| Effort | About forty lines | Implement an interface |
+| | `exec` plugin | Mapping | TypeScript provider |
+|---|---|---|---|
+| Language | Any | TypeScript or JavaScript | TypeScript or JavaScript |
+| Distribution | A file. Point the config at it. | An npm package or a module path | An npm package or a module path |
+| Isolation | Separate process | In-process | In-process |
+| Speed | One IPC round trip per request | Direct call | Direct call |
+| Effort | About forty lines | Describe your types and edges | Implement an interface |
+| Projectable | Via its tree | Via your own graph | Only if you write one |
 
 The `exec` tier exists because the alternative is telling a Python person to learn the
 TypeScript build. `examples/notes-plugin.mjs` is a complete working plugin in one
 dependency-free file; copying it is a legitimate way to start.
+
+If you are writing TypeScript, start at [the mapping surface](#the-mapping-surface). It is
+less code than implementing `Provider`, and it is the only route that gives users a real
+graph of your integration to write [projections](PROJECTIONS.md) against.
 
 ## The model you are implementing
 
@@ -186,9 +191,27 @@ repeat or drop entries, that names are unique and safe, that search results carr
 importantly — that the object's shape matches its declared capabilities.
 
 That last one has caught real bugs in this repo more than once. If you declare `search`, the
-engine checks `'search' in provider`, so a property that exists but is `undefined` still
-answers *true* and the engine will call it. Use `delete provider.search`, not
-`provider.search = undefined`.
+engine will call `provider.search`, so the method has to actually be there — and, in the
+other direction, a method that *is* there while the capability is not means the shell never
+offers a feature you already wrote.
+
+The trap is that an optional method has to genuinely not be installed, which is harder than
+it sounds in a class. A method lives on the prototype, so it exists on every instance no
+matter what the constructor decided, and `delete this.search` cannot remove it. Declare
+optional capabilities as optional *fields* and assign them only when you can honour them:
+
+```ts
+class MyProvider implements Provider {
+  readonly search?: (query: Query, options: SearchOptions) => Promise<SearchPage>;
+
+  constructor(canSearch: boolean) {
+    if (canSearch) this.search = (query, options) => this.#searchImpl(query, options);
+  }
+}
+```
+
+`MemoryProvider` and `MappedProvider` both do this, and the conformance suite is what
+keeps them honest.
 
 `packages/provider-exec/src/test/conformance.test.ts` runs this suite against the example
 plugin over the real protocol, in both transports. It is a working example of testing a
@@ -213,3 +236,122 @@ Register it with:
 
 Then use its type name in a mount. `plugins` runs your code in-process; prefer `exec` for
 anything you did not write yourself.
+
+## The mapping surface
+
+Implementing `Provider` means writing paging, cursors, name allocation, `resolveChild`,
+search and a graph — the same six things every integration writes, differently, and gets
+subtly wrong in its own way. A **mapping** is the declarative alternative: describe the
+kinds of thing your API has and how they connect, and `defineMapping` produces an ordinary
+`ProviderPlugin` with all of that already built.
+
+```ts
+import { defineMapping } from '@mscomms/core';
+
+interface Issue { id: string; title: string; state: string; user: string; at: string }
+
+export const trackerPlugin = defineMapping<{ project: string }>({
+  type: 'tracker',
+  displayName: 'Tracker',
+  setup(options) {
+    return {
+      types: [
+        {
+          name: 'Issue',
+          key: (i: Issue) => i.id,
+          title: (i: Issue) => `#${i.id} ${i.title}`,
+          datePrefix: true,
+          extension: '.md',
+          mtime: (i: Issue) => new Date(i.at),
+          author: (i: Issue) => i.user,
+          flags: (i: Issue) => (i.state === 'open' ? ['unread'] : []),
+          fields: [
+            { name: 'state', type: 'String', value: (i: Issue) => i.state },
+          ],
+          read: (i: Issue) => ({ body: i.title, headers: [['State', i.state]] }),
+        },
+      ],
+      roots: [
+        {
+          name: 'issues',
+          type: 'Issue',
+          universal: true,
+          resolve: (request) => fetchIssues(options.project, request.limit),
+        },
+      ],
+    };
+  },
+});
+```
+
+That is a complete, first-class mount. It lists, pages, caches, completes, searches,
+watches, and appears in `schema` as a graph users can project.
+
+### The three pieces
+
+**A type** is one kind of thing. `key` and `title` are required — `key` is the stable
+identity that caching and paths hang off, so it must survive a rename. Everything else is
+optional and defaulted: `kind` is `dir` when the type has a `childEdge` and `file`
+otherwise, `filename` is the sanitized title with `extension` and an optional `datePrefix`,
+`subtype` is the lowercased type name. `mtime`, `author`, `summary`, `size`, `flags`,
+`meta`, `childCount` and `unreadCount` map straight onto `VNode`.
+
+**A field** is scalar data that shows up in the graph and is selectable in a projection.
+**An edge** is a named relationship to another type in the same mapping, and this is the
+part a tree cannot express:
+
+```ts
+edges: [
+  { name: 'comments', target: 'Comment', list: true,
+    resolve: (i: Issue, request) => fetchComments(i.id, request.limit) },
+  { name: 'author', target: 'User',
+    resolve: (i: Issue) => [fetchUser(i.user)] },
+],
+childEdge: 'comments',
+```
+
+`childEdge` names the one edge `ls` follows. The others are still there, still queryable,
+still projectable — they simply are not the containment the default tree chose. Declaring
+them costs nothing and is what makes `{ all { author { name } } }` possible later.
+
+**A root** is an entry point: where a walk starts. `universal: true` marks a root as
+"everything here", which is what a cross-source `all` fans out to; without it your source
+is reachable by name but sits out the wildcard queries. `mount: false` keeps a root out of
+the default tree while leaving it projectable, which is how you expose a by-author index
+without cluttering `ls`.
+
+`rootMode` decides how roots appear at the mount point. The default, `auto`, puts a single
+root's records directly at the mount — making a user `cd issues` inside `/issues` is pure
+ceremony — and gives each root its own folder when there is more than one.
+
+### Capabilities follow from what you declared
+
+You do not declare a capability set. A type with `read` gives the mount `read`; a type with
+`invoke` gives it `actions`; `search` and `graph` are always available because the engine
+provides them. The set is computed, so it cannot disagree with the object — which is the
+bug the conformance suite exists to catch, removed rather than tested for.
+
+### What you get for free
+
+Paging and opaque cursors. Name allocation, including the Windows reserved names and the
+collision suffixes. `resolveChild`. Search across every mounted root, with local
+re-filtering. A `GraphSource` derived from your types and edges, so the mount is
+projectable the moment it exists. `MappingRequest.query` is pushed to you if you can use it
+and ignored safely if you cannot, exactly as in the wire protocol.
+
+`lookup(key)` is the one thing worth adding deliberately. It re-fetches a record from its
+key, which is what lets a projection resolve `/by-person/alice/3` in a cold process without
+walking there first. Without it that path still works — the engine re-evaluates level by
+level — it is just slower.
+
+### If a mapping is the wrong shape
+
+Implement `Provider` directly. Mappings are a convenience over the same contract, not a
+restriction on it, and a provider that declares its own `graph` is used verbatim. A
+provider that declares no graph at all still gets the one its tree implies — `children`,
+`descendants`, `parent` — so it is projectable regardless. Nothing has to opt in, because a
+projection over "all sources" that silently omitted one would be indistinguishable from a
+source with nothing in it.
+
+See [PROJECTIONS.md](PROJECTIONS.md) for what users do with the graph once you have
+declared it.

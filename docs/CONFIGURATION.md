@@ -310,6 +310,60 @@ splitting of a path a user did not write is how injection bugs happen. Note that
 is in **seconds** here, unlike the `timeoutMs` options elsewhere — it is the number a
 plugin author reaches for, and the name says which it is. See [PLUGINS.md](PLUGINS.md).
 
+### `projection` — a GraphQL view of your other mounts
+
+Not a source. A projection reorganizes the mounts you already have into a different tree,
+described by a GraphQL query over every mounted source. It is here because from your side
+it is just another mount type.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `query` | string | — | The projection, as GraphQL. Required unless `queryFile` is set. |
+| `queryFile` | string | — | Read it from a file instead. Relative paths resolve next to this config file. |
+| `operation` | string | the only one | Which named operation to run, when the document has more than one. |
+| `variables` | object | `{}` | Values for the query's variables. |
+| `defaultLimit` | number | 200 | Entries fetched per field when the query does not say. |
+
+```jsonc
+{
+  "path": "/by-person",
+  "type": "projection",
+  "options": {
+    "query": "{ all(filter: \"is:unread\") @flatten @group(by: \"author\") { name mtime } }"
+  }
+}
+```
+
+That mount lists, pages, caches, searches and completes like any other, and `cat` on a
+message inside it opens the actual message.
+
+Use `queryFile` once a projection outgrows a JSON string — escaping quotes inside JSONC
+gets unpleasant fast:
+
+```jsonc
+{ "path": "/by-person", "type": "projection", "options": { "queryFile": "./by-person.graphql" } }
+```
+
+Two rules follow from a projection being a mount. It never includes itself, or anything
+beneath its own path, because a projection over "all sources" would otherwise recurse until
+the stack gave out — which also means you cannot project a projection. And it cannot
+contain a mutation: it is a view, and acting on an item is `do`, which works normally
+inside one.
+
+Errors surface when the mount is built rather than on first `ls`, so a syntax error, an
+unknown operation name or a missing variable all fail at startup with the position in the
+query.
+
+Write the query at the prompt before committing it to a file. `schema` prints what you can
+select from the mounts you actually have, and `graphql` runs a query and prints JSON:
+
+```sh
+mscomms schema
+mscomms graphql '{ all(filter: "is:unread") { name source } }'
+```
+
+The full reference is [PROJECTIONS.md](PROJECTIONS.md).
+
 ## Secrets
 
 Never write a token into the file. Two indirections are resolved at use time:
