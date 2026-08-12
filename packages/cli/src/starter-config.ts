@@ -25,16 +25,29 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     },
 
     // --- Outlook mail via Microsoft Graph -------------------------------------
-    // The first time you use it, you will be given a short code and a URL to
-    // sign in with. Tokens are cached; you will not be asked again for weeks.
+    // Two ways to authenticate, and the default picks for you:
+    //
+    //   "transport": "mcp"    Borrow a sign-in from an MCP server that already has
+    //                         one, by running \`agency mcp workiq\`. Nothing to type
+    //                         and no prompt. Use this if your tenant blocks
+    //                         device-code sign-in, as many managed tenants do.
+    //   "transport": "https"  Call Graph directly. The first use prints a short
+    //                         code and a URL to sign in with; tokens are cached, so
+    //                         you will not be asked again for weeks.
+    //   "transport": "auto"   The default: "mcp" when its command is installed,
+    //                         "https" otherwise.
     //
     // {
     //   "path": "/mail",
     //   "type": "graph-mail",
     //   "options": {
-    //     // Optional. Defaults to the Microsoft Graph Command Line Tools client,
-    //     // which is a first-party public client available in most tenants.
-    //     // If your tenant blocks it, register your own app and put its id here.
+    //     // "transport": "auto",
+    //     // Another MCP server with the same passthrough tools works too:
+    //     // "mcp": { "command": "agency", "args": ["mcp", "workiq"] },
+    //
+    //     // Only used by the "https" transport. Defaults to the Microsoft Graph
+    //     // Command Line Tools client, a first-party public client available in
+    //     // most tenants. If yours blocks it, register an app and put its id here.
     //     // "clientId": "00000000-0000-0000-0000-000000000000",
     //     // "tenantId": "common",
     //     "pageSize": 50,

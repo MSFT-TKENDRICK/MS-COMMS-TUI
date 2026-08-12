@@ -47,7 +47,11 @@
  *    to stderr, which is right for a command line and useless underneath an alternate screen
  *    buffer: the code and the URL land somewhere invisible and opening /mail looks like a
  *    hang. So on a machine that has never signed in, that happens here first, on an ordinary
- *    screen, before the pane is entered.
+ *    screen, before the pane is entered — but only for a mount that is actually going to
+ *    sign in. A mount reaching Graph through an already-authorised MCP server never prompts,
+ *    and pre-empting a prompt that is never coming would produce the device-code dialog on
+ *    every single Run, which in a tenant that forbids that flow is not merely noise but a
+ *    dead end.
  *
  * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the terminal check, MSCOMMS_RUN_TUI=0 falls
  * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_SIGNIN=0
@@ -64,6 +68,7 @@ import { ROOT, flag } from './lib/npm.mjs';
 
 const BIN = join(ROOT, 'packages', 'cli', 'dist', 'bin.js');
 const CORE = join(ROOT, 'packages', 'core', 'dist', 'index.js');
+const GRAPH = join(ROOT, 'packages', 'provider-graph', 'dist', 'index.js');
 const SETUP = join(ROOT, 'scripts', 'app-setup.mjs');
 const MODULES = join(ROOT, 'node_modules');
 
@@ -108,7 +113,7 @@ async function loadSources() {
   }
 }
 
-/** Sources that sign in interactively the first time something asks them for data. */
+/** Sources that may sign in interactively the first time something asks them for data. */
 const INTERACTIVE_SOURCE = /^(graph-|ado-)/;
 
 /**
@@ -130,22 +135,47 @@ function hasCachedSignIn(stateDir) {
 }
 
 /**
+ * The first mount that is really going to open a device-code prompt, if there is one.
+ *
+ * A Graph mount can reach Graph two ways, and only one of them signs in here: the other
+ * borrows an MCP server that is already authorised. Asking the provider which transport a
+ * mount resolves to — rather than assuming from its type — is what keeps this from
+ * pre-empting a prompt that was never going to appear. Getting that wrong is expensive:
+ * many tenants disable device code entirely, so a spurious prompt is an unskippable dead
+ * end on every Run.
+ *
+ * If the provider cannot be loaded, no mount is claimed. An unnecessary prompt is worse
+ * than a missing one — the missing one merely happens later, on its own screen.
+ */
+async function signInMount(mounts) {
+  const candidates = mounts.filter((mount) => INTERACTIVE_SOURCE.test(mount.type));
+  if (candidates.length === 0) return undefined;
+
+  let resolveTransport;
+  try {
+    ({ resolveTransport } = await import(pathToFileURL(GRAPH).href));
+  } catch {
+    return undefined;
+  }
+
+  return candidates.find((mount) =>
+    // Azure DevOps has no MCP transport, so it always signs in the old way.
+    mount.type.startsWith('ado-') ? true : resolveTransport(mount.options ?? {}) === 'https',
+  );
+}
+
+/**
  * Get the Microsoft sign-in over with before the full-screen view opens.
  *
- * The device-code prompt is written to stderr, which is right for a command line and fatal
- * behind an alternate screen buffer: the pane is already drawn over the whole terminal, so
- * the code and the URL land somewhere invisible and the first attempt to open /mail looks
- * like a hang with no way to discover what it wants. Doing it here means it happens once, on
- * an ordinary screen, where the code can be read and typed.
- *
- * Only for a machine that has never signed in — after that the refresh token answers and
- * this would be a network round trip for nothing.
+ * Only for a machine that has never signed in, and only when a mount is actually going to
+ * ask — after that the refresh token answers and this would be a network round trip for
+ * nothing.
  */
 async function signInFirst(mounts, paths) {
   if (!flag('MSCOMMS_RUN_SIGNIN', true)) return;
   if (paths === undefined || hasCachedSignIn(paths.stateDir)) return;
 
-  const mount = mounts.find((candidate) => INTERACTIVE_SOURCE.test(candidate.type));
+  const mount = await signInMount(mounts);
   if (mount === undefined) return;
 
   console.error(`Signing in before opening the pane, so the code below is visible.`);

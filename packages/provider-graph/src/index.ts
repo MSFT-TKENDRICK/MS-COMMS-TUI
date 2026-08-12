@@ -1,9 +1,22 @@
 export { DeviceCodeAuthenticator, DEFAULT_CLIENT_ID, DEFAULT_SCOPES } from './auth.js';
 export type { DeviceCodeAuthOptions } from './auth.js';
-export { GraphClient } from './client.js';
+export { GraphClient, graphFailure } from './client.js';
 export type { GraphApi, GraphClientOptions, GraphPage, GraphRequestOptions } from './client.js';
-export { getAuthenticator, createClient, resetAllAuth, htmlToText, preview } from './shared.js';
-export type { GraphSharedOptions, AuthenticatorIdentity } from './shared.js';
+export { McpStdioClient, commandExists } from './mcp-client.js';
+export type { McpClientOptions, McpToolResult, McpTransport } from './mcp-client.js';
+export { McpGraphClient, DEFAULT_TOOL_NAMES, relativeUrl } from './mcp-graph.js';
+export type { McpGraphClientOptions, McpToolNames } from './mcp-graph.js';
+export {
+  getAuthenticator,
+  getMcpTransport,
+  releaseClient,
+  resolveTransport,
+  createClient,
+  resetAllAuth,
+  htmlToText,
+  preview,
+} from './shared.js';
+export type { GraphSharedOptions, GraphMcpOptions, GraphTransport, AuthenticatorIdentity } from './shared.js';
 export { GraphMailProvider, graphMailPlugin } from './mail.js';
 export type { GraphMailOptions } from './mail.js';
 export { GraphChatProvider, graphChatPlugin } from './chat.js';

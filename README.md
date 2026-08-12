@@ -153,7 +153,10 @@ indistinguishable from real data that is wrong, so a machine with nothing config
 how to connect an account rather than handed props; `MSCOMMS_RUN_DEMO=1` asks for them
 deliberately. And because the Microsoft device-code prompt is written to stderr — invisible
 underneath an alternate screen buffer — a machine that has never signed in does that first,
-on an ordinary screen, where the code can actually be read.
+on an ordinary screen, where the code can actually be read. Only when a mount is really
+going to prompt: a Graph mount set to the `mcp` transport borrows a sign-in that already
+exists and asks for nothing, and pre-empting a prompt that is never coming would put the
+device-code dialog in front of every Run.
 
 That is the opposite of what `mscomms` does on its own, and deliberately so: the line shell
 is the binary's default [for accessibility reasons](#keyboard-and-accessibility), and a
@@ -218,8 +221,14 @@ Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Credentials never live in the config. GitHub takes an explicit `token`, then `GH_TOKEN` or
 `GITHUB_TOKEN`, and failing both it borrows the credential from `gh auth login` — so on a
-machine with the GitHub CLI signed in, the `token` line above is unnecessary. The Microsoft
-sources sign in interactively the first time you open them and cache the result.
+machine with the GitHub CLI signed in, the `token` line above is unnecessary.
+
+The Microsoft sources follow the same principle. By default they look for an MCP server
+that is already authenticated (`agency mcp workiq`) and ask it for the data, so nothing
+prompts and nothing is stored. That matters in tenants that disable device-code sign-in by
+policy, where the interactive flow simply cannot complete. Without such a server they fall
+back to signing in interactively the first time you open them and caching the result. Set
+`"transport"` on the mount to `"mcp"` or `"https"` to choose explicitly.
 
 ## Add your own source
 

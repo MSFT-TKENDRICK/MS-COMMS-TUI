@@ -76,7 +76,7 @@ import {
   type VNode,
 } from '@mscomms/core';
 import type { GraphApi } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import { createClient, releaseClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
 
 export interface GraphPeopleOptions extends GraphSharedOptions {
   readonly pageSize?: number;
@@ -453,6 +453,8 @@ export class GraphPeopleProvider implements Provider {
   readonly #options: GraphPeopleOptions;
   readonly #context: ProviderContext;
   #client: GraphApi | undefined;
+  /** A client handed in by a test is not ours to release. */
+  #ownsClient = false;
   #me: Promise<Person> | undefined;
   #signals: Promise<SignalIndex> | undefined;
   #people = new Map<string, Person>();
@@ -465,7 +467,17 @@ export class GraphPeopleProvider implements Provider {
   }
 
   async init(): Promise<void> {
-    this.#client ??= createClient(this.#options, this.#context.state, this.#context.logger);
+    if (this.#client !== undefined) return;
+    this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
+    this.#ownsClient = true;
+  }
+
+  /** Release the shared MCP server so a one-shot command can exit. See the mail provider. */
+  async dispose(): Promise<void> {
+    if (!this.#ownsClient) return;
+    this.#ownsClient = false;
+    this.#client = undefined;
+    releaseClient(this.#options);
   }
 
   get #api(): GraphApi {

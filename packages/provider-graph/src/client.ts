@@ -219,15 +219,33 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     // Non-JSON error body; the status alone will have to do.
   }
 
-  const endpoint = url.replace(/^https:\/\/graph\.microsoft\.com\/v1\.0/, '');
+  return graphFailure(response.status, url, { code, message: detail });
+}
 
-  if (response.status === 401) {
+/**
+ * Turn a Graph error into the right `VfsError`.
+ *
+ * Split out of `describeFailure` because the MCP transport gets the same statuses and the
+ * same error codes back from Graph, just wrapped in a tool result rather than an HTTP
+ * response. A 403 on Teams has to keep producing the "needs admin consent" hint no matter
+ * which transport carried it, or the same tenant problem produces two different diagnoses.
+ */
+export function graphFailure(
+  status: number,
+  url: string,
+  error: { readonly code?: string; readonly message?: string } = {},
+): VfsError {
+  const detail = error.message ?? '';
+  const code = error.code ?? '';
+  const endpoint = url.replace(/^https:\/\/graph\.microsoft\.com\/(v1\.0|beta)/, '');
+
+  if (status === 401) {
     return new VfsError('EAUTH', 'Microsoft Graph rejected the credentials.', {
       hint: 'The sign-in has expired. Run `mscomms auth --reset` and sign in again.',
     });
   }
 
-  if (response.status === 403) {
+  if (status === 403) {
     const teams = endpoint.includes('/teams') || endpoint.includes('/chats');
     return new VfsError('EACCES', `Access denied${detail === '' ? '' : `: ${detail}`}`, {
       hint: teams
@@ -236,7 +254,7 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     });
   }
 
-  if (response.status === 404) {
+  if (status === 404) {
     return new VfsError('ENOENT', `Microsoft Graph has no ${endpoint}.`, {
       hint: 'The item may have been moved or deleted. Try refreshing the listing.',
     });
@@ -246,7 +264,7 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     return new VfsError('ENOENT', 'That item no longer exists.');
   }
 
-  return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(response.status)}${detail === '' ? '' : `: ${detail}`}`);
+  return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(status)}${detail === '' ? '' : `: ${detail}`}`);
 }
 
 function sleep(ms: number): Promise<void> {
