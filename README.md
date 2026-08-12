@@ -126,15 +126,36 @@ it does. The only `dependencies` entries are this repo's own workspace packages.
 ```sh
 git clone https://github.com/MSFT-TKENDRICK/MS-COMMS-TUI
 cd MS-COMMS-TUI
-npm install     # devDependencies only: TypeScript
-npm run build
+npm run setup   # npm install (devDependencies only: TypeScript) + npm run build
 npm link        # optional: puts `mscomms` and `msh` on your PATH
 ```
+
+`npm run setup` is the same two commands you would type yourself — `npm install` and
+`npm run build` — wrapped so that every entry point into this repo agrees on what "set up"
+means. Run them by hand if you prefer.
+
+### From the GitHub Copilot desktop app
+
+[`.github/github-app.yml`](.github/github-app.yml) wires the app's **Setup** and **Run**
+buttons to `scripts/app-setup.mjs` and `scripts/app-run.mjs`, so a workspace the app creates
+installs and builds itself and then has something to run. It takes effect once the file is
+on the default branch and the project's repository config has been trusted in the app's
+settings.
+
+The Run script adapts to where it is started. In a terminal it is the ordinary interactive
+shell; in the app's log pane, where nothing can be typed, it drives the same shell from a
+short canned transcript against the demo data — so the log shows the tool working instead of
+a prompt nobody can answer. Point `MSCOMMS_RUN_SCRIPT` at a file of commands to change that
+transcript, or set `MSCOMMS_RUN_INTERACTIVE=1` to force the interactive shell.
+
+Every run recompiles first, so the button always runs the code that is on disk rather than
+whatever was built last. That is an incremental no-op once warm; set `MSCOMMS_RUN_BUILD=0` to
+skip it and run the last successful build as-is.
 
 ## Try it without connecting anything
 
 ```sh
-mscomms          # starts the shell
+mscomms          # starts the shell — `npm start` if you skipped `npm link`
 /> demo          # mounts sample mail, chats, issues and people
 /> ls /demo-mail/Inbox
 /> cat 3
