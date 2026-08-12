@@ -18,7 +18,18 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { NULL_LOGGER, PluginRegistry, DEFAULT_CONFIG, type AppConfig, type AppPaths } from '@mscomms/core';
+import {
+  NULL_LOGGER,
+  PluginRegistry,
+  DEFAULT_CONFIG,
+  VfsError,
+  type AppConfig,
+  type AppPaths,
+  type Capability,
+  type ListPage,
+  type ProviderPlugin,
+  type VNode,
+} from '@mscomms/core';
 import { memoryPlugin, type MemoryItem } from '@mscomms/provider-memory';
 
 import { Dispatcher, editDistance } from '../dispatch.js';
@@ -545,3 +556,222 @@ describe('search: path and query', () => {
     assert.match(out, /Searching for "budget review"/);
   });
 });
+
+/**
+ * A provider whose root lists cleanly and whose one folder always fails to open.
+ *
+ * This is the failure that hides: nothing throws at the top level, so a search over it
+ * "succeeds" while having seen none of the content. It exists here to prove the search
+ * says so rather than returning a confident zero.
+ */
+const brokenPlugin: ProviderPlugin<Record<string, never>> = {
+  type: 'broken',
+  displayName: 'Broken feed',
+  description: 'Test double: lists its root, then refuses to open anything inside it.',
+  validateOptions: () => ({}) as Record<string, never>,
+  create: () => ({
+    id: 'broken',
+    displayName: 'Broken feed',
+    capabilities: new Set<Capability>(['list', 'read']),
+    list(parent: VNode | null): Promise<ListPage> {
+      if (parent === null) {
+        return Promise.resolve({
+          entries: [{ name: 'Headlines', id: 'headlines', kind: 'dir', title: 'Headlines' }],
+          total: 1,
+        });
+      }
+      return Promise.reject(new VfsError('ENETWORK', 'the feed did not answer'));
+    },
+    read: () => Promise.reject(new VfsError('ENETWORK', 'the feed did not answer')),
+  }),
+};
+
+/**
+ * `find` across every source.
+ *
+ * The harness mounts two independent memory providers so these exercise the real
+ * fan-out, not a single-mount shortcut.
+ */
+describe('dispatcher: cross-source find', () => {
+  async function twoMounts(): Promise<Harness> {
+    const registry = new PluginRegistry(NULL_LOGGER);
+    registry.register(memoryPlugin);
+
+    const config: AppConfig = {
+      ...DEFAULT_CONFIG,
+      mounts: [
+        {
+          id: 'mail',
+          path: '/mail',
+          type: 'memory',
+          options: { items: TREE, displayName: 'Test mail', now: () => NOW },
+        },
+        {
+          id: 'chat',
+          path: '/chat',
+          type: 'memory',
+          options: {
+            items: [
+              {
+                id: 'general',
+                title: 'General',
+                subtype: 'folder',
+                children: [
+                  { id: 'c1', title: 'the budget thread', author: 'Priya Raman', agoMinutes: 5, body: 'long' },
+                ],
+              },
+            ],
+            displayName: 'Test chat',
+            now: () => NOW,
+          },
+        },
+      ],
+      ui: { ...DEFAULT_CONFIG.ui, plain: true, color: 'never' },
+    };
+
+    const session = new Session({
+      config,
+      registry,
+      logger: NULL_LOGGER,
+      paths: PATHS,
+      mode: 'plain',
+      color: false,
+      width: 100,
+      write: () => undefined,
+      writeError: () => undefined,
+    });
+    await session.start();
+
+    const dispatcher = new Dispatcher(buildTable());
+    return {
+      session,
+      dispatcher,
+      run: async (line) => session.capture(async () => dispatcher.execute(session, line)),
+    };
+  }
+
+  /**
+   * Two sources, one of which lists its root fine and then refuses to open the folder
+   * inside it — the shape of a feed that is reachable but broken, or a scope that was
+   * revoked for one folder only. The whole point is that the search still succeeds.
+   */
+  async function withBrokenSource(): Promise<Harness> {
+    const registry = new PluginRegistry(NULL_LOGGER);
+    registry.register(memoryPlugin);
+    registry.register(brokenPlugin);
+
+    const config: AppConfig = {
+      ...DEFAULT_CONFIG,
+      mounts: [
+        {
+          id: 'mail',
+          path: '/mail',
+          type: 'memory',
+          options: { items: TREE, displayName: 'Test mail', now: () => NOW },
+        },
+        { id: 'news', path: '/news', type: 'broken', options: {} },
+      ],
+      ui: { ...DEFAULT_CONFIG.ui, plain: true, color: 'never' },
+    };
+
+    const session = new Session({
+      config,
+      registry,
+      logger: NULL_LOGGER,
+      paths: PATHS,
+      mode: 'plain',
+      color: false,
+      width: 100,
+      write: () => undefined,
+      writeError: () => undefined,
+    });
+    await session.start();
+
+    const dispatcher = new Dispatcher(buildTable());
+    return {
+      session,
+      dispatcher,
+      run: async (line) => session.capture(async () => dispatcher.execute(session, line)),
+    };
+  }
+
+  it('-a reaches every source even from inside one of them', async () => {
+    // Without this, a user who has cd'd into their mailbox and searches gets mail only,
+    // with nothing to suggest the chat hit they were actually after even exists.
+    const h = await twoMounts();
+    await h.run('cd /mail/Inbox');
+    const out = await h.run('find -a -q budget');
+    assert.match(out, /chat\//, 'the other source must appear');
+    assert.match(out, /mail\//);
+  });
+
+  it('without -a, a search stays where the user is', async () => {
+    const h = await twoMounts();
+    await h.run('cd /mail/Inbox');
+    const out = await h.run('find -q budget');
+    assert.doesNotMatch(out, /chat\//);
+  });
+
+  it('--source restricts to the named sources and implies searching them all', async () => {
+    const h = await twoMounts();
+    await h.run('cd /mail/Inbox');
+    const out = await h.run('find --source chat -q budget');
+    assert.match(out, /chat\//);
+    assert.doesNotMatch(out, /mail\//);
+  });
+
+  it('names an unknown source instead of reporting an empty result', async () => {
+    // "No matches" would read as "that mail does not exist", which is a false negative.
+    const h = await twoMounts();
+    const out = await h.run('find --source nope -q budget');
+    assert.match(out, /No source matches/);
+    assert.match(out, /chat|mail/);
+  });
+
+  it('offers a wider limit rather than `more`, since a merged search has no cursor', async () => {
+    const h = await twoMounts();
+    const out = await h.run('find -a -n 1 -q budget');
+    assert.doesNotMatch(out, /Type `more`/, 'there is no cursor to resume from');
+    assert.match(out, /raise `-n`|Raise `-n`/i);
+  });
+
+  it('accepts Lucene syntax end to end', async () => {
+    const h = await twoMounts();
+    const fuzzy = await h.run('find -a -q budgt~');
+    assert.match(fuzzy, /budget/i, 'a misspelling should still find the item');
+    const wildcard = await h.run('find -a -q subject:budg*');
+    assert.match(wildcard, /budget/i);
+  });
+
+  it('ranks the better match first across sources', async () => {
+    const h = await twoMounts();
+    const out = await h.run('find -a -q "budget review"');
+    const first = out.split('\n').find((line) => line.trim().startsWith('1.')) ?? '';
+    assert.match(first, /FY26 budget review/, 'the phrase match belongs at the top');
+  });
+
+  it('says so when a source could only be searched in part', async () => {    // The quiet failure this guards against: a feed that will not answer contributes no
+    // results, the merge succeeds, and "0 matches in news" reads as "nothing there".
+    const h = await withBrokenSource();
+    const out = await h.run('find -a -q budget');
+    assert.match(out, /Searched only part of: news/);
+    assert.match(out, /could not be read/);
+    assert.match(out, /mail\//, 'the healthy source still reports its hits');
+  });
+
+  it('says so on a single-source search too', async () => {
+    const h = await withBrokenSource();
+    const out = await h.run('find /news -q budget');
+    assert.match(out, /Could not read 1 folder/);
+    assert.match(out, /may not be everything/);
+  });
+
+  it('stays quiet about unreadable folders when there were none', async () => {
+    // The report has to be rare enough to mean something; printing it every time would
+    // train the user to skip the line that matters.
+    const h = await twoMounts();
+    const out = await h.run('find -a -q budget');
+    assert.doesNotMatch(out, /could not be read|may not be everything/);
+  });
+});
+

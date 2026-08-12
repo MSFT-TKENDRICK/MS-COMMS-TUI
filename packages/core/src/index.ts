@@ -64,18 +64,22 @@ export {
   tokenizeQuery,
   stringifyQuery,
   evaluateQuery,
+  scoreQuery,
   queryFields,
   requiresContent,
   isMatchAll,
   parseDateValue,
+  parseDateBoundEnd,
   parseSizeValue,
   MATCH_ALL,
   CONTENT_FIELDS,
   QUERY_FIELD_HELP,
+  QUERY_SYNTAX_HELP,
   type AndQuery,
   type CompareOp,
   type EvaluateContext,
   type MatchAllQuery,
+  type MatchModifiers,
   type NotQuery,
   type OrQuery,
   type Query,
@@ -96,7 +100,17 @@ export {
   type LoggerOptions,
 } from './logging.js';
 
-export { Vfs, sortNodes, type Mount, type VfsListResult, type VfsOptions, type VfsTarget } from './vfs.js';
+export {
+  Vfs,
+  rankHits,
+  sortNodes,
+  type Mount,
+  type SearchOptions,
+  type SearchSourceReport,
+  type VfsListResult,
+  type VfsOptions,
+  type VfsTarget,
+} from './vfs.js';
 
 export {
   Notifier,

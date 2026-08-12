@@ -8,7 +8,17 @@
  * while it silently fetched ten thousand message bodies.
  */
 
-import { parseQuery, stringifyQuery, requiresContent, QUERY_FIELD_HELP, vpath, type VNode } from '@mscomms/core';
+import {
+  parseQuery,
+  stringifyQuery,
+  requiresContent,
+  QUERY_FIELD_HELP,
+  QUERY_SYNTAX_HELP,
+  vpath,
+  type SearchSourceReport,
+  type VfsListResult,
+  type VNode,
+} from '@mscomms/core';
 import { formatListing, formatRows, sanitizeForDisplay, truncateWidth } from '../format.js';
 import type { Session } from '../session.js';
 import {
@@ -43,8 +53,8 @@ export const findCommand: Command = {
   name: 'find',
   aliases: ['search'],
   group: 'search',
-  summary: 'Find items by sender, subject, date or status, without downloading bodies.',
-  usage: 'find [path] -q <query> [-n count] [--depth n]',
+  summary: 'Find items by sender, subject, date or status, across one source or all of them.',
+  usage: 'find [path] -q <query> [-a] [--source ids] [-n count] [--depth n]',
   detail: [
     'Query syntax:',
     '',
@@ -55,11 +65,25 @@ export const findCommand: Command = {
     '  after:2026-01-01      received on or after a date; also `after:7d`',
     '  larger:1MB            bigger than a size',
     '',
+    'Lucene modifiers are accepted:',
+    '',
+    '  subject:budg*         wildcard; ? matches one character',
+    '  budgt~                fuzzy, for a word you are not sure how to spell',
+    '  "budget review"~5     the two words within 5 words of each other, in either order',
+    '  date:[2026-01 TO *]   a range; {} for exclusive ends',
+    '  subject:budget^3      weigh this clause more heavily when ranking',
+    '  +must -mustnot        require and exclude; && || ! also work',
+    '',
     'Terms are combined with AND unless you write OR. `NOT` and parentheses work too, and',
     'a bare word matches the title. Values with spaces need quotes: subject:"q3 planning".',
+    'Backslash escapes any of these, so `sub\\*ject` searches for a literal asterisk.',
     '',
-    'Sources that have their own search index use it. Sources that do not are walked',
-    'breadth-first with a budget, so an unindexed feed is slow but never unbounded.',
+    'Searching a folder that spans several sources — the root `/`, or `-a` from anywhere —',
+    'queries every source at once rather than one after another, and merges the results by',
+    'relevance. Sources that have their own search index use it. Sources that do not are',
+    'walked breadth-first with a budget, so an unindexed feed is slow but never unbounded.',
+    'A source that fails or times out is named rather than quietly dropped, because "no',
+    'results" and "could not look" must never look the same.',
     '',
     'Without `-q`, a leading word is treated as the folder to search only when it really',
     'is one — `find /mail/Inbox budget` searches that folder for "budget", while',
@@ -70,15 +94,28 @@ export const findCommand: Command = {
   args: ['path', 'query'],
   flags: [
     { name: 'q', description: 'The query to match.', value: true, aliases: ['query'] },
+    { name: 'a', description: 'Search every source, whatever the current folder.', aliases: ['all'] },
+    {
+      name: 'source',
+      description: 'Restrict to these sources, by name. Comma-separated.',
+      value: true,
+      aliases: ['sources'],
+    },
     { name: 'n', description: 'Maximum results.', value: true, aliases: ['limit'] },
     { name: 'depth', description: 'How many folder levels to search. Default 4.', value: true },
     ...OUTPUT_FLAGS,
   ],
-  examples: ['find -q "is:unread"', 'find /mail -q "from:alice after:7d"', 'find -q "subject:budget OR subject:forecast"'],
+  examples: [
+    'find -q "is:unread"',
+    'find -a -q "from:alice after:7d"',
+    'find -a --source mail,gh -q "subject:budg* OR subject:forecast^2"',
+  ],
   async run(session, args) {
     const explicit = flagString(args, 'q', 'query');
     const positional = [...args.positional];
-    let path = session.cwd;
+    const all = flagBool(args, 'a', 'all');
+    const sources = splitSources(flagString(args, 'source', 'sources'));
+    let path = all || sources !== undefined ? vpath.ROOT : session.cwd;
 
     if (explicit !== undefined) {
       // With -q, the query is settled and a positional can only be the path.
@@ -96,10 +133,10 @@ export const findCommand: Command = {
       const candidate = positional[0] as string;
       const resolved = await resolveDirectory(session, candidate);
       if (resolved !== undefined) {
-        path = resolved;
+        if (!all && sources === undefined) path = resolved;
         positional.shift();
         session.status(
-          `Searching ${resolved} for "${positional.join(' ')}". Use \`-q\` to search from here instead.`,
+          `Searching ${all || sources !== undefined ? 'every source' : resolved} for "${positional.join(' ')}". Use \`-q\` to search from here instead.`,
         );
       }
     }
@@ -122,6 +159,7 @@ export const findCommand: Command = {
     const result = await session.vfs.search(path, query, {
       limit,
       ...(flagNumber(args, 'depth') === undefined ? {} : { maxDepth: flagNumber(args, 'depth') as number }),
+      ...(sources === undefined ? {} : { sources }),
     });
 
     session.print(formatListing(result.entries, { ...session.withMode(mode), startIndex: 1 }));
@@ -135,11 +173,92 @@ export const findCommand: Command = {
     });
 
     if (mode === 'json' || mode === 'tsv') return;
+    const count = result.entries.length;
     session.status(
-      `${String(result.entries.length)} ${result.entries.length === 1 ? 'match' : 'matches'} for ${stringifyQuery(query)}${result.cursor === undefined ? '' : '. Type `more` for the next page'}.`,
+      `${String(count)} ${count === 1 ? 'match' : 'matches'} for ${stringifyQuery(query)}${describeMore(result, count, limit)}.`,
     );
+    for (const line of describeSources(result.sources)) session.status(line);
+    if (result.sources === undefined && (result.unreadable ?? 0) > 0) {
+      const skipped = result.unreadable as number;
+      session.status(
+        `Could not read ${String(skipped)} ${skipped === 1 ? 'folder' : 'folders'} while searching${
+          result.unreadableError === undefined ? '' : ` (${sanitizeForDisplay(result.unreadableError)})`
+        }, so this may not be everything.`,
+      );
+    }
   },
 };
+
+function splitSources(value: string | undefined): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  const names = value
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+  return names.length === 0 ? undefined : names;
+}
+
+/**
+ * How to offer the rest of the results.
+ *
+ * A cross-source search has no cursor to resume — see `Vfs`. Offering `more` anyway would
+ * be a lie that costs the user a command and an error to discover, so the honest advice
+ * is to widen the limit instead.
+ */
+function describeMore(result: VfsListResult, shown: number, limit: number): string {
+  if (result.cursor !== undefined) return '. Type `more` for the next page';
+  const truncated = result.sources?.some((source) => source.truncated) ?? false;
+  if (!truncated && result.total !== undefined && result.total <= shown) return '';
+  if (!truncated && shown < limit) return '';
+  return `. Showing the top ${String(shown)}; raise \`-n\` for more`;
+}
+
+/**
+ * One line per source outcome, but only when there is something a user must know.
+ *
+ * Announcing "mail 12, teams 3" after every successful search would be noise a screen
+ * reader has to read out every time. Announcing a source that failed, timed out or got
+ * cut off is not noise: it is the difference between "there are no more" and "I stopped
+ * looking".
+ */
+function describeSources(sources: readonly SearchSourceReport[] | undefined): readonly string[] {
+  if (sources === undefined || sources.length === 0) return [];
+
+  const lines: string[] = [];
+  const complete = sources.filter((source) => source.status === 'ok');
+  const partial = sources.filter((source) => source.status === 'partial');
+  const broken = sources.filter((source) => source.status === 'failed' || source.status === 'timeout');
+
+  if (broken.length > 0) {
+    lines.push(
+      `Searched ${String(complete.length + partial.length)} of ${String(sources.length)} sources. ${broken
+        .map(
+          (source) =>
+            `${source.id} ${source.status === 'timeout' ? 'timed out' : 'failed'}${source.error === undefined ? '' : ` (${sanitizeForDisplay(source.error)})`}`,
+        )
+        .join('; ')}.`,
+    );
+  }
+
+  if (partial.length > 0) {
+    lines.push(
+      `Searched only part of: ${partial
+        .map(
+          (source) =>
+            `${source.id}${source.error === undefined ? '' : ` (${sanitizeForDisplay(source.error)})`}`,
+        )
+        .join('; ')}.`,
+    );
+  }
+
+  const cut = [...complete, ...partial].filter((source) => source.truncated).map((source) => source.id);
+  if (cut.length > 0) {
+    lines.push(`More to find in: ${cut.join(', ')}. Raise \`-n\` to see further into each source.`);
+  }
+
+  return lines;
+}
+
 
 export const grepCommand: Command = {
   name: 'grep',
@@ -367,6 +486,11 @@ export const queriesCommand: Command = {
     }
 
     session.print(formatRows(['field', 'what it matches'], QUERY_FIELD_HELP.map((pair) => [...pair]), session.withMode(mode)));
+
+    session.print('');
+    session.print(
+      formatRows(['modifier', 'what it does'], QUERY_SYNTAX_HELP.map((pair) => [...pair]), session.withMode(mode)),
+    );
 
     if (session.config.queries.length > 0) {
       session.print('');

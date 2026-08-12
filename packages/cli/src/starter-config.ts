@@ -65,6 +65,29 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   },
     // },
 
+    // --- Azure DevOps boards --------------------------------------------------
+    // Projects, teams, boards and columns become folders; work items become
+    // files, so "what is in Active" is \`ls\` rather than a query. Every project
+    // also gets an "Assigned to me" folder.
+    //
+    // Uses AZURE_DEVOPS_EXT_PAT (or AZURE_DEVOPS_PAT) if one is set, and signs
+    // in interactively if not. A token needs only the "Work items (read)" scope.
+    //
+    // {
+    //   "path": "/ado",
+    //   "type": "ado-boards",
+    //   "options": {
+    //     "organization": "contoso",
+    //     // For Azure DevOps Server, give the full collection URL instead:
+    //     // "orgUrl": "https://tfs.contoso.example/tfs/DefaultCollection",
+    //
+    //     // Listing projects also skips discovery, so a token scoped to one
+    //     // project is enough. Omit to show everything you can see.
+    //     // "projects": ["Contoso"],
+    //     // "boards": ["Stories"],
+    //   },
+    // },
+
     // --- RSS and Atom feeds ---------------------------------------------------
     //
     // {
@@ -80,6 +103,8 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     // --- Anything else, in any language ---------------------------------------
     // The exec provider speaks line-delimited JSON over stdin and stdout, so a
     // source can be a shell script, a Python file, or a compiled binary.
+    // "command" is always an array: a string would have to be split by a shell,
+    // and shell-splitting a path you did not write is how injection bugs happen.
     // See docs/PLUGINS.md for the protocol.
     //
     // {
@@ -123,11 +148,13 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
   // ---------------------------------------------------------------------------
   "watches": [
     // {
+    //   "id": "inbox",
     //   "path": "/mail/Inbox",
     //   "query": "is:unread",
-    //   "intervalSeconds": 120,
-    //   "notify": true,
+    //   "intervalMs": 120000,
     //   "label": "Inbox",
+    //   // Also notify when something already seen changes, not just on arrival.
+    //   "includeUpdates": false,
     // },
   ],
 

@@ -1,7 +1,8 @@
 # MS-COMMS-TUI
 
-Browse Outlook mail, Microsoft Teams chats, GitHub issues, RSS feeds and anything else you
-can write forty lines of script for — as folders and files, from the keyboard.
+Browse Outlook mail, Microsoft Teams chats, GitHub issues, Azure DevOps boards, RSS feeds
+and anything else you can write forty lines of script for — as folders and files, from the
+keyboard.
 
 ```
 /> cd /demo-mail/Inbox
@@ -17,6 +18,7 @@ Date: 2026-08-11T18:32:47Z
 Subject: FY26 budget review — please read before Thursday
 ...
 Inbox> find /mail -q "is:unread from:dana after:7d"
+Inbox> find -a -q "budget~ after:7d"        # every source at once, ranked
 ```
 
 `ls`, `cd`, `cat`, `find`, `grep`, `stat`. The commands you already know, pointed at the
@@ -42,9 +44,55 @@ terminal client for Microsoft Teams or Outlook — wrappers, raw API CLIs and we
 but no real TUI. See [docs/PRIOR-ART.md](docs/PRIOR-ART.md) for that survey and the
 learnings taken from twenty-odd adjacent projects.
 
-**Everything is the same shape.** Mail, chats, issues and feeds are all "a stream of
-authored, timestamped, sometimes-unread things, grouped somehow". Modelling them once and
-writing the interface once means a new backend is a plugin, not a fork.
+**Everything is the same shape.** Mail, chats, issues, work items and feeds are all "a
+stream of authored, timestamped, sometimes-unread things, grouped somehow". Modelling them
+once and writing the interface once means a new backend is a plugin, not a fork.
+
+## Searching everything at once
+
+`find -a` asks every mounted source in parallel and merges the answers by relevance.
+Each source is queried through its own search index where it has one, so this is not a
+brute-force walk; sources without an index are walked with a budget.
+
+```
+/> find -a -q "budget~ after:14d"
+/> find -a --source mail,gh -q "subject:budg* OR subject:forecast^2"
+```
+
+The query language accepts Lucene syntax on top of the plain `field:value` form:
+
+| Syntax | Meaning |
+|---|---|
+| `subject:budg*`, `bud?et` | wildcards; `*` is any run of characters, `?` is exactly one |
+| `budgt~`, `budgt~1` | fuzzy, for a word you are not sure how to spell |
+| `"budget review"~5` | the two words within five words of each other, in either order |
+| `date:[2026-01 TO *]` | a range; `{}` for exclusive ends |
+| `subject:budget^3` | weigh this clause more heavily when ranking |
+| `+must -mustnot` | require and exclude; `&&`, `||` and `!` also work |
+| `sub\*ject` | backslash escapes any of the above |
+
+Two deliberate departures from Lucene, both because a mail client is not a document
+index. Adjacent terms mean AND, not OR, because that is what every mail search does — so
+`+` is accepted and then ignored, since it is already the default. And `from:dana` is a
+substring match, so it finds `dana.whitfield@contoso.example`; use `from:dana*` for
+whole-word and `from:=dana` for exact. Proximity also ignores word order, because someone
+asking whether two words are near each other should not have to guess which one the
+author wrote first.
+
+When a source fails, times out, gets searched only in part, or gets cut off by the result
+limit, it is named:
+
+```
+/> find -a -q "budget"
+12 matches for budget.
+Searched 3 of 4 sources. news failed (401 Unauthorized).
+Searched only part of: teams (2 folders could not be read: 403 Forbidden).
+More to find in: mail. Raise `-n` to see further into each source.
+```
+
+That reporting is the point of the feature. "No results" and "I could not look" must never
+render as the same line — including the quiet middle case, where a source answers normally
+having silently skipped half of itself.
 
 ## Install
 
@@ -88,6 +136,8 @@ A minimal config:
     { "id": "teams",  "path": "/teams",  "type": "graph-chat" },
     { "id": "gh",     "path": "/gh",     "type": "github",
       "options": { "repos": ["octocat/hello-world"], "token": "${env:GITHUB_TOKEN}" } },
+    { "id": "ado",    "path": "/ado",    "type": "ado-boards",
+      "options": { "organization": "contoso", "token": "${env:AZURE_DEVOPS_EXT_PAT}" } },
     { "id": "news",   "path": "/news",   "type": "rss",
       "options": { "feeds": [{ "url": "https://example.com/feed.xml", "name": "Example" }] } }
   ]
@@ -180,6 +230,7 @@ hole in your scrollback.
 ```sh
 mscomms ls /mail/Inbox --json
 mscomms find /mail -q "is:unread from:dana" --tsv
+mscomms find -a -q "subject:budg* OR subject:forecast^2" --json
 mscomms cat "/mail/Inbox/2026-08-11 FY26 budget review.eml"
 mscomms watch /mail/Inbox -q is:unread      # desktop notification on new mail
 ```
@@ -200,9 +251,11 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 
 ## Status
 
-Working and tested: the VFS engine, query language, cache, notifications, the line shell,
-tab completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
-GraphQL projections, and the memory, RSS, GitHub, Graph and exec providers. 828 tests.
+Working and tested: the VFS engine, the query language (including Lucene syntax and
+relevance ranking), cross-source search, cache, notifications, the line shell, tab
+completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
+GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
+985 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been

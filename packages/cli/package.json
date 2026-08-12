@@ -23,6 +23,7 @@
     "@mscomms/provider-rss": "0.1.0",
     "@mscomms/provider-github": "0.1.0",
     "@mscomms/provider-graph": "0.1.0",
+    "@mscomms/provider-ado": "0.1.0",
     "@mscomms/provider-exec": "0.1.0"
   }
 }

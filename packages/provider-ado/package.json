@@ -1,0 +1,16 @@
+{
+  "name": "@mscomms/provider-ado",
+  "version": "0.1.0",
+  "description": "Azure DevOps Boards — teams, boards, columns and work items as a virtual filesystem.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "files": ["dist"],
+  "scripts": { "build": "tsc --build" },
+  "dependencies": {
+    "@mscomms/core": "0.1.0",
+    "@mscomms/provider-graph": "0.1.0"
+  }
+}

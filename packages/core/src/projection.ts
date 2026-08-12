@@ -692,6 +692,8 @@ export interface ProjectionProviderOptions extends ProjectionOptions {
 export class ProjectionProvider implements Provider {
   readonly id = 'projection';
   readonly displayName = 'GraphQL projection';
+  /** A projection re-presents other mounts; it is not a source of its own. See `Provider`. */
+  readonly derived = true;
   readonly capabilities: ReadonlySet<Capability> = new Set<Capability>([
     'list',
     'read',

@@ -717,10 +717,90 @@ describe('a projection over its own mount table', () => {
   });
 });
 
+describe('a projection is a view, not a source, for cross-source search', () => {
+  /** Mail, tickets, and a projection over both, all mounted in one Vfs. */
+  function mounted(): Vfs {
+    const vfs = new Vfs();
+    vfs.mount({ path: '/mail', id: 'mail', provider: mailProvider() });
+    vfs.mount({ path: '/tickets', id: 'tickets', provider: ticketProvider() });
+    vfs.mount({
+      path: '/by-person',
+      id: 'by-person',
+      provider: new ProjectionProvider({
+        space: () => vfs.graphSpace().without('/by-person'),
+        mountPath: '/by-person',
+        query: '{ all @flatten @group(by: "author") { name mtime } }',
+      }),
+    });
+    return vfs;
+  }
+
+  it('declares itself derived, so the engine can tell a view from a backend', () => {
+    const view: Provider = new ProjectionProvider({
+      space,
+      mountPath: '/view',
+      query: '{ all { name } }',
+    });
+    const mail: Provider = mailProvider();
+    assert.equal(view.derived, true);
+    assert.notEqual(mail.derived, true);
+  });
+
+  it('is left out of a fan-out nobody asked it to be part of', async () => {
+    const result = await mounted().search('/', parseQuery('*'), {});
+    const roots = new Set(result.entries.map((hit) => (hit.path ?? '').split('/')[1]));
+    assert.ok(!roots.has('by-person'), `fan-out reached the projection: ${[...roots].join(', ')}`);
+    assert.deepEqual([...roots].sort(), ['mail', 'tickets']);
+  });
+
+  it('does not report itself as one of the sources searched', async () => {
+    const result = await mounted().search('/', parseQuery('*'), {});
+    const reported = (result.sources ?? []).map((source) => source.id).sort();
+    assert.deepEqual(reported, ['mail', 'tickets']);
+  });
+
+  it('does not hand back the same item twice under two names', async () => {
+    const result = await mounted().search('/', parseQuery('*'), {});
+    const ids = result.entries.map((hit) => hit.id);
+    assert.equal(new Set(ids).size, ids.length, 'a hit was returned more than once');
+  });
+
+  it('is searched anyway when the user names it', async () => {
+    const result = await mounted().search('/', parseQuery('*'), { sources: ['by-person'] });
+    assert.ok(result.entries.length > 0);
+    assert.deepEqual(
+      (result.sources ?? []).map((source) => source.id),
+      ['by-person'],
+    );
+  });
+
+  it('is searched normally from inside itself', async () => {
+    const result = await mounted().search('/by-person', parseQuery('*'), {});
+    assert.ok(result.entries.length > 0, 'searching a projection directly returned nothing');
+  });
+
+  it('is kept when it is the only thing beneath the root, rather than answering nothing', async () => {
+    const vfs = new Vfs();
+    vfs.mount({ path: '/deep/mail', id: 'mail', provider: mailProvider() });
+    vfs.mount({
+      path: '/view',
+      id: 'view',
+      provider: new ProjectionProvider({
+        space: () => vfs.graphSpace().without('/view'),
+        mountPath: '/view',
+        query: '{ all @flatten { name } }',
+      }),
+    });
+
+    // `/view` has only the projection beneath it. A view of a source beats no answer.
+    const result = await vfs.search('/view', parseQuery('*'), {});
+    assert.ok(result.entries.length > 0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The plugin
 // ---------------------------------------------------------------------------
-
 describe('projectionPlugin', () => {
   it('registers as the `projection` mount type', () => {
     assert.equal(projectionPlugin.type, 'projection');

@@ -366,6 +366,23 @@ export interface Provider {
   readonly displayName: string;
   readonly capabilities: ReadonlySet<Capability>;
 
+  /**
+   * True when this mount's contents come from other mounts rather than from a backend of
+   * its own — a projection being the built-in case.
+   *
+   * It exists for cross-source search. Fanning out across "every mount beneath here"
+   * silently assumes every mount is an independent source, and a view breaks that in two
+   * ways at once: it returns the same items a real source already returned, and it spends
+   * a share of a merged, ranked result budget doing so. Searching `/` with one projection
+   * over two sources gives back mostly duplicates, and the sources being duplicated are
+   * the ones pushed out to make room.
+   *
+   * So a derived mount is left out of a fan-out that was not asked for by name. It is
+   * still searched normally from inside (`find /by-person`), and still searched when named
+   * explicitly (`find / --source by-person`), because at that point the user means it.
+   */
+  readonly derived?: boolean;
+
   init?(): Promise<void>;
   dispose?(): Promise<void>;
 

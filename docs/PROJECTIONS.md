@@ -256,8 +256,20 @@ Deep paths survive a cold cache. Frame ids are hierarchical, so `cat /by-person/
 in a fresh process re-evaluates the projection level by level until it matches. Slower than
 a warm walk, never wrong.
 
+Searching `/` does not search your projections. A cross-source `find` fans out across your
+real sources, and a projection holds nothing of its own — including it would return every
+hit a second time under a different path, and cost the real sources part of a bounded
+result budget to do so. Search inside one to search it:
+
+```
+find /by-person -q is:unread      # searches the projection
+find / -q is:unread               # searches your sources, not your views
+find / -q is:unread --source by-person   # unless you say so
+```
+
 ## See also
 
 - [CONFIGURATION.md](CONFIGURATION.md#projection--a-graphql-view-of-your-other-mounts) — the mount type.
 - [PLUGINS.md](PLUGINS.md#the-mapping-surface) — making your own integration projectable.
 - [ARCHITECTURE.md](ARCHITECTURE.md#the-graph-model) — why the model is a graph.
+- [ARCHITECTURE.md](ARCHITECTURE.md#views-are-not-sources) — why a fan-out skips them.
