@@ -148,6 +148,8 @@ Read-only unless you grant write scopes. Mail folders become directories; messag
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
+| `transport` | `"auto"` \| `"mcp"` \| `"https"` | `"auto"` | How to reach Graph. See below. |
+| `mcp` | object | `agency mcp workiq` | The MCP server to borrow, when `transport` is `mcp`. |
 | `clientId` | string | Microsoft Graph Command Line Tools | Your own app registration, if the default is blocked. |
 | `tenantId` | string | `common` | Single-tenant directory ID. |
 | `scopes` | string[] | see below | Add `Mail.ReadWrite` to mark messages read. |
@@ -156,9 +158,51 @@ Read-only unless you grant write scopes. Mail folders become directories; messag
 | `includeHiddenFolders` | boolean | `false` | Include folders Outlook hides. |
 | `timeoutMs` | number | 30000 | Per-request timeout. |
 
-Sign-in is the OAuth device code flow: the program prints a URL and a code, you approve in
-a browser, and the refresh token is stored in the data directory. No password is ever
-typed into the terminal.
+#### Authentication
+
+There are two ways to reach Graph, and `transport` chooses between them.
+
+**`https`** calls Graph directly and signs in with the OAuth device code flow: the program
+prints a URL and a code, you approve in a browser, and the refresh token is stored in the
+data directory. No password is ever typed into the terminal.
+
+**`mcp`** does not sign in at all. It runs an MCP server that is already authenticated —
+`agency mcp workiq` by default — and asks it for the Graph responses. Many managed tenants
+disable device-code sign-in by policy, which leaves the `https` transport with no way to
+get a token even though the machine is signed in perfectly well; this borrows that existing
+sign-in instead. Nothing is stored, and no token ever appears in a config file.
+
+**`auto`**, the default, uses `mcp` when its command is on `PATH` and `https` otherwise, so
+a machine with the tooling installed never sees a prompt and one without behaves exactly as
+it always has.
+
+Any server exposing the same passthrough tools will do:
+
+```jsonc
+"options": {
+  "transport": "mcp",
+  "mcp": {
+    "command": "agency",
+    "args": ["mcp", "workiq"],
+    "timeoutMs": 60000,
+    // Only if the server names its tools differently:
+    // "tools": { "fetch": "fetch", "fetchBlob": "fetch_blob",
+    //            "action": "do_action", "create": "create_entity",
+    //            "update": "update_entity" },
+  },
+}
+```
+
+One server process is shared by every mount using the same command, and it is stopped when
+the last of them is unmounted.
+
+The `mcp` transport is a proxy, so it inherits that proxy's limits: the permissions are
+whichever ones the server was granted, not the `scopes` listed below, and a query it cannot
+express is widened rather than failed (nested `$expand` options are dropped, which returns
+more fields than were asked for, never fewer). Attachment downloads are also capped by the
+server — the reference one stops at 4 MB — so a very large attachment can fail to open on
+`mcp` and succeed on `https`. `scopes`, `clientId`, `tenantId` and `authority` apply only
+to `https`.
 
 The default scope set covers both mail and Teams, because one consent prompt is kinder than
 two:

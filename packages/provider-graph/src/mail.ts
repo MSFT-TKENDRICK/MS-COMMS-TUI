@@ -33,8 +33,8 @@ import {
   type ReadOptions,
   type VNode,
 } from '@mscomms/core';
-import type { GraphClient, GraphPage } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import type { GraphApi, GraphPage } from './client.js';
+import { createClient, releaseClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
 
 export interface GraphMailOptions extends GraphSharedOptions {
   /** Include folders Outlook hides by default (Conversation History, and similar). */
@@ -95,7 +95,7 @@ export class GraphMailProvider implements Provider {
 
   readonly #options: GraphMailOptions;
   readonly #context: ProviderContext;
-  #client: GraphClient | undefined;
+  #client: GraphApi | undefined;
 
   constructor(options: GraphMailOptions, context: ProviderContext) {
     this.#options = options;
@@ -107,7 +107,18 @@ export class GraphMailProvider implements Provider {
     this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
-  get #api(): GraphClient {
+  /**
+   * Let go of the MCP server, if that is how this mount is reaching Graph.
+   *
+   * Without this a subprocess holding an open pipe keeps the event loop alive, and every
+   * one-shot command prints its answer and then never exits.
+   */
+  async dispose(): Promise<void> {
+    this.#client = undefined;
+    releaseClient(this.#options);
+  }
+
+  get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The mail mount was not initialised.');
     return this.#client;
   }
