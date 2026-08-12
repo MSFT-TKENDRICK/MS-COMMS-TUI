@@ -186,6 +186,39 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
   ],
 
   // ---------------------------------------------------------------------------
+  // Local snapshot. Off by default; this is the setting that makes the tool feel
+  // instant. Mail is synced into a local Turso (libSQL) database in the
+  // background, listings are served from disk instead of the network, and
+  // \`find\` searches locally before it searches remotely.
+  //
+  // It keeps the most recent items per folder rather than replicating your
+  // mailbox, so it is honest about what it can answer: a plain \`ls\` comes from
+  // the snapshot, a filtered one goes to the source, and search never concludes
+  // "no results" from local data alone.
+  // ---------------------------------------------------------------------------
+  // "cache": {
+  //   "enabled": true,
+  //
+  //   // Items kept per folder. The rest are evicted; this is what stops a large
+  //   // mailbox from turning the first sync into an overnight job.
+  //   "recent": 500,
+  //
+  //   // Message bodies to pre-download per folder per sync, so \`cat\` on
+  //   // something recent is instant and \`body:\` works offline. 0 disables.
+  //   "bodies": 25,
+  //
+  //   // Record every fetch in an AgentFS tool_calls log inside the snapshot:
+  //   // what was called, which path, how long, and whether it failed. Paths and
+  //   // sizes only, never message content. Shown in \`cache\`.
+  //   // "audit": true,
+  //
+  //   // Replicate from a shared Turso database. The local file still works on
+  //   // its own; this only adds a remote to sync with.
+  //   // "syncUrl": "libsql://mail-org.turso.io",
+  //   // "authToken": "\${env:TURSO_AUTH_TOKEN}",
+  // },
+
+  // ---------------------------------------------------------------------------
   // Notifications.
   // ---------------------------------------------------------------------------
   "notifications": {

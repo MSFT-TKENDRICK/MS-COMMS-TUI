@@ -46,6 +46,37 @@ function uncommentExamples(source: string): string {
   return out.join('\n');
 }
 
+/**
+ * Uncomment a named top-level block, e.g. `"cache"`.
+ *
+ * `uncommentExamples` deliberately only revives the mount objects, which begin with a bare
+ * `{`. A settings block is introduced by its key instead, so it would be treated as prose
+ * and never validated — which is the exact hole this file exists to close.
+ */
+function uncommentSection(source: string, key: string): string {
+  const out: string[] = [];
+  let depth = 0;
+  let started = false;
+  for (const line of source.split('\n')) {
+    const match = /^(\s*)\/\/ ?(.*)$/.exec(line);
+    if (match === null) {
+      out.push(line);
+      continue;
+    }
+    const [, indent = '', body = ''] = match;
+    const trimmed = body.trim();
+    if (!started && !trimmed.startsWith(`"${key}":`)) {
+      out.push(line);
+      continue;
+    }
+    started = true;
+    depth += (trimmed.match(/[{[]/g) ?? []).length - (trimmed.match(/[}\]]/g) ?? []).length;
+    out.push(`${indent}${body}`);
+    if (depth === 0) started = false;
+  }
+  return out.join('\n');
+}
+
 describe('starter config', () => {
   it('is valid JSONC', () => {
     const parsed = parseJsonc(STARTER_CONFIG, 'starter-config.ts');
@@ -116,6 +147,43 @@ describe('starter config', () => {
       assert.ok(ado !== undefined, 'the starter config should show how to mount Azure DevOps boards');
       assert.equal(ado.path, '/ado');
       assert.equal((ado.options as { organization?: unknown } | undefined)?.organization, 'contoso');
+    });
+  });
+
+  /**
+   * The snapshot is the setting with the largest effect on how the tool feels, and it is
+   * off by default, so the commented block is the only way most people will find it. That
+   * makes a typo in it worse than useless: `init` would hand you a config that `doctor`
+   * rejects the moment you uncomment the thing you were told to uncomment.
+   */
+  describe('the commented-out cache block', () => {
+    const revived = validateConfig(parseJsonc(uncommentSection(STARTER_CONFIG, 'cache')));
+
+    it('is enabled once uncommented, rather than needing a second edit', () => {
+      assert.equal(revived.cache?.enabled, true);
+    });
+
+    it('sets the retention and body limits it describes', () => {
+      assert.equal(revived.cache?.recent, 500);
+      assert.equal(revived.cache?.bodies, 25);
+    });
+
+    it('leaves the remote and the audit log commented, since both are opt-in', () => {
+      assert.equal(revived.cache?.syncUrl, undefined);
+      assert.equal(revived.cache?.authToken, undefined);
+      assert.equal(revived.cache?.audit, undefined);
+    });
+
+    it('names only keys the validator accepts, including the nested ones', () => {
+      // The nested examples stay commented above, so validate them on their own too:
+      // an unknown key here is rejected, which is what catches a renamed option.
+      const inner = uncommentSection(
+        STARTER_CONFIG.replace(/\/\/\s*"(audit|syncUrl|authToken)":/g, '"$1":'),
+        'cache',
+      );
+      const config = validateConfig(parseJsonc(inner));
+      assert.equal(config.cache?.audit, true);
+      assert.equal(config.cache?.syncUrl, 'libsql://mail-org.turso.io');
     });
   });
 });
