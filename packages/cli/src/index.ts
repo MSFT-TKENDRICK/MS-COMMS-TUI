@@ -36,7 +36,7 @@ import { graphCommands } from './commands/graph.js';
 import { readCommands } from './commands/read.js';
 import { searchCommands } from './commands/search.js';
 import { watchCommands } from './commands/watch.js';
-import { systemCommands } from './commands/system.js';
+import { demoCommand, systemCommands } from './commands/system.js';
 import { STARTER_CONFIG } from './starter-config.js';
 import type { OutputMode } from './format.js';
 
@@ -83,6 +83,7 @@ export interface GlobalFlags {
   readonly verbose: boolean;
   readonly noConfig: boolean;
   readonly tui: boolean;
+  readonly demo: boolean;
   readonly rest: readonly string[];
 }
 
@@ -95,6 +96,7 @@ export function parseGlobals(argv: readonly string[]): GlobalFlags {
   let verbose = false;
   let noConfig = false;
   let tui = false;
+  let demo = false;
   let configPath: string | undefined;
   let mode: OutputMode | undefined;
   const rest: string[] = [];
@@ -117,6 +119,9 @@ export function parseGlobals(argv: readonly string[]): GlobalFlags {
         break;
       case '--tui':
         tui = true;
+        break;
+      case '--demo':
+        demo = true;
         break;
       case 'init':
         // Only a subcommand when it is the very first word.
@@ -166,7 +171,7 @@ export function parseGlobals(argv: readonly string[]): GlobalFlags {
   // appending would invent a command out of a flag.
   if (rest.length > 0) rest.push(...modeFlags);
 
-  return { help, version, shell, init, configPath, mode, verbose, noConfig, tui, rest };
+  return { help, version, shell, init, configPath, mode, verbose, noConfig, tui, demo, rest };
 }
 
 const VERSION = '0.1.0';
@@ -182,6 +187,8 @@ Usage:
 Global options:
   -c, --config <file>   use a specific config file
       --no-config       ignore config files entirely
+      --demo            mount the sample data before starting, so there is something to
+                        look at without connecting an account (same mounts as \`demo\`)
   -i, --shell           force the interactive shell
       --tui             full-screen two-pane view (opt-in; the line shell is the default
                         because it works with screen readers, and does everything this does)
@@ -264,6 +271,23 @@ export async function main(options: CliOptions): Promise<number> {
 
   try {
     await session.start();
+
+    // Mount the sample data before any interface exists.
+    //
+    // The line shell can be told `demo` at its prompt, but the full-screen view has no
+    // prompt until it has already drawn itself, so a first-time user opening it lands on
+    // an empty tree with no obvious way out. This is the startup-time equivalent, and it
+    // delegates to the command rather than repeating the mount list, so the flag cannot
+    // drift away from what `demo` actually does.
+    if (globals.demo) {
+      try {
+        await demoCommand.run(session, { positional: [], flags: {}, raw: 'demo' });
+      } catch (error) {
+        writeError(`${error instanceof Error ? error.message : String(error)}\n`);
+        if (isVfsError(error) && error.hint !== undefined) writeError(`${error.hint}\n`);
+        return 2;
+      }
+    }
 
     // The full-screen view is opt-in and never inferred. `--tui` with a command still runs
     // the command: someone scripting `mscomms ls --tui` wants the listing, not a pane.

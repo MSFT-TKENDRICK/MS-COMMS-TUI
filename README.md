@@ -142,15 +142,32 @@ installs and builds itself and then has something to run. It takes effect once t
 on the default branch and the project's repository config has been trusted in the app's
 settings.
 
-The Run script adapts to where it is started. In a terminal it is the ordinary interactive
-shell; in the app's log pane, where nothing can be typed, it drives the same shell from a
-short canned transcript against the demo data — so the log shows the tool working instead of
-a prompt nobody can answer. Point `MSCOMMS_RUN_SCRIPT` at a file of commands to change that
-transcript, or set `MSCOMMS_RUN_INTERACTIVE=1` to force the interactive shell.
+The Run script adapts to where it is started. In a real terminal — the app's Run panel is a
+genuine pty, as is any IDE terminal — it opens the **full-screen two-pane view**, mounting
+the demo data first if this machine has no sources configured, so the button always lands on
+something you can navigate. In the app's log pane, where nothing can be typed, it drives the
+line shell from a short canned transcript instead, so the log shows the tool working rather
+than a prompt nobody can answer.
+
+That is the opposite of what `mscomms` does on its own, and deliberately so: the line shell
+is the binary's default [for accessibility reasons](#keyboard-and-accessibility), and a
+command someone types must not ambush them with an alternate screen buffer. Clicking a play
+button in a windowed GUI is already a sighted, pointer-driven act that asks to be shown the
+thing, so that is the one place the full-screen view is assumed rather than requested.
+
+| Variable | Effect |
+| --- | --- |
+| `MSCOMMS_RUN_TUI=0` | Use the line shell instead of the full-screen view. |
+| `MSCOMMS_RUN_DEMO=0/1` | Force the sample mounts off or on, instead of "on when nothing is configured". |
+| `MSCOMMS_RUN_INTERACTIVE=0/1` | Override the terminal check that picks between a live interface and the transcript. |
+| `MSCOMMS_RUN_SCRIPT=<file>` | Use a file of commands as the transcript. |
+| `MSCOMMS_RUN_BUILD=0` | Skip the rebuild and run the last successful build as-is. |
+
+Arguments passed to the script win over all of it: `node scripts/app-run.mjs ls /demo-mail`
+runs that one command, and `node scripts/app-run.mjs --shell` gives the line shell.
 
 Every run recompiles first, so the button always runs the code that is on disk rather than
-whatever was built last. That is an incremental no-op once warm; set `MSCOMMS_RUN_BUILD=0` to
-skip it and run the last successful build as-is.
+whatever was built last. That is an incremental no-op once warm.
 
 ## Try it without connecting anything
 
@@ -260,6 +277,7 @@ There is also an opt-in full-screen pane:
 
 ```bash
 mscomms --tui
+mscomms --tui --demo   # with the sample data already mounted
 ```
 
 It is **opt-in on purpose**. The line shell above is the primary interface, because a
@@ -270,6 +288,10 @@ anything you can do there you can do by typing. It refuses to start with `--anno
 the keys, `q` quits, and **Ctrl+C always works, from any mode**, including mid-filter.
 On exit it prints where you were and what was selected, so a full-screen session isn't a
 hole in your scrollback.
+
+`--demo` is the `demo` command hoisted to startup. The line shell can be told `demo` at its
+prompt, but the pane has no prompt until it has drawn itself, so on an unconfigured machine
+it would otherwise open onto an empty tree.
 
 ## Scripting
 
@@ -301,7 +323,7 @@ Working and tested: the VFS engine, the query language (including Lucene syntax 
 relevance ranking), cross-source search, cache, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1148 tests.
+1156 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been
