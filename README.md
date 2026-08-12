@@ -158,7 +158,7 @@ thing, so that is the one place the full-screen view is assumed rather than requ
 | Variable | Effect |
 | --- | --- |
 | `MSCOMMS_RUN_TUI=0` | Use the line shell instead of the full-screen view. |
-| `MSCOMMS_RUN_DEMO=0/1` | Force the sample mounts off or on, instead of "on when nothing is configured". |
+| `MSCOMMS_RUN_DEMO=1` | Mount the sample data. Off unless asked for: the Run button shows your accounts, not fixtures. |
 | `MSCOMMS_RUN_INTERACTIVE=0/1` | Override the terminal check that picks between a live interface and the transcript. |
 | `MSCOMMS_RUN_SCRIPT=<file>` | Use a file of commands as the transcript. |
 | `MSCOMMS_RUN_BUILD=0` | Skip the rebuild and run the last successful build as-is. |
@@ -208,6 +208,11 @@ A minimal config:
 ```
 
 Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+Credentials never live in the config. GitHub takes an explicit `token`, then `GH_TOKEN` or
+`GITHUB_TOKEN`, and failing both it borrows the credential from `gh auth login` — so on a
+machine with the GitHub CLI signed in, the `token` line above is unnecessary. The Microsoft
+sources sign in interactively the first time you open them and cache the result.
 
 ## Add your own source
 
@@ -323,7 +328,7 @@ Working and tested: the VFS engine, the query language (including Lucene syntax 
 relevance ranking), cross-source search, cache, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1156 tests.
+1163 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been

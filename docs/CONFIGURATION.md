@@ -123,7 +123,7 @@ No credentials, no vendor API, and nobody can turn it off.
 | Option | Type | Default | Meaning |
 |---|---|---|---|
 | `repos` | string[] | — | `owner/name` entries, each a folder. |
-| `token` | string | — | A PAT. Use `${env:GITHUB_TOKEN}`. |
+| `token` | string | — | A PAT. Use `${env:GITHUB_TOKEN}`; omit it to fall back to the environment or `gh`. |
 | `baseUrl` | string | api.github.com | Set for GitHub Enterprise Server. |
 | `includePulls` | boolean | `true` | Show pull requests alongside issues. |
 | `includeComments` | boolean | `true` | Append the comment thread when reading. |
@@ -133,6 +133,13 @@ No credentials, no vendor API, and nobody can turn it off.
 
 Without a token you get public data at a much lower rate limit. `cache` in the shell shows
 how close you are to it.
+
+The token is looked for in three places, in order: the `token` option, then `GITHUB_TOKEN`
+or `GH_TOKEN` in the environment, then the credential belonging to `gh auth login`. The
+last of these means a machine with the GitHub CLI signed in needs no configuration at all —
+`gh` keeps its token in the OS keychain, so there is nothing to inherit and asking it is the
+only way to find out. That lookup runs only when the first two found nothing, never gets
+anything from the config file, and treats every failure as "no token".
 
 ### `graph-mail` — Outlook mail
 

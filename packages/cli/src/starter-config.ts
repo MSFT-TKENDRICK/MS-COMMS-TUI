@@ -77,15 +77,18 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     // },
 
     // --- GitHub issues and pull requests --------------------------------------
-    // Reads GH_TOKEN or GITHUB_TOKEN from the environment, or run \`gh auth login\`.
+    // Uses GH_TOKEN or GITHUB_TOKEN if either is set, and otherwise borrows the
+    // credential from \`gh auth login\`. Without any of the three it still works on
+    // public repositories, just at 60 requests an hour.
     //
     // {
     //   "path": "/github",
     //   "type": "github",
     //   "options": {
     //     "repos": ["octocat/hello-world"],
-    //     // Or, instead of repos, everything assigned to you:
-    //     // "involvesMe": true,
+    //     // Or, instead of repos, your notification inbox — everything across
+    //     // every repository that is actually waiting on you. Needs a token.
+    //     // "includeNotifications": true,
     //   },
     // },
 

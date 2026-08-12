@@ -35,6 +35,7 @@ import {
   queryFields,
 } from '@mscomms/core';
 import { GitHubClient } from './client.js';
+import { ghToken } from './gh.js';
 
 export interface GitHubProviderOptions {
   /** Repositories as `owner/name`. */
@@ -108,15 +109,20 @@ export class GitHubProvider implements Provider {
 
   async init(): Promise<void> {
     const configured = this.#options.token;
+    // Order is a promise the config file makes: an explicit token, then the environment,
+    // then whatever `gh auth login` left in the keychain. Each step is more surprising than
+    // the last, so each only runs when the ones above it had nothing.
     const token =
       configured === undefined
-        ? (process.env['GITHUB_TOKEN'] ?? process.env['GH_TOKEN'])
+        ? (process.env['GITHUB_TOKEN'] ?? process.env['GH_TOKEN'] ?? (await ghToken()))
         : await this.#context.secret(configured);
 
     if (token === undefined || token.length === 0) {
       // Not fatal: public repositories work unauthenticated, just with a much smaller rate
       // limit. Refusing to start would make the tool unusable for a perfectly valid setup.
-      this.#context.logger.warn('GitHub mount has no token; using unauthenticated access (60 requests/hour)');
+      this.#context.logger.warn(
+        'GitHub mount has no token; using unauthenticated access (60 requests/hour). Set GH_TOKEN or run `gh auth login`.',
+      );
     }
 
     this.#client = new GitHubClient({

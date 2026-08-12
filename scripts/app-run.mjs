@@ -30,17 +30,21 @@
  * wants the line shell from the Run button gets it with MSCOMMS_RUN_TUI=0, and the binary's
  * own default is untouched — `npm start` and `mscomms` still land on the line shell.
  *
- * A pane needs something in it. On a checkout with no config file the tree is empty and the
- * pane opens on "(empty)", which reads as a broken build rather than an unconfigured one, so
- * this adds `--demo` when — and only when — nothing is mounted. Arguments are passed straight
- * through and suppress all of the above:
+ * A pane needs something in it, but the answer to an unconfigured machine is to say so, not
+ * to fill the tree with fixtures: sample data that appears without being asked for is
+ * indistinguishable from real data that is wrong, and a Run button that silently shows
+ * make-believe teaches you to distrust it. So this never adds `--demo` on its own. When
+ * nothing is mounted it prints how to connect a real account and opens the pane anyway,
+ * empty and honest. `MSCOMMS_RUN_DEMO=1` asks for the fixtures deliberately.
+ *
+ * Arguments are passed straight through and suppress all of the above:
  *
  *   node scripts/app-run.mjs                          the full-screen view
  *   node scripts/app-run.mjs --shell                  the line shell instead
  *   node scripts/app-run.mjs ls /mail/Inbox           one shot, then exit
  *
  * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the terminal check, MSCOMMS_RUN_TUI=0 falls
- * back to the line shell, MSCOMMS_RUN_DEMO=0/1 forces the sample mounts, MSCOMMS_RUN_BUILD=0
+ * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_BUILD=0
  * skips the rebuild, and MSCOMMS_RUN_SCRIPT points at a file of commands to use instead of
  * the built-in transcript.
  */
@@ -178,6 +182,26 @@ async function runTranscript(lines) {
   });
 }
 
+/**
+ * Tell someone with no sources how to get some.
+ *
+ * Written to stderr, which the full-screen view leaves alone: the alternate screen buffer
+ * would swallow anything on stdout the moment the pane opens, so a hint printed there would
+ * exist for a few milliseconds and then be gone. On stderr it stays in the scrollback and is
+ * still there after quitting, which is when someone actually goes looking for it.
+ */
+function explainEmpty() {
+  console.error('No sources are configured, so the pane will be empty.');
+  console.error('');
+  console.error('  npm start -- init          write a starter config, then uncomment a source');
+  console.error('  npm start -- doctor        check the config and the connections');
+  console.error('');
+  console.error('GitHub needs only GH_TOKEN or `gh auth login`; Outlook and Teams sign in');
+  console.error('interactively the first time you open them.');
+  console.error('Set MSCOMMS_RUN_DEMO=1 to browse sample data instead.');
+  console.error('');
+}
+
 async function main() {
   const built = await ensureBuilt();
   if (built !== 0) return built;
@@ -190,10 +214,11 @@ async function main() {
 
   const launch = [];
   if (flag('MSCOMMS_RUN_TUI', true)) launch.push('--tui');
-  // Only ask the config loader when nobody has already answered: the check costs a module
-  // load and a file read, and an explicit MSCOMMS_RUN_DEMO makes its answer irrelevant.
-  const demo = flag('MSCOMMS_RUN_DEMO', undefined) ?? !(await hasConfiguredMounts());
-  if (demo) launch.push('--demo');
+  // Fixtures only on request. Asking the config loader is still worth it when they were not
+  // requested, because an empty pane deserves an explanation — but the explanation is how to
+  // connect an account, not four folders of invented mail.
+  if (flag('MSCOMMS_RUN_DEMO', false)) launch.push('--demo');
+  else if (!(await hasConfiguredMounts())) explainEmpty();
 
   return spawnNode([BIN, ...launch], { stdio: 'inherit' });
 }
