@@ -138,9 +138,12 @@ describe('keys that reach the journal', () => {
     assert.deepEqual(step.effects, [{ kind: 'command', line: 'undo' }]);
   });
 
-  it('starts listening on the push-to-talk key', () => {
+  it('leaves the talk key alone, because a keypress reducer cannot see a key come up', () => {
+    // Push-to-talk moved out of this reducer deliberately. Its meaning depends on the
+    // release, which never reaches a keypress parser at all, so handling it here could only
+    // ever have produced a toggle wearing a hold's name. See tui-push-to-talk.test.ts.
     const step = reduce(browsing([node('Q3 budget review')]), { name: 'space', ctrl: true, sequence: '\u0000' });
-    assert.deepEqual(step.effects, [{ kind: 'listen' }]);
+    assert.deepEqual(step.effects, []);
   });
 
   it('navigates through the session so arrow-key moves are undoable too', () => {

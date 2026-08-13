@@ -429,6 +429,9 @@ Colour is decoration only. Everything shown in colour is also stated in words, s
 | `command` / `commandArgs` | string / string[] | — | Local binary for `engine: "command"`. WAV on stdin, transcript on stdout. |
 | `mode` | `"push"` \| `"continuous"` | `"push"` | `push` captures one utterance at a time; `continuous` listens until told to stop and requires `wakeWord`. |
 | `wakeWord` | string | — | Required prefix in continuous mode, so ambient speech is not obeyed. |
+| `pushToTalk` | `"auto"` \| `"hold"` \| `"toggle"` | `"auto"` | How the talk key behaves in the pane. `auto` holds where the terminal reports key releases and latches where it does not; `hold` insists; `toggle` never holds. |
+| `talkKey` | string | `ctrl+space` | The hold-to-talk key in the pane. **One modifier and one key**, e.g. `ctrl+t`, `alt+v`. A bare key is rejected: a terminal sends an unmodified key as the character it types, so there is no "held" to detect. Also rejected if it collides with a key the terminal sends the same bytes for — `ctrl+m` is Enter, `ctrl+i` is Tab, `ctrl+h` is Backspace, and `ctrl+c` / `ctrl+[` are the ways out of the pane. |
+| `releaseDelayMs` | number | 250 | Keep recording this long after the key comes up, so the last syllable is not clipped. `0` stops immediately. |
 | `maxSeconds` | number | 15 | Longest single utterance. |
 | `recorder` / `recorderArgs` | string / string[] | auto | Force a capture program rather than detecting one. |
 | `device` | string | — | Input device name passed to the recorder. |
@@ -436,8 +439,13 @@ Colour is decoration only. Everything shown in colour is also stated in words, s
 | `speak` | boolean | `false` | Read results back through the OS synthesizer. |
 
 `voice status` reports which engine resolved, whether the key reference resolved (without
-printing what it resolved to) and whether a recorder was found. `voice devices` lists the
-capture backends available on this machine.
+printing what it resolved to), whether a recorder was found, and how the talk key will
+behave. `voice devices` lists the capture backends available on this machine.
+
+Hold-to-talk needs a terminal that reports key releases, which is negotiated with the kitty
+keyboard protocol — kitty, foot, WezTerm, Ghostty, rio, Alacritty and Windows Terminal 1.25
+and later. Everywhere else the same key latches instead: press to start, press again to stop.
+See [VOICE.md](VOICE.md#push-to-talk).
 
 `mai` and `foundry` are two different APIs on the same Foundry resource. `mai` is the LLM
 Speech API that serves MAI-Transcribe — a different URL, request body and response shape

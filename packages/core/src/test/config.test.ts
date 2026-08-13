@@ -213,6 +213,40 @@ describe('validateConfig', () => {
     const config = validateConfig({});
     assert.deepEqual(config.mounts, []);
   });
+
+  it('accepts every voice engine the program offers, including the default', () => {
+    // This rejected "mai" while `starter-config.ts` recommended it and the docs named it as
+    // the default — so copying the program's own example into a config file made the program
+    // refuse to start. Enumerated here rather than spot-checked, because the failure was a
+    // list in one file drifting from a list in another.
+    for (const engine of ['mai', 'foundry', 'azure-speech', 'openai', 'xai', 'command']) {
+      assert.equal(validateConfig({ ...minimal, voice: { engine } }).voice.engine, engine);
+    }
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { engine: 'whisper' } }),
+      (error: unknown) => error instanceof VfsError && error.message.includes('whisper'),
+    );
+  });
+
+  it('refuses push-to-talk settings a config file cannot mean', () => {
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { pushToTalk: 'hodl' } }),
+      (error: unknown) => error instanceof VfsError && error.message.includes('hodl'),
+    );
+    // Negative is not a slower stop, it is a stop in the past.
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { releaseDelayMs: -1 } }),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { releaseDelayMs: 'soon' } }),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+    assert.equal(validateConfig({ ...minimal, voice: { releaseDelayMs: 0 } }).voice.releaseDelayMs, 0);
+    for (const mode of ['auto', 'hold', 'toggle']) {
+      assert.equal(validateConfig({ ...minimal, voice: { pushToTalk: mode } }).voice.pushToTalk, mode);
+    }
+  });
 });
 
 describe('resolveAppPaths', () => {

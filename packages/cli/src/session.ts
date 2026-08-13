@@ -44,6 +44,7 @@ import {
   type VoiceConfig,
 } from '@mscomms/core';
 import { DEFAULT_FORMAT, type FormatOptions, type OutputMode } from './format.js';
+import { DEFAULT_TALK_KEY, PLAIN_KEY_CONFLICT, describeTalkKey, parseTalkKey, talkKeyConflict } from './tui/keyboard.js';
 
 export interface SessionOptions {
   readonly config: AppConfig;
@@ -225,6 +226,53 @@ export class Session {
         return `voice.engine is ${value} for this session.`;
       }
 
+      case 'pushToTalk': {
+        const modes = ['auto', 'hold', 'toggle'] as const;
+        if (!modes.includes(value as (typeof modes)[number])) {
+          throw new Error('voice.pushToTalk is "auto", "hold" or "toggle".');
+        }
+        settings.pushToTalk = value as (typeof modes)[number];
+        return `voice.pushToTalk is ${value} for this session.`;
+      }
+
+      case 'releaseDelayMs': {
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms < 0) {
+          throw new Error('voice.releaseDelayMs is a number of milliseconds, zero or more.');
+        }
+        settings.releaseDelayMs = ms;
+        return `voice.releaseDelayMs is ${String(ms)} for this session.`;
+      }
+
+      case 'talkKey': {
+        // Validated here rather than at first press, because a key that cannot be parsed
+        // fails by doing nothing at all — the worst way for a settings mistake to show up.
+        if (value === '') {
+          delete settings.talkKey;
+          return `voice.talkKey is back to ${describeTalkKey(DEFAULT_TALK_KEY)} for this session.`;
+        }
+        const spec = parseTalkKey(value);
+        if (spec === undefined) {
+          const conflict = talkKeyConflict(value);
+          if (conflict !== undefined) {
+            // Two different mistakes, two different fixes. Telling someone who typed `t` to
+            // pick another key sends them to `v`, then `b`, each failing identically.
+            const advice =
+              conflict === PLAIN_KEY_CONFLICT
+                ? `Add a modifier — ${value} on its own is fine as ctrl+${value} or alt+${value}.`
+                : 'Pick another key.';
+            throw new Error(
+              `${value} cannot be the talk key: a terminal sends it as ${conflict}, so the two cannot be told apart. ${advice}`,
+            );
+          }
+          throw new Error(
+            `I cannot read "${value}" as a key. Write it like ctrl+space, ctrl+t or alt+v — one modifier and one key.`,
+          );
+        }
+        settings.talkKey = value;
+        return `voice.talkKey is ${describeTalkKey(spec)} for this session. It applies to the next pane you open.`;
+      }
+
       case 'recorder':
       case 'device':
       case 'wakeWord':
@@ -243,7 +291,7 @@ export class Session {
 
       default:
         throw new Error(
-          `There is no voice setting called "${key}". Try autoRun, speak, phraseBias, recorder, device, wakeWord, mode, language, maxSeconds, engine, endpoint or model.`,
+          `There is no voice setting called "${key}". Try autoRun, speak, phraseBias, recorder, device, wakeWord, mode, language, maxSeconds, engine, endpoint, model, pushToTalk, talkKey or releaseDelayMs.`,
         );
     }
   }

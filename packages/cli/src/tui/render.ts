@@ -36,6 +36,22 @@ import type { TuiState } from './state.js';
 export interface RenderOptions extends FormatOptions {
   readonly columns: number;
   readonly rows: number;
+  /**
+   * The talk key as the user would say it, when it is not the default.
+   *
+   * Passed in rather than read from config here, because rendering stays a pure function of
+   * its arguments — that is what lets every screen in this pane be tested by comparing
+   * strings.
+   */
+  readonly talkKey?: string;
+  /**
+   * Whether this terminal can report key releases, once it has answered.
+   *
+   * Drives one sentence on the help screen, and it is a sentence worth getting right: on a
+   * terminal that cannot report releases, "hold to talk" is an instruction that silently does
+   * not work, and the user has no way to discover why.
+   */
+  readonly holdSupported?: boolean;
 }
 
 /** Rows consumed by furniture: title, rule, rule, status, input. */
@@ -99,7 +115,10 @@ export function render(state: TuiState, options: RenderOptions): string[] {
 export function statusLine(state: TuiState): string {
   switch (state.voice.phase) {
     case 'listening':
-      return `[MIC ON] ${state.status}`;
+      // The status line is what a screen reader speaks, so the fact that decides the user's
+      // next move — whether letting go of the key ends the recording — is spoken, not left
+      // to the coloured chip in the input bar, which they may not be able to see.
+      return state.voice.hold === 'latched' ? `[MIC ON, LOCKED] ${state.status}` : `[MIC ON] ${state.status}`;
     case 'transcribing':
       return `[MIC …] ${state.status}`;
     case 'off':
@@ -175,11 +194,59 @@ function renderPreview(state: TuiState, width: number, body: number, options: Re
   return rows;
 }
 
+/**
+ * The microphone chip that sits at the left of the input bar.
+ *
+ * This is the answer to "is this thing recording me right now?", and it is in the input bar
+ * rather than only in the status line because the input bar is the one row a user is already
+ * looking at while they decide whether to speak — the status line is where the program talks
+ * about what it just did.
+ *
+ * It is words, not a coloured dot, for the same reason everything else here is: the people
+ * most likely to be driving this program by voice are the least likely to be able to see a
+ * red circle. `LIVE` and `LOCKED` are also different lengths, so the row changes shape as
+ * well as colour, which is visible in peripheral vision and survives a monochrome terminal.
+ *
+ * Returns an empty string when voice has never been turned on. A permanent `MIC OFF` on a
+ * row that exists to show what you are typing is clutter charged to every user, including
+ * everyone who will never say a word to this program.
+ */
+export function voiceChip(state: TuiState): string {
+  switch (state.voice.phase) {
+    case 'off':
+      return '';
+    case 'listening':
+      return state.voice.hold === 'latched' ? '[MIC LIVE - LOCKED]' : '[MIC LIVE]';
+    case 'transcribing':
+      return '[MIC WORKING]';
+    case 'error':
+      return '[MIC FAILED]';
+    case 'idle':
+    case 'heard':
+      return '[MIC READY]';
+  }
+}
+
+function chipColor(state: TuiState): 'red' | 'yellow' | 'dim' {
+  switch (state.voice.phase) {
+    case 'listening':
+      return 'red';
+    case 'error':
+      return 'yellow';
+    default:
+      return 'dim';
+  }
+}
+
 function inputLine(state: TuiState, width: number, options: RenderOptions): string {
   // The block is a cursor stand-in; the app parks the real cursor here too, so a terminal
   // that reports cursor position to an assistive tool reports the position that matters.
-  if (state.mode === 'filter') return fit(`Filter: ${state.filter}\u2588`, width);
-  if (state.mode === 'command') return fit(`: ${state.command}\u2588`, width);
+  const chip = voiceChip(state);
+  const room = chip === '' ? width : Math.max(0, width - displayWidth(chip) - 1);
+  const painted = chip === '' ? '' : `${paint(chip, chipColor(state), options.color)} `;
+
+  if (state.mode === 'filter') return painted + fit(`Filter: ${state.filter}\u2588`, room);
+  if (state.mode === 'command') return painted + fit(`: ${state.command}\u2588`, room);
 
   // `/` appears in both hints. It is now the only way into a filter, so it has to be on
   // screen in every state it works in — which is both panes.
@@ -187,7 +254,7 @@ function inputLine(state: TuiState, width: number, options: RenderOptions): stri
     state.pane === 'preview'
       ? 'Tab list   Up/Down scroll   / filter   : command   ? help   q quit'
       : 'Enter open   Backspace up   / filter   : command   ? help   q quit';
-  return paint(fit(hint, width), 'dim', options.color);
+  return painted + paint(fit(hint, room), 'dim', options.color);
 }
 
 /**
@@ -198,6 +265,14 @@ function inputLine(state: TuiState, width: number, options: RenderOptions): stri
  */
 export function renderHelp(options: RenderOptions): string[] {
   const width = Math.max(24, options.columns);
+  const talkKey = options.talkKey ?? 'Ctrl+Space';
+  // The key's own line describes the gesture that actually works here. Printing "hold to
+  // talk" on a terminal that cannot report a release would be documenting a feature the user
+  // is about to find missing, which is worse than not offering it.
+  const talkHelp =
+    options.holdSupported === false
+      ? 'press to talk, press again to stop \u2014 this terminal cannot report key releases'
+      : 'hold to talk: speak while held, tap to lock it on (needs `voice on`)';
   const keys: readonly (readonly [string, string])[] = [
     ['Up / Down, j / k', 'move the selection'],
     ['PageUp / PageDown', 'move by a screenful'],
@@ -209,7 +284,7 @@ export function renderHelp(options: RenderOptions): string[] {
     [':', 'run any command \u2014 ls, find, grep, cat, open, mark, watch\u2026'],
     ['r, F5', 'refresh the current folder'],
     ['u', 'undo the last change (anywhere \u2014 pane, shell, or voice)'],
-    ['Ctrl+Space', 'push to talk: speak one command (needs `voice on`)'],
+    [talkKey, talkHelp],
     ['?', 'this screen'],
     ['Ctrl+C', 'always works, from any mode, even mid-filter'],
     ['q, Escape', 'leave (the folder and selection are printed on the way out)'],

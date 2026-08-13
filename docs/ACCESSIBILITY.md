@@ -370,9 +370,24 @@ means the audio was silent — a muted or unselected microphone. The second mean
 and matched nothing — a phrasing problem. Different causes, different fixes, so collapsing
 them into one message would send half the users to the wrong place.
 
-**The microphone indicator is words, not colour.** `[MIC ON]` and `[MIC …]`, following the
-colour-is-never-information rule, which matters more here than anywhere else: the people most
-likely to be driving this by voice are the least likely to be able to see a coloured dot.
+**The microphone indicator is words, not colour.** `[MIC LIVE]`, `[MIC WORKING]`,
+`[MIC FAILED]`, following the colour-is-never-information rule, which matters more here than
+anywhere else: the people most likely to be driving this by voice are the least likely to be
+able to see a coloured dot. `[MIC LIVE]` and `[MIC LIVE - LOCKED]` are different lengths too,
+so the row changes shape as well as colour. It sits on the prompt in the line shell and in
+the input bar in the pane — the row the cursor is already on, in both cases, because "am I
+being recorded right now?" must not require running a command to find out.
+
+**Hold-to-talk is never the only way to talk.** Holding `Ctrl+Space` through a sentence is
+the primary gesture, but a quick tap latches the microphone on until the next tap. Holding a
+key steadily is exactly the thing a tremor, a splint or a single-handed setup makes
+unreliable, so the gesture that is hardest to perform has an equivalent that is not. The same
+tap-to-latch behaviour is what you get automatically on a terminal that cannot report key
+releases, so no user is ever left without a working way in.
+
+**The indicator only appears while the microphone is open.** A permanent `[MIC OFF]` on the
+prompt would be re-read by a screen reader on every keystroke, forever, to convey the absence
+of a thing — a running cost charged to every user in exchange for nothing.
 
 `command <anything>` runs what follows verbatim, checked before normalization so punctuation
 and capitalization survive. Somebody who already knows the shell should not have to discover

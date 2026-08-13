@@ -30,7 +30,7 @@ import { dirname, join } from 'node:path';
 import { vpath } from '@mscomms/core';
 import { Completer } from './completion.js';
 import { Dispatcher } from './dispatch.js';
-import { relativeTime, sanitizeForDisplay } from './format.js';
+import { relativeTime, paint, sanitizeForDisplay } from './format.js';
 import type { Session } from './session.js';
 import type { CommandTable } from './commands/types.js';
 
@@ -50,6 +50,14 @@ export class Shell {
   readonly #dispatcher: Dispatcher;
   readonly #historyFile: string;
   #rl: Interface | undefined;
+  /**
+   * Whether the microphone is open right now.
+   *
+   * Held here so the prompt can say so. The prompt is this interface's input bar — it is the
+   * row the cursor is sitting on — and "am I being recorded?" is a question that has to be
+   * answerable without running a command to ask.
+   */
+  #voicePhase: 'off' | 'listening' | 'transcribing' = 'off';
 
   constructor(private readonly options: ShellOptions) {
     this.#session = options.session;
@@ -172,6 +180,21 @@ export class Shell {
       promptAgain(true);
     });
 
+    // The microphone indicator on the prompt. Redrawn with the cursor preserved, so the
+    // indicator can appear and disappear underneath a half-typed line without eating it.
+    //
+    // Only a change is redrawn. Voice emits a run of events per utterance, and repainting
+    // the prompt for each one would make a screen reader read the line again every time,
+    // which is precisely the announcement storm the line shell exists to avoid.
+    const unsubscribeVoice = session.subscribe((event) => {
+      if (event.kind !== 'voice') return;
+      const phase =
+        event.phase === 'listening' ? 'listening' : event.phase === 'transcribing' ? 'transcribing' : 'off';
+      if (phase === this.#voicePhase) return;
+      this.#voicePhase = phase;
+      promptAgain(true);
+    });
+
     promptAgain();
 
     /**
@@ -233,6 +256,7 @@ export class Shell {
     }
 
     unsubscribe();
+    unsubscribeVoice();
     session.voice?.stop();
     rl.close();
     return 0;
@@ -255,13 +279,25 @@ export class Shell {
    * screen reader on every keystroke in some configurations, so the current folder is
    * abbreviated to its last component rather than shown in full — `pwd` gives the full
    * path on demand.
+   *
+   * The one thing allowed to make it longer is a live microphone. That earns its place
+   * because it is not decoration: it is the difference between a program that is listening
+   * and one that is not, on the row the user is already looking at. It appears only while
+   * the microphone is actually open, so a user who never speaks to this program never pays
+   * for it — and the same rule means a screen reader only reads the extra words during the
+   * seconds when they are the most important thing on the line.
    */
   #prompt(): string {
     const session = this.#session;
     const configured = session.config.ui.prompt;
-    if (configured !== undefined) return configured;
     const where = session.cwd === vpath.ROOT ? '/' : vpath.basename(session.cwd);
-    return `${where}> `;
+    const base = configured ?? `${where}> `;
+    if (this.#voicePhase === 'off') return base;
+    // Words, not a coloured dot, and painted only if colour is on — the distinction has to
+    // survive a monochrome terminal and a screen reader, both of which see none of the paint.
+    const chip = this.#voicePhase === 'listening' ? '[MIC LIVE]' : '[MIC WORKING]';
+    const color = this.#voicePhase === 'listening' ? 'red' : 'dim';
+    return `${paint(chip, color, session.format.color)} ${base}`;
   }
 
   #banner(): void {

@@ -10,7 +10,8 @@ That constraint is the whole design. Everything below follows from it.
 ```
 Inbox> voice on
 Voice is on, push-to-talk.
-Say one thing at a time with `voice once`, or hold Ctrl+Space in the pane.
+Say one thing at a time with `voice once`, or hold Ctrl+Space in the pane and speak while you hold it.
+Tapping Ctrl+Space instead locks the microphone on until you tap it again.
 Say "what can I say" for the phrase list, or "stop listening" to finish.
 
   (you) "go to the inbox"
@@ -261,11 +262,123 @@ Reads and view changes are recorded but not undoable — there is nothing to rev
 putting them on the stack would mean `undo` often did nothing visible, which teaches people
 that undo is unreliable.
 
+## Push-to-talk
+
+Hold `Ctrl+Space` in the pane, speak, and let go. That is the Discord gesture, and it works
+here for the same reason it works there: an open microphone in a program that has your mail
+open is a privacy problem, and a key you are physically holding is the clearest possible
+statement of "record me now".
+
+Terminals make this harder than it sounds. A terminal tells a program that a key went down
+and never that it came back up, which is why almost every "push-to-talk" in a terminal is
+really a toggle wearing a hold's clothing — including this one, until recently, in a help
+line that said "hold Ctrl+Space" when holding it did nothing.
+
+The fix is the [kitty keyboard
+protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), which lets a program ask the
+terminal to report key releases. It is negotiated with escape codes, so it costs no
+dependency. Terminals that implement it include kitty, foot, WezTerm, Ghostty, rio, Alacritty
+and Windows Terminal 1.25 and later.
+
+**Anywhere else, the same key still works — it just latches.** Press to start, press again to
+stop. This is not a separate code path or a fallback that had to be detected and switched to:
+holding is "start on press, stop on release", and a terminal that never sends a release
+simply never sends the stop. `voice status` says which of the two you are getting:
+
+```
+  Talk key: Ctrl+Space in the pane — hold to talk, tap to lock the microphone on
+  Release:  keeps recording 250ms after the key comes up
+```
+
+**A quick tap locks the microphone on**, until you tap again. Holding a key through a long
+sentence is tiring, and it is worse if a hand tremor makes holding a key steadily unreliable
+— so the gesture that is hardest to perform is never the only way in. Anything under 350ms
+counts as a tap.
+
+**Recording continues for 250ms after you let go.** Discord uses about 20ms. This uses more
+because of what the audio is for: letting go on the last word of "archive this" gives the
+recognizer "archive thi", and this program then correctly refuses a command it did not
+understand — leaving the user to conclude the microphone is broken. A quarter of a second per
+utterance buys the end of every sentence.
+
+The input bar shows what is happening, in words:
+
+| In the bar | Meaning |
+|---|---|
+| nothing | Voice has never been turned on |
+| `[MIC READY]` | On, not recording |
+| `[MIC LIVE]` | Recording right now |
+| `[MIC LIVE - LOCKED]` | Recording, latched on until you tap again |
+| `[MIC WORKING]` | Recording finished, audio being transcribed |
+| `[MIC FAILED]` | The last attempt did not work; `voice status` says why |
+
+It is words rather than a coloured dot, and `LIVE` and `LOCKED` are different lengths, so the
+row changes shape as well as colour. The people most likely to be driving this program by
+voice are the least likely to be able to see a red circle.
+
+The line shell shows the same thing on the prompt, because the prompt is its input bar:
+
+```
+[MIC LIVE] Inbox>
+```
+
+It appears only while the microphone is open. A permanent `[MIC OFF]` would be clutter
+charged to every user, including everyone who will never say a word to this program — and on
+a screen reader, an indicator on the prompt is re-read on every keystroke.
+
+Four settings control it:
+
+```jsonc
+"voice": {
+  "pushToTalk": "auto",     // or "hold" to insist, "toggle" to never hold
+  "talkKey": "ctrl+space",  // one modifier and one key
+  "releaseDelayMs": 250,    // 0 stops the instant the key comes up
+}
+```
+
+Some keys are refused, and the refusal names the key that is in the way:
+
+```
+/> set voice.talkKey ctrl+m
+ctrl+m cannot be the talk key: a terminal sends it as Enter, so the two cannot be told apart. Pick another key.
+/> set voice.talkKey ctrl+i
+ctrl+i cannot be the talk key: a terminal sends it as Tab, so the two cannot be told apart. Pick another key.
+/> set voice.talkKey ctrl+t
+voice.talkKey is Ctrl+T for this session. It applies to the next pane you open.
+```
+
+This is not a policy, it is arithmetic. A terminal sends `Ctrl+M` as byte 13, and byte 13 is
+also exactly what Enter sends; nothing downstream can tell them apart. Taking `ctrl+m` as the
+talk key would mean every Enter opened the microphone and no Enter ever submitted a line. The
+same collision rules out `ctrl+i` (Tab), `ctrl+h` (Backspace) and `ctrl+j`. `ctrl+c` and
+`ctrl+[` are refused for a nearby reason: they are the two ways out of the pane, and a talk
+key that ate them would trade your escape hatch for a microphone.
+
+A key with no modifier at all is refused for a different reason, and the message says so
+rather than repeating "pick another key" at someone whose next three guesses would fail
+identically:
+
+```
+/> set voice.talkKey t
+t cannot be the talk key: a terminal sends it as ordinary typed text, so the two cannot be told apart. Add a modifier — t on its own is fine as ctrl+t or alt+t.
+```
+
+A terminal has no way to tell you that an unmodified key is being *held*: it sends the
+character, once per repeat, exactly as if it were being typed. There is no press and no
+release to find. So a bare talk key would never open the microphone — and would go on doing
+whatever that key already does, which for `q` means quitting the pane.
+
 ## In the full-screen pane
 
-`Ctrl+Space` is push-to-talk for one command. `u` undoes. The status line says `[MIC ON]` or
-`[MIC …]` in words, not as a coloured dot — the people most likely to be using voice control
-are the least likely to be able to see one.
+`Ctrl+Space` is push-to-talk, as above. `u` undoes. The status line says `[MIC ON]` or
+`[MIC ON, LOCKED]` in words, not as a coloured dot — the people most likely to be using voice
+control are the least likely to be able to see one.
+
+One honest asymmetry: the *gesture* only exists in the pane, because holding a key requires
+raw key input and the line shell deliberately hands its input to readline instead. The
+*capability* exists in both — `voice on` and `voice once` work identically in the shell, and
+the microphone indicator appears on the prompt either way. If you want hold-to-talk, that is
+the one thing the pane does that the shell does not.
 
 The pane stays in step because it does not maintain its own idea of where you are. Anything
 that changes the world announces it, and the pane folds that announcement into its state.
@@ -286,6 +399,9 @@ the same journaled navigation a typed `cd` does, rather than assigning to a fiel
 | `command` / `commandArgs` | — | Local binary for `engine: "command"` |
 | `mode` | `push` | `continuous` listens until told to stop, and needs `wakeWord` |
 | `wakeWord` | — | Required prefix in continuous mode |
+| `pushToTalk` | `auto` | `hold` insists on hold-to-talk, `toggle` never uses it |
+| `talkKey` | `ctrl+space` | The hold-to-talk key in the pane |
+| `releaseDelayMs` | `250` | Keep recording this long after the key comes up |
 | `maxSeconds` | `15` | Longest single utterance |
 | `recorder` / `device` | auto | Force a capture program or input device |
 | `autoRun` | `false` | Skip confirmation for mutating commands |
@@ -301,11 +417,14 @@ on` — which matters, because "off" is usually the state you are trying to get 
 ```
 /> voice status
 Voice is off. Turn it on with `voice on`.
-  Engine:   foundry
+  Engine:   mai
   Endpoint: not set
   Key:      not set — add "apiKey": "${env:NAME}" to the config file
   Confirm:  on for anything that changes something
+  Bias:     on — names on screen are sent as recognition hints
   Recorder: none found — install ffmpeg or sox, or `set voice.recorder <program>`
+  Talk key: Ctrl+Space in the pane — hold to talk, tap to lock the microphone on
+  Release:  keeps recording 250ms after the key comes up
 ```
 
 The key line says whether the `${env:NAME}` reference resolved, never what it resolved to.

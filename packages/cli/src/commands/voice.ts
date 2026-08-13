@@ -25,6 +25,8 @@ import {
 } from '@mscomms/voice';
 import { Dispatcher } from '../dispatch.js';
 import { sanitizeForDisplay } from '../format.js';
+import { DEFAULT_TALK_KEY, describeTalkKey, parseTalkKey, talkKeyConflict } from '../tui/keyboard.js';
+import { PUSH_TO_TALK_DEFAULTS } from '../tui/push-to-talk.js';
 import { VoiceService } from '../voice-service.js';
 import type { Session } from '../session.js';
 import type { Command, CommandArgs, CommandTable } from './types.js';
@@ -81,8 +83,9 @@ export function voiceCommands(table: CommandTable): readonly Command[] {
     detail: [
       'Subcommands:',
       '',
-      '  voice on         Start listening. Push-to-talk by default: press Ctrl+Space in the',
-      '                   pane, or run `voice once`, for each thing you want to say.',
+      '  voice on         Start listening. Push-to-talk by default: hold Ctrl+Space in the',
+      '                   pane and speak, tap it to lock the microphone on, or run',
+      '                   `voice once` for a single phrase.',
       '  voice off        Stop listening and release the microphone.',
       '  voice once       Record one phrase and act on it.',
       '  voice say <...>  Run a phrase through the voice grammar without a microphone.',
@@ -153,6 +156,7 @@ export function voiceCommands(table: CommandTable): readonly Command[] {
           // something to record with. Awaited here rather than folded into `describe()`,
           // which stays synchronous because the pane footer redraws with it.
           session.print(await recorderLine(session));
+          for (const line of pushToTalkLine(session)) session.print(line);
           return;
 
         case 'help':
@@ -189,10 +193,16 @@ async function startListening(session: Session, service: VoiceService, continuou
   const mode = continuous || session.voiceSettings.mode === 'continuous';
 
   if (!mode) {
+    const key = describeTalkKey(
+      session.voiceSettings.talkKey === undefined
+        ? DEFAULT_TALK_KEY
+        : (parseTalkKey(session.voiceSettings.talkKey) ?? DEFAULT_TALK_KEY),
+    );
     session.print(
       [
         'Voice is on, push-to-talk.',
-        'Say one thing at a time with `voice once`, or hold Ctrl+Space in the pane.',
+        `Say one thing at a time with \`voice once\`, or hold ${key} in the pane and speak while you hold it.`,
+        `Tapping ${key} instead locks the microphone on until you tap it again.`,
         'Say "what can I say" for the phrase list, or "stop listening" to finish.',
       ].join('\n'),
     );
@@ -261,6 +271,74 @@ async function recorderLine(session: Session): Promise<string> {
     }
     throw error;
   }
+}
+
+/**
+ * How the talk key is set up, and — the part people actually need — whether holding it will
+ * work here.
+ *
+ * Stated plainly rather than optimistically. Whether a terminal reports key releases is not
+ * something a user can be expected to know, and it is the difference between "hold to talk"
+ * and "press to start, press to stop". Reported for the current terminal, since that is the
+ * one the answer is about, and hedged when there is no terminal at all — a pipe cannot be
+ * asked, and guessing would be worse than saying so.
+ */
+function pushToTalkLine(session: Session): readonly string[] {
+  const config = session.voiceSettings;
+  const configured = config.talkKey === undefined ? undefined : parseTalkKey(config.talkKey);
+  const spec = configured ?? DEFAULT_TALK_KEY;
+  const mode = config.pushToTalk ?? PUSH_TO_TALK_DEFAULTS.mode;
+  const delay = Math.max(0, config.releaseDelayMs ?? PUSH_TO_TALK_DEFAULTS.releaseDelayMs);
+  const key = describeTalkKey(spec);
+  const held = mode !== 'toggle' && !(mode === 'auto' && terminalReportsKeyReleases() === false);
+
+  // `set voice.talkKey` refuses a key it cannot use, but a config file is edited by hand and
+  // is not offered that refusal. The fallback would otherwise be invisible: a key pressed
+  // repeatedly while nothing happens, and a config file that plainly says which key it
+  // should be. This is the one place that can say the two disagree.
+  const rejected: string[] = [];
+  if (config.talkKey !== undefined && configured === undefined) {
+    const conflict = talkKeyConflict(config.talkKey);
+    const why = conflict === undefined ? 'which I cannot read as a key' : `which a terminal sends as ${conflict}`;
+    rejected.push(`  Note:     voice.talkKey in your config is "${config.talkKey}", ${why}. Using ${key} instead.`);
+  }
+
+  if (!held) {
+    const why =
+      mode === 'toggle'
+        ? 'voice.pushToTalk is set to toggle'
+        : 'this terminal cannot report key releases, so holding is not available';
+    return [
+      `  Talk key: ${key} in the pane — press to start, press again to stop`,
+      `  Release:  ${why}`,
+      ...rejected,
+    ];
+  }
+
+  return [
+    `  Talk key: ${key} in the pane — hold to talk, tap to lock the microphone on`,
+    delay > 0
+      ? `  Release:  keeps recording ${String(delay)}ms after the key comes up`
+      : '  Release:  stops the moment the key comes up',
+    ...rejected,
+  ];
+}
+
+/**
+ * A guess at whether the terminal will report key releases, from what it says it is.
+ *
+ * A guess and not an answer: the real test is asking the terminal and waiting for a reply,
+ * which the pane does and a status line cannot — `voice status` returns in the time it takes
+ * to print, and blocking it on an escape-code round trip to report a nicety would be a bad
+ * trade. So this errs toward saying nothing: `undefined` means "no opinion", and only a
+ * confident no is reported, because telling somebody hold will not work when it would is
+ * worse than staying quiet.
+ */
+function terminalReportsKeyReleases(): boolean | undefined {
+  if (process.env['TERM'] === 'dumb') return false;
+  const program = process.env['TERM_PROGRAM']?.toLowerCase() ?? '';
+  if (program === 'apple_terminal' || program === 'vscode') return false;
+  return undefined;
 }
 
 async function reportDevices(session: Session): Promise<void> {

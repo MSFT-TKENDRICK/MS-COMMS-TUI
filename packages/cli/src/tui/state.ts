@@ -61,6 +61,15 @@ export interface TuiState {
 export interface VoiceIndicator {
   readonly phase: 'off' | 'idle' | 'listening' | 'transcribing' | 'heard' | 'error';
   readonly text: string;
+  /**
+   * How the recording was started, when one is running.
+   *
+   * Separate from `phase` because "the microphone is open" and "letting go of the key will
+   * close it" are different facts, and the second is the one a user needs before they decide
+   * whether it is safe to stop holding the key. Conflating them is how a user ends up
+   * whispering the rest of a sentence to a microphone that stopped listening.
+   */
+  readonly hold: 'none' | 'holding' | 'latched';
 }
 
 export type Effect =
@@ -102,7 +111,7 @@ export function initialState(cwd: string, rows = 20): TuiState {
     status: 'Loading…',
     busy: true,
     exiting: false,
-    voice: { phase: 'off', text: '' },
+    voice: { phase: 'off', text: '', hold: 'none' },
     rows,
   };
 }
@@ -159,7 +168,12 @@ export function applySessionEvent(state: TuiState, event: SessionEvent): Step {
               : event.phase === 'error'
                 ? `Voice error: ${text}`
                 : state.status;
-      return { state: { ...state, voice: { phase: event.phase, text }, status }, effects: [] };
+      // The hold only means anything while the microphone is actually open. Once we are
+      // transcribing or idle there is no key to let go of, and leaving a stale "locked" on
+      // screen would tell the user to press a key that now starts a recording instead of
+      // ending one.
+      const hold = event.phase === 'listening' ? state.voice.hold : 'none';
+      return { state: { ...state, voice: { phase: event.phase, text, hold }, status }, effects: [] };
     }
 
     case 'listing':
@@ -391,15 +405,11 @@ function reduceBrowse(state: TuiState, key: Key): Step {
       break;
   }
 
-  // Ctrl+Space is push-to-talk. Chosen because it is not a character, so it cannot collide
-  // with typeahead, and because it is reachable one-handed — which matters for the users
-  // most likely to be reaching for voice control in the first place.
-  if (key.ctrl === true && (key.name === 'space' || key.sequence === ' ' || key.sequence === '\u0000')) {
-    if (state.voice.phase === 'listening') {
-      return { state: { ...state, status: 'Stopping…' }, effects: [{ kind: 'command', line: 'voice off' }] };
-    }
-    return { state: { ...state, status: 'Listening…' }, effects: [{ kind: 'listen' }] };
-  }
+  // The talk key is deliberately absent from this reducer. It is the one key whose meaning
+  // depends on when it comes *up*, so it is handled on the raw input stream in `app.ts` —
+  // both because releases never reach a keypress parser, and because a release must be acted
+  // on while a recording is in flight, which is exactly when the pane drops ordinary keys.
+  // See `push-to-talk.ts` for the state machine and `keyboard.ts` for how releases arrive.
 
   // `/`, `:` and `?` are matched by sequence because they are punctuation, and terminals
   // report punctuation key names inconsistently.
@@ -503,6 +513,18 @@ export function withError(state: TuiState, message: string): TuiState {
 
 export function withRows(state: TuiState, rows: number): TuiState {
   return clampSelection({ ...state, rows: Math.max(1, rows) }, state.selected);
+}
+
+/**
+ * Record whether the open microphone is being held or has been latched.
+ *
+ * Set from the talk key rather than inferred from the voice phase, because only the key
+ * knows which of the two it is — and the indicator that tells the user whether letting go
+ * will stop the recording must not be a guess.
+ */
+export function withVoiceHold(state: TuiState, hold: VoiceIndicator['hold']): TuiState {
+  if (state.voice.hold === hold) return state;
+  return { ...state, voice: { ...state.voice, hold } };
 }
 
 // ---------------------------------------------------------------------------

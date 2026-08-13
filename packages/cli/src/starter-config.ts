@@ -282,6 +282,27 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     // "mode": "continuous",
     // "wakeWord": "computer",
 
+    // Push-to-talk in the --tui pane, the way it works in Discord: hold the key
+    // and speak, let go and it stops. Holding needs a terminal that reports key
+    // releases (kitty, foot, WezTerm, Ghostty, rio, Alacritty, Windows Terminal
+    // 1.25+); anywhere else the same key presses to start and presses again to
+    // stop, which "auto" falls back to on its own. Force it with "hold" or
+    // "toggle" if you would rather it never changed under you.
+    // "pushToTalk": "auto",
+    // One modifier and one key — the modifier is not optional, because a terminal
+    // sends an unmodified key as ordinary typed text and cannot report it being
+    // held. A few Ctrl combinations are refused too, because the terminal sends
+    // them as another key entirely — ctrl+m is Enter, ctrl+i is Tab, ctrl+h is
+    // Backspace — and ctrl+c and ctrl+[ are the ways out of the pane. Setting one
+    // of those tells you which key is in the way.
+    // "talkKey": "ctrl+space",
+
+    // Keep recording for this long after the key comes up. Discord uses about
+    // 20ms; this defaults to 250 because letting go on the last word of "archive
+    // this" gives a recognizer "archive thi", and the command is then correctly
+    // refused for a reason that looks like a broken microphone.
+    // "releaseDelayMs": 250,
+
     // Read results back through the operating system's own synthesizer. Never a
     // cloud voice: subject lines have no business on a network, and a screen
     // reader user already has a voice they have configured.

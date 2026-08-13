@@ -22,6 +22,8 @@ import { resolveVoiceSettings } from '@mscomms/voice';
 
 import { Session } from '../session.js';
 import { VoiceService } from '../voice-service.js';
+import { CommandTable } from '../commands/types.js';
+import { voiceCommands } from '../commands/voice.js';
 
 function tmp(name: string): string {
   return `${process.cwd()}/.test-tmp/voice-settings/${name}`;
@@ -188,6 +190,121 @@ describe('clearing a setting', () => {
     session.setVoiceOption('recorder', '');
     assert.equal(session.voiceSettings.recorder, undefined);
     assert.equal(session.config.voice.recorder, 'sox');
+  });
+});
+
+describe('push-to-talk settings', () => {
+  it('takes the three modes and refuses anything else', () => {
+    const session = sessionWith();
+    for (const mode of ['auto', 'hold', 'toggle'] as const) {
+      session.setVoiceOption('pushToTalk', mode);
+      assert.equal(session.voiceSettings.pushToTalk, mode);
+    }
+    assert.throws(() => session.setVoiceOption('pushToTalk', 'hodl'), /"auto", "hold" or "toggle"/);
+  });
+
+  it('validates the talk key when it is set, not when it is first pressed', () => {
+    // A key that cannot be parsed fails by doing nothing at all. Accepting it here would
+    // mean the mistake surfaces later, as a hold that silently does not work, with nothing
+    // on screen connecting the two.
+    const session = sessionWith();
+    assert.throws(() => session.setVoiceOption('talkKey', 'ctrl+spcae'), /cannot read/);
+    assert.equal(session.voiceSettings.talkKey, undefined);
+  });
+
+  it('echoes the key back in the spelling the help screen uses', () => {
+    // "ctrl+t" in, "Ctrl+T" out. The confirmation should match what the user will go looking
+    // for on the help screen, or the two read as different keys.
+    const session = sessionWith();
+    assert.match(session.setVoiceOption('talkKey', 'ctrl+t'), /Ctrl\+T/);
+    assert.equal(session.voiceSettings.talkKey, 'ctrl+t');
+  });
+
+  it('clears back to the default key by name, not silently', () => {
+    const session = sessionWith({ talkKey: 'alt+v' });
+    assert.match(session.setVoiceOption('talkKey', ''), /Ctrl\+Space/);
+    assert.equal(session.voiceSettings.talkKey, undefined);
+  });
+
+  it('refuses a key the terminal cannot tell apart from Enter, and says which key is in the way', () => {
+    // Ctrl+M is the byte Enter sends. Taken as the talk key, the pane would open the
+    // microphone on every Enter and never submit a line — a config that looks accepted and
+    // breaks the one key nobody can work without.
+    const session = sessionWith();
+    assert.throws(() => session.setVoiceOption('talkKey', 'ctrl+m'), /sends it as Enter/);
+    assert.equal(session.voiceSettings.talkKey, undefined);
+
+    for (const [key, blocked] of [
+      ['ctrl+i', /Tab/],
+      ['ctrl+h', /Backspace/],
+      ['ctrl+j', /line feed/],
+      ['ctrl+c', /always cancels/],
+      ['ctrl+[', /Escape/],
+    ] as const) {
+      assert.throws(() => session.setVoiceOption('talkKey', key), blocked, key);
+    }
+
+    // The refusal is specific to the collision, not to the Ctrl+letter shape.
+    session.setVoiceOption('talkKey', 'ctrl+k');
+    assert.equal(session.voiceSettings.talkKey, 'ctrl+k');
+  });
+
+  it('allows a zero release delay but not a negative one', () => {
+    const session = sessionWith();
+    session.setVoiceOption('releaseDelayMs', '0');
+    assert.equal(session.voiceSettings.releaseDelayMs, 0);
+    assert.throws(() => session.setVoiceOption('releaseDelayMs', '-1'), /zero or more/);
+    assert.throws(() => session.setVoiceOption('releaseDelayMs', 'soon'), /milliseconds/);
+  });
+});
+
+describe('`voice status` on the push-to-talk settings', () => {
+  /**
+   * Driven through the real command rather than a helper, because the lines being checked are
+   * printed by the command and not by `describe()`.
+   */
+  async function statusLines(voice: AppConfig['voice']): Promise<string> {
+    const lines: string[] = [];
+    const session = new Session({
+      config: { ...DEFAULT_CONFIG, voice },
+      registry: new PluginRegistry(NULL_LOGGER),
+      logger: NULL_LOGGER,
+      paths: PATHS,
+      mode: 'plain',
+      color: false,
+      width: 100,
+      write: (text) => lines.push(text),
+      writeError: (text) => lines.push(text),
+    });
+    const table = new CommandTable();
+    table.registerAll(voiceCommands(table));
+    const command = table.get('voice');
+    assert.ok(command);
+    await command.run(session, { positional: ['status'], flags: {}, raw: 'voice status' });
+    return lines.join('');
+  }
+
+  it('says which talk key is actually in force', async () => {
+    assert.match(await statusLines({ talkKey: 'ctrl+t' }), /Talk key:\s+Ctrl\+T/);
+  });
+
+  it('says so when the config names a key it cannot use, instead of silently substituting one', async () => {
+    // `set voice.talkKey ctrl+m` is refused to the user's face. A config file is edited by
+    // hand and gets no such refusal, so without this the user has a file that plainly says
+    // Ctrl+M and a Ctrl+M that does nothing, with nothing connecting the two.
+    const status = await statusLines({ talkKey: 'ctrl+m' });
+    assert.match(status, /Talk key:\s+Ctrl\+Space/);
+    assert.match(status, /voice\.talkKey in your config is "ctrl\+m"/);
+    assert.match(status, /sends as Enter/);
+
+    const typo = await statusLines({ talkKey: 'ctrl+spcae' });
+    assert.match(typo, /cannot read as a key/);
+    assert.match(typo, /Using Ctrl\+Space instead/);
+  });
+
+  it('says nothing extra when the configured key is fine', async () => {
+    assert.ok(!(await statusLines({ talkKey: 'ctrl+t' })).includes('Note:'));
+    assert.ok(!(await statusLines({})).includes('Note:'));
   });
 });
 

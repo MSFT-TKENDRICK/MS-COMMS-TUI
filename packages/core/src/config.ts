@@ -154,6 +154,24 @@ export interface VoiceConfig {
    * Turn it off if you would rather send audio and nothing else.
    */
   readonly phraseBias?: boolean;
+  /**
+   * What the talk key does in the full-screen pane.
+   *
+   * `auto` holds where the terminal can report key releases and latches where it cannot,
+   * which is the honest default: the gesture is the same everywhere, and only its ending
+   * differs. `hold` and `toggle` pin one behaviour for a user who would rather have a
+   * predictable key than the best one their terminal can manage.
+   */
+  readonly pushToTalk?: 'auto' | 'hold' | 'toggle';
+  /**
+   * Milliseconds to keep recording after the talk key is released.
+   *
+   * People finish a word slightly after they decide to stop, so cutting at the instant of
+   * release clips the last syllable and hands the recognizer a truncated sentence.
+   */
+  readonly releaseDelayMs?: number;
+  /** The key to hold, written as `ctrl+space` or `alt+t`. */
+  readonly talkKey?: string;
 }
 
 export interface AppConfig {
@@ -479,7 +497,7 @@ function validateConfigBody(raw: unknown, sourcePath?: string): AppConfig {
   };
 }
 
-const VOICE_ENGINES = ['foundry', 'azure-speech', 'openai', 'xai', 'command'] as const;
+const VOICE_ENGINES = ['mai', 'foundry', 'azure-speech', 'openai', 'xai', 'command'] as const;
 
 /**
  * Validate the voice block.
@@ -498,7 +516,7 @@ function validateVoice(raw: unknown): VoiceConfig {
   if (engine !== undefined && !VOICE_ENGINES.includes(engine as (typeof VOICE_ENGINES)[number])) {
     throw VfsError.config(
       `voice.engine "${String(engine)}" is not a speech backend I know.`,
-      `Use one of: ${VOICE_ENGINES.join(', ')}. "foundry" is Microsoft Foundry with MAI-Transcribe-1.5.`,
+      `Use one of: ${VOICE_ENGINES.join(', ')}. "mai" is Microsoft Foundry's LLM Speech API with MAI-Transcribe-1.5.`,
     );
   }
 
@@ -527,6 +545,29 @@ function validateVoice(raw: unknown): VoiceConfig {
       'Continuous listening obeys anything it hears, so it requires a wake word: try "wakeWord": "computer".',
     );
   }
+
+  const pushToTalk = record['pushToTalk'];
+  if (pushToTalk !== undefined && pushToTalk !== 'auto' && pushToTalk !== 'hold' && pushToTalk !== 'toggle') {
+    throw VfsError.config(
+      `voice.pushToTalk "${String(pushToTalk)}" is not valid.`,
+      '"auto" holds where the terminal reports key releases and latches where it does not; "hold" insists; "toggle" never holds.',
+    );
+  }
+
+  // Checked because a negative delay is not a slower stop, it is a stop in the past — the
+  // recording would end before the key came up, clipping the words the delay exists to keep.
+  const releaseDelay = record['releaseDelayMs'];
+  if (releaseDelay !== undefined && (typeof releaseDelay !== 'number' || !Number.isFinite(releaseDelay) || releaseDelay < 0)) {
+    throw VfsError.config(
+      `voice.releaseDelayMs must be a number of milliseconds, zero or more, not ${JSON.stringify(releaseDelay)}.`,
+      'It keeps the microphone open briefly after the talk key comes up, so the last syllable is not clipped. 250 is the default.',
+    );
+  }
+
+  // Deliberately not validated here: `voice.talkKey`, whose meaning depends on how a terminal
+  // encodes keys and so is parsed by the pane rather than by config loading. An unusable one
+  // falls back to Ctrl+Space, and `voice status` says so rather than leaving the user with a
+  // key that does nothing and a config file that says it should.
 
   return record as VoiceConfig;
 }
