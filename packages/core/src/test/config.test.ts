@@ -179,7 +179,7 @@ describe('validateConfig', () => {
 
   it('names every unknown setting, not just the first one', () => {
     // A user who has two stale keys should learn that in one pass rather than one per run.
-    const config = validateConfig({ ...minimal, cache: {}, telemetry: true });
+    const config = validateConfig({ ...minimal, snapshot: {}, telemetry: true });
     assert.equal(config.warnings?.length, 2);
   });
 
@@ -260,6 +260,142 @@ describe('validateConfig', () => {
     for (const mode of ['auto', 'hold', 'toggle']) {
       assert.equal(validateConfig({ ...minimal, voice: { pushToTalk: mode } }).voice.pushToTalk, mode);
     }
+  });
+});
+
+describe('validateConfig: cache', () => {
+  const withCache = (cache: unknown): unknown => ({ ...minimal, cache });
+
+  it('defaults to no cache block at all', () => {
+    assert.deepEqual(validateConfig(minimal).cache, {});
+  });
+
+  it('accepts a full cache block and keeps every field', () => {
+    const config = validateConfig(
+      withCache({
+        enabled: true,
+        path: '/tmp/snapshot.db',
+        driver: 'libsql',
+        recent: 500,
+        ttlMs: 60_000,
+        intervalMs: 120_000,
+        depth: 2,
+        bodies: 25,
+        vectors: true,
+        prefetch: true,
+        prefetchConcurrency: 3,
+        audit: true,
+      }),
+    );
+    assert.equal(config.cache.driver, 'libsql');
+    assert.equal(config.cache.recent, 500);
+    assert.equal(config.cache.vectors, true);
+    assert.equal(config.cache.audit, true);
+    assert.equal(config.cache.path, '/tmp/snapshot.db');
+  });
+
+  it('accepts every driver it advertises', () => {
+    for (const driver of ['auto', 'libsql', 'node-sqlite']) {
+      assert.equal(validateConfig(withCache({ driver })).cache.driver, driver);
+    }
+  });
+
+  it('rejects a driver it does not have, and lists the ones it does', () => {
+    assert.throws(
+      () => validateConfig(withCache({ driver: 'postgres' })),
+      (error: unknown) =>
+        error instanceof VfsError &&
+        error.code === 'ECONFIG' &&
+        error.message.includes('libsql') &&
+        error.message.includes('node-sqlite'),
+    );
+  });
+
+  it('no longer offers a driver that reaches a database off this machine', () => {
+    assert.throws(
+      () => validateConfig(withCache({ driver: 'libsql-remote' })),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+  });
+
+  describe('the snapshot is local, and says so', () => {
+    // These keys are rejected rather than ignored. `validateCache` builds its result from
+    // the keys it knows about, so an unrecognised one would be dropped in silence — and
+    // "I configured replication and nothing happened" leaves somebody believing their
+    // mail is somewhere it is not.
+    for (const key of ['syncUrl', 'authToken', 'syncInterval', 'syncIntervalMs']) {
+      it(`rejects cache.${key} instead of quietly dropping it`, () => {
+        assert.throws(
+          () => validateConfig(withCache({ [key]: 'libsql://mail-org.turso.io' })),
+          (error: unknown) =>
+            error instanceof VfsError && error.code === 'ECONFIG' && error.message.includes(`cache.${key}`),
+        );
+      });
+    }
+
+    it('says why, not just no', () => {
+      assert.throws(
+        () => validateConfig(withCache({ syncUrl: 'libsql://mail-org.turso.io' })),
+        (error: unknown) => error instanceof VfsError && /local to this machine/i.test(error.message),
+      );
+    });
+  });
+
+  it('rejects negative numbers', () => {
+    for (const key of ['recent', 'ttlMs', 'intervalMs', 'depth', 'bodies', 'prefetchConcurrency']) {
+      assert.throws(
+        () => validateConfig(withCache({ [key]: -1 })),
+        (error: unknown) => error instanceof VfsError && error.message.includes(`cache.${key}`),
+        `expected cache.${key} to reject -1`,
+      );
+    }
+  });
+
+  it('rejects numbers that are not numbers', () => {
+    for (const bad of ['100', null, {}, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () => validateConfig(withCache({ recent: bad })),
+        (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+        `expected cache.recent to reject ${JSON.stringify(bad) ?? String(bad)}`,
+      );
+    }
+  });
+
+  it('accepts zero, because "cache nothing" is a real answer', () => {
+    // bodies: 0 means "index headers but never pre-download a message" — the setting
+    // someone on a metered connection actually wants.
+    assert.equal(validateConfig(withCache({ bodies: 0 })).cache.bodies, 0);
+  });
+
+  it('rejects a flag that is not a boolean', () => {
+    for (const key of ['enabled', 'vectors', 'prefetch']) {
+      assert.throws(
+        () => validateConfig(withCache({ [key]: 'yes' })),
+        (error: unknown) => error instanceof VfsError && error.message.includes(`cache.${key}`),
+        `expected cache.${key} to reject "yes"`,
+      );
+    }
+  });
+
+  it('rejects a blank path rather than quietly writing somewhere unexpected', () => {
+    assert.throws(
+      () => validateConfig(withCache({ path: '  ' })),
+      (error: unknown) => error instanceof VfsError && error.message.includes('cache.path'),
+    );
+  });
+
+  it('rejects a cache block that is not an object', () => {
+    assert.throws(
+      () => validateConfig(withCache('on')),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+  });
+
+  it('says which file the bad cache setting is in', () => {
+    assert.throws(
+      () => validateConfig(withCache({ driver: 'nope' }), '/etc/mscomms.jsonc'),
+      (error: unknown) => error instanceof VfsError && error.message.includes('/etc/mscomms.jsonc'),
+    );
   });
 });
 

@@ -16,19 +16,25 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import {
+  BackgroundSync,
   ChangeBus,
   FileStateStore,
   Journal,
   Notifier,
   PluginRegistry,
+  SnapshotStore,
   Vfs,
   Watcher,
   buildMounts,
+  hashEmbedder,
+  openSqlDriver,
   parseQuery,
   resolveAppPaths,
   reversalFor,
   stateFileFor,
   vpath,
+  agentFsDatabase,
+  loadAgentFs,
   type ActionResult,
   type AppConfig,
   type AppPaths,
@@ -39,10 +45,12 @@ import {
   type MetaValue,
   type SessionEvent,
   type SessionListener,
+  type ToolCallsLike,
   type VNode,
   type VfsTarget,
   type VoiceConfig,
 } from '@mscomms/core';
+import { closeAllMcpClients } from '@mscomms/provider-graph';
 import { DEFAULT_FORMAT, type FormatOptions, type OutputMode } from './format.js';
 import { DEFAULT_TALK_KEY, PLAIN_KEY_CONFLICT, describeTalkKey, parseTalkKey, talkKeyConflict } from './tui/keyboard.js';
 
@@ -111,6 +119,12 @@ export class Session {
   /** How the view learns that something changed. See {@link subscribe}. */
   readonly #bus = new ChangeBus();
 
+  /** The local snapshot, once opened. Undefined when caching is off or unavailable. */
+  snapshot: SnapshotStore | undefined;
+  sync: BackgroundSync | undefined;
+  /** Why the cache is not running, when it was asked for but could not start. */
+  cacheError: string | undefined;
+
   #sink: (text: string) => void = (text) => process.stdout.write(text);
   #errorSink: (text: string) => void = (text) => process.stderr.write(text);
 
@@ -138,6 +152,10 @@ export class Session {
    * not harmless enough to hide.
    */
   mountWarnings: readonly string[] = [];
+
+  /** Background startup warm-up; awaited only by {@link dispose}. */
+  #warming: Promise<void> | undefined;
+  readonly #warmAbort = new AbortController();
 
   cwd = vpath.ROOT;
   lastListing: LastListing | undefined;
@@ -338,6 +356,18 @@ export class Session {
     this.vfs = new Vfs({
       ...(options.config.ttlMs === undefined ? {} : { ttlMs: options.config.ttlMs }),
       pageSize: this.pageSize,
+      logger: options.logger,
+      // Prefetching is deliberately *not* conditional on the snapshot being enabled. It
+      // used to be, which meant a default install — no config file, no cache section —
+      // preloaded nothing whatsoever: every mount root and every folder was a cold round
+      // trip taken while the user waited. Speculative results land in the in-memory cache
+      // perfectly well; the snapshot only decides whether they outlive the process.
+      prefetch: {
+        enabled: options.config.cache.prefetch ?? true,
+        ...(options.config.cache.prefetchConcurrency === undefined
+          ? {}
+          : { concurrency: options.config.cache.prefetchConcurrency }),
+      },
     });
 
     this.notifier = new Notifier({
@@ -396,6 +426,10 @@ export class Session {
     this.brokenMounts = broken;
     this.mountWarnings = ignored;
 
+    // Opened after the mounts, because a snapshot with nothing mounted has nothing to
+    // sync, and before the watches, so a watch's first poll can be served locally.
+    await this.#startCache();
+
     // The cwd defaults to the only mount when there is exactly one. Landing in a root
     // that contains a single directory and making the user `cd` into it is pure ceremony.
     const mounts = this.vfs.mounts;
@@ -418,11 +452,110 @@ export class Session {
         });
       }
     }
+
+    // Deliberately not awaited. Warming spawns MCP servers and speculatively lists mount
+    // roots, which takes seconds — awaiting it here would move the delay from the user's
+    // first command to the banner, which is not an improvement. Started last so it competes
+    // with nothing that the session actually needs in order to be usable.
+    this.#warming = this.vfs.warm({ signal: this.#warmAbort.signal }).catch((error: unknown) => {
+      this.logger.debug('warm-up did not finish', { message: String(error) });
+    });
   }
 
   async dispose(): Promise<void> {
     this.watcher.stop();
+    // Warm-up first, and awaited: it spawns MCP servers and writes listings through the
+    // snapshot, so tearing down underneath it would close a database it is still using.
+    // The abort is what makes this quick — without it, quitting during startup would block
+    // on a seven-second handshake nobody is waiting for any more.
+    this.#warmAbort.abort();
+    await this.#warming?.catch(() => undefined);
+    // Speculative work goes next, and it has to go *before* the flush. `flush()` waits for
+    // the prefetch queue to drain, so leaving guesses running means quitting waits for
+    // answers nobody will ever look at — including on one-shot commands, which start a
+    // warm-up too. Aborting `#warmAbort` alone does not reach them: it covers connecting,
+    // while the listings it schedules run on the queue's own signals.
+    this.vfs.cancelSpeculative();
+    // Order matters, and `stop()` must be awaited: it aborts the cycle *and waits for it
+    // to unwind*. Dropping that promise would close the database under a sync still
+    // writing to it, which is the same bug as not flushing, arriving from the other side.
+    await this.sync?.stop();
+    // Then settle the engine's outstanding snapshot writes before closing the database
+    // under them, or the last thing the user did is the one thing not saved.
+    await this.vfs.flush().catch(() => undefined);
+    await this.snapshot?.close().catch(() => undefined);
     await this.vfs.dispose();
+    // Shared across every Graph mount rather than owned by one, so it is released here
+    // with the session that outlives them all.
+    closeAllMcpClients();
+  }
+
+  /**
+   * Open the local snapshot and start background sync.
+   *
+   * Every failure here is non-fatal and recorded rather than thrown. A cache that will not
+   * open is a slower program, not a broken one, and refusing to start the shell because a
+   * disk was full would turn an optimisation into a single point of failure. `cache status`
+   * reports {@link cacheError} so the degradation is visible rather than mysterious.
+   */
+  async #startCache(): Promise<void> {
+    const cache = this.config.cache;
+    if (cache.enabled !== true) return;
+
+    try {
+      const embedder = cache.vectors === false ? undefined : hashEmbedder();
+      const driver = await openSqlDriver({
+        path: cache.path ?? join(this.paths.cacheDir, 'snapshot.db'),
+        ...(cache.driver === undefined ? {} : { driver: cache.driver }),
+        onWarning: (message) => {
+          this.logger.warn(message);
+        },
+      });
+
+      const snapshot = await SnapshotStore.open({
+        driver,
+        ...(cache.recent === undefined ? {} : { maxNodesPerDirectory: cache.recent }),
+        ...(cache.ttlMs === undefined ? {} : { ttlMs: cache.ttlMs }),
+        ...(cache.vectors === undefined ? {} : { vectors: cache.vectors }),
+        ...(embedder === undefined ? {} : { embedder }),
+        logger: this.logger.child('snapshot'),
+      });
+
+      this.snapshot = snapshot;
+      this.vfs.attachSnapshot(snapshot, {
+        enabled: cache.prefetch ?? true,
+        ...(cache.prefetchConcurrency === undefined ? {} : { concurrency: cache.prefetchConcurrency }),
+      });
+      await this.vfs.warmPredictor().catch(() => undefined);
+
+      // The audit log lives in the same database as the snapshot, so it needs no
+      // configuration beyond being switched on. If AgentFS cannot load — no native
+      // binding, an incompatible version — sync still runs, just without the record.
+      let audit: ToolCallsLike | undefined;
+      if (cache.audit === true) {
+        try {
+          const { ToolCalls } = await loadAgentFs();
+          audit = (await ToolCalls.fromDatabase(agentFsDatabase(driver))) as ToolCallsLike;
+        } catch (error) {
+          this.logger.warn('audit log unavailable; syncing without it', { message: String(error) });
+        }
+      }
+
+      this.sync = new BackgroundSync({
+        host: this.vfs,
+        snapshot,
+        logger: this.logger.child('sync'),
+        ...(cache.intervalMs === undefined ? {} : { intervalMs: cache.intervalMs }),
+        ...(cache.recent === undefined ? {} : { recent: cache.recent }),
+        ...(cache.depth === undefined ? {} : { depth: cache.depth }),
+        ...(cache.bodies === undefined ? {} : { bodies: cache.bodies }),
+        ...(audit === undefined ? {} : { audit }),
+      });
+      this.sync.start();
+    } catch (error) {
+      this.cacheError = error instanceof Error ? error.message : String(error);
+      this.logger.warn('local cache could not start', { message: this.cacheError });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -807,6 +940,41 @@ export class Session {
     }
     return chunks.join('');
   }
+
+  /**
+   * Run `fn`, calling `before` once, immediately ahead of the first byte it prints.
+   *
+   * Exists for the shell's progress indicator, which occupies a line that has to be erased
+   * before anything else is written to it. Doing that in a `finally` would be too late — the
+   * command's output has already moved the cursor by then, and the spinner is stranded in
+   * the scrollback. The only moment that works is the one just before the first write, and
+   * only the sink knows when that is.
+   *
+   * `before` is called at most once, and sinks are restored in a `finally` so a throwing
+   * command cannot leave the session writing through a filter that outlives it.
+   */
+  async beforeFirstWrite(before: () => void, fn: () => Promise<void>): Promise<void> {
+    const previousSink = this.#sink;
+    const previousErrorSink = this.#errorSink;
+    let fired = false;
+    const wrap =
+      (inner: (text: string) => void) =>
+      (text: string): void => {
+        if (!fired) {
+          fired = true;
+          before();
+        }
+        inner(text);
+      };
+    this.#sink = wrap(previousSink);
+    this.#errorSink = wrap(previousErrorSink);
+    try {
+      await fn();
+    } finally {
+      this.#sink = previousSink;
+      this.#errorSink = previousErrorSink;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -882,3 +1050,4 @@ export function defaultConfigCandidates(paths: AppPaths): string[] {
     join(homedir(), '.mscomms.json'),
   ];
 }
+

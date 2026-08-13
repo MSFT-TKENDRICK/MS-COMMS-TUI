@@ -204,10 +204,10 @@ export interface BuiltMount {
    * Options this mount was given that its provider does not read.
    *
    * A mount that quietly ignores half its configuration is the most expensive kind of wrong,
-   * because the file says one thing and the program does another and neither ever mentions it.
-   * A real example: `"transport": "mcp"` on a Graph mount, written in the belief that it would
-   * borrow an existing sign-in, read by nothing, and paid for with a device-code prompt on
-   * every launch and no clue as to why.
+   * because the file says one thing and the program does another and neither ever mentions
+   * it. The option is reported, not rejected: it is not worth losing a working source over,
+   * and the person who wrote it is the one who can decide whether it was a typo or a
+   * leftover from a setting that has since been renamed.
    */
   readonly ignoredOptions?: readonly string[];
 }

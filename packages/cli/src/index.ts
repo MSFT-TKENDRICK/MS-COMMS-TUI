@@ -12,6 +12,7 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
   ConsoleLogger,
+  DEFAULT_CONFIG,
   NULL_LOGGER,
   PluginRegistry,
   isVfsError,
@@ -246,7 +247,7 @@ export async function main(options: CliOptions): Promise<number> {
   let config: AppConfig;
   try {
     config = globals.noConfig
-      ? { plugins: [], mounts: [], queries: [], watches: [], ui: {}, notifications: {}, voice: {}, keymap: {} }
+      ? DEFAULT_CONFIG
       : await loadConfig(globals.configPath ?? paths.configFile, { required: globals.configPath !== undefined });
   } catch (error) {
     writeError(`${error instanceof Error ? error.message : String(error)}\n`);

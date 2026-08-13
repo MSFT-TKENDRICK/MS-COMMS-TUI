@@ -433,6 +433,25 @@ export interface Provider {
   init?(): Promise<void>;
   dispose?(): Promise<void>;
 
+  /**
+   * Pay one-time connection cost ahead of being asked for anything.
+   *
+   * Separate from {@link init} because `init` runs while the session is still starting and
+   * everything waits for it, whereas this is explicitly allowed to be slow and is never
+   * awaited on a path a user is watching. The Graph providers use it to bring up their MCP
+   * server, which costs about seven seconds against roughly a quarter of a second for the
+   * request that follows — so whether it is paid here or on the user's first keystroke is
+   * the difference between a tool that feels instant and one that appears to hang.
+   *
+   * Must not throw, must not fetch anything, and must be safe to call more than once. A
+   * provider with nothing expensive to set up simply omits it.
+   *
+   * The signal is a courtesy, not a contract: the engine stops waiting on abort whether or
+   * not the provider honours it, because shutting the session down must not be held up by
+   * a handshake nobody is waiting for. Honouring it just makes the teardown tidier.
+   */
+  warm?(signal?: AbortSignal): Promise<void>;
+
   /** Children of `parent`. `null` means the mount root. */
   list(parent: VNode | null, options: ListOptions): Promise<ListPage>;
 

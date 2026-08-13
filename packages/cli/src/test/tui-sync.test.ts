@@ -150,6 +150,11 @@ describe('keys that reach the journal', () => {
     // A pane that assigned `cwd` directly would be the one interaction in the program
     // that could not be undone, replayed, or spoken.
     const step = reduce(browsing([node('Archive', { kind: 'dir' })]), { name: 'return', sequence: '\r' });
-    assert.deepEqual(step.effects, [{ kind: 'list', path: '/mail/Inbox/Archive' }]);
+    // Asserted field by field rather than as a whole object: the claim is that entering a
+    // folder goes through a listing effect the session can record, not that the effect never
+    // grows another field.
+    assert.equal(step.effects.length, 1);
+    assert.equal(step.effects[0]?.kind, 'list');
+    assert.equal((step.effects[0] as { path?: string }).path, '/mail/Inbox/Archive');
   });
 });

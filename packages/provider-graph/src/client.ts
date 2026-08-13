@@ -14,6 +14,7 @@
  */
 
 import { VfsError } from '@mscomms/core';
+import { raceAbort } from './abort.js';
 
 export interface GraphClientOptions {
   readonly getToken: () => Promise<string>;
@@ -48,6 +49,48 @@ export interface GraphApi {
   getBytes(path: string, options?: GraphRequestOptions): Promise<Uint8Array>;
   post<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
   patch<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
+  /**
+   * Establish the connection without asking for anything.
+   *
+   * Only the MCP transport implements this, and only because it has a genuinely expensive
+   * setup — spawning a server and completing a handshake takes seconds, against
+   * milliseconds for the request that follows. Direct HTTP has nothing to prepare and
+   * omits it.
+   */
+  warm?(): Promise<void>;
+}
+
+/**
+ * Turn a raw Graph collection response into a `GraphPage`.
+ *
+ * Shared with the MCP transport rather than reimplemented there. Paging is the one place
+ * where a subtle difference between two transports would show up as "the listing stops
+ * after 50 items" long after the code was written, so both read the envelope the same way.
+ */
+export function toGraphPage<T>(raw: Record<string, unknown>): GraphPage<T> {
+  return {
+    value: (raw['value'] as T[] | undefined) ?? [],
+    ...(typeof raw['@odata.nextLink'] === 'string' ? { nextLink: raw['@odata.nextLink'] } : {}),
+    ...(typeof raw['@odata.deltaLink'] === 'string' ? { deltaLink: raw['@odata.deltaLink'] } : {}),
+  };
+}
+
+const GRAPH_ORIGIN = /^https:\/\/graph\.microsoft\.com(\/(v1\.0|beta))?/i;
+
+/**
+ * Reduce a Graph URL to the tenant-relative path.
+ *
+ * `@odata.nextLink` always comes back absolute, so any transport that addresses Graph by
+ * path — as the MCP one does — has to strip the origin or paging breaks on the second page.
+ */
+export function toRelativeGraphPath(path: string): string {
+  const relative = path.replace(GRAPH_ORIGIN, '');
+  if (/^https?:\/\//i.test(relative)) {
+    throw new VfsError('ENETWORK', `Not a Microsoft Graph URL: ${path}`, {
+      hint: 'This transport can only address Microsoft Graph itself.',
+    });
+  }
+  return relative.startsWith('/') ? relative : `/${relative}`;
 }
 
 export class GraphClient implements GraphApi {
@@ -68,12 +111,21 @@ export class GraphClient implements GraphApi {
     let attempt = 0;
 
     for (;;) {
+      // Re-checked each pass: the listener below is registered fresh per attempt, and a
+      // signal that fired between two attempts would never reach it.
+      if (options.signal?.aborted === true) throw new VfsError('ECANCELED', 'Request cancelled.');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
-      options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+      // Named, because this is a retry loop and the caller's signal usually outlives the
+      // whole loop: an anonymous listener per attempt is a leak that grows with every
+      // retry and every request made under the same warm-up signal.
+      const relayAbort = (): void => {
+        controller.abort();
+      };
+      options.signal?.addEventListener('abort', relayAbort, { once: true });
 
       try {
-        const token = await this.#getToken();
+        const token = await raceAbort(this.#getToken(), options.signal);
         const response = await fetch(url, {
           headers: {
             authorization: `Bearer ${token}`,
@@ -95,7 +147,7 @@ export class GraphClient implements GraphApi {
             });
           }
           attempt += 1;
-          await sleep(Math.max(1, retryAfter) * 1000);
+          await sleep(Math.max(1, retryAfter) * 1000, options.signal);
           continue;
         }
 
@@ -109,23 +161,19 @@ export class GraphClient implements GraphApi {
         }
         if (attempt < this.#maxRetries) {
           attempt += 1;
-          await sleep(500 * attempt);
+          await sleep(500 * attempt, options.signal);
           continue;
         }
         throw new VfsError('ENETWORK', `Could not reach Microsoft Graph: ${String(error)}`);
       } finally {
         clearTimeout(timer);
+        options.signal?.removeEventListener('abort', relayAbort);
       }
     }
   }
 
   async getPage<T>(path: string, options: GraphRequestOptions = {}): Promise<GraphPage<T>> {
-    const raw = await this.get<Record<string, unknown>>(path, options);
-    return {
-      value: (raw['value'] as T[] | undefined) ?? [],
-      ...(typeof raw['@odata.nextLink'] === 'string' ? { nextLink: raw['@odata.nextLink'] } : {}),
-      ...(typeof raw['@odata.deltaLink'] === 'string' ? { deltaLink: raw['@odata.deltaLink'] } : {}),
-    };
+    return toGraphPage<T>(await this.get<Record<string, unknown>>(path, options));
   }
 
   /**
@@ -155,12 +203,21 @@ export class GraphClient implements GraphApi {
     let attempt = 0;
 
     for (;;) {
+      // Re-checked each pass: the listener below is registered fresh per attempt, and a
+      // signal that fired between two attempts would never reach it.
+      if (options.signal?.aborted === true) throw new VfsError('ECANCELED', 'Request cancelled.');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
-      options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+      // Named, because this is a retry loop and the caller's signal usually outlives the
+      // whole loop: an anonymous listener per attempt is a leak that grows with every
+      // retry and every request made under the same warm-up signal.
+      const relayAbort = (): void => {
+        controller.abort();
+      };
+      options.signal?.addEventListener('abort', relayAbort, { once: true });
 
       try {
-        const token = await this.#getToken();
+        const token = await raceAbort(this.#getToken(), options.signal);
         const response = await fetch(url, {
           method,
           headers: {
@@ -192,13 +249,14 @@ export class GraphClient implements GraphApi {
         throw new VfsError('ENETWORK', `Could not reach Microsoft Graph: ${String(error)}`);
       } finally {
         clearTimeout(timer);
+        options.signal?.removeEventListener('abort', relayAbort);
       }
     }
   }
 
   async getBytes(path: string, options: GraphRequestOptions = {}): Promise<Uint8Array> {
     const url = path.startsWith('http') ? path : `${this.#baseUrl}${path.startsWith('/') ? '' : '/'}${path}`;
-    const token = await this.#getToken();
+    const token = await raceAbort(this.#getToken(), options.signal);
     const response = await fetch(url, {
       headers: { authorization: `Bearer ${token}` },
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -219,15 +277,26 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     // Non-JSON error body; the status alone will have to do.
   }
 
-  const endpoint = url.replace(/^https:\/\/graph\.microsoft\.com\/v1\.0/, '');
+  return graphFailure(response.status, url, detail, code);
+}
 
-  if (response.status === 401) {
+/**
+ * Map a Graph status code onto the error the UI knows how to explain.
+ *
+ * Split out from the HTTP path so every transport reports the same thing: a 403 on a Teams
+ * endpoint means "ask your tenant admin" no matter which pipe the 403 arrived through, and
+ * a user should never have to learn two vocabularies for the same failure.
+ */
+export function graphFailure(status: number, url: string, detail = '', code = ''): VfsError {
+  const endpoint = url.replace(GRAPH_ORIGIN, '');
+
+  if (status === 401) {
     return new VfsError('EAUTH', 'Microsoft Graph rejected the credentials.', {
       hint: 'The sign-in has expired. Run `mscomms auth --reset` and sign in again.',
     });
   }
 
-  if (response.status === 403) {
+  if (status === 403) {
     const teams = endpoint.includes('/teams') || endpoint.includes('/chats');
     return new VfsError('EACCES', `Access denied${detail === '' ? '' : `: ${detail}`}`, {
       hint: teams
@@ -236,19 +305,47 @@ async function describeFailure(response: Response, url: string): Promise<VfsErro
     });
   }
 
-  if (response.status === 404) {
+  if (status === 404) {
     return new VfsError('ENOENT', `Microsoft Graph has no ${endpoint}.`, {
       hint: 'The item may have been moved or deleted. Try refreshing the listing.',
     });
   }
 
-  if (code === 'ErrorItemNotFound') {
-    return new VfsError('ENOENT', 'That item no longer exists.');
+  if (status === 429 || status === 503 || status === 504) {
+    return new VfsError('ERATELIMIT', 'Microsoft Graph is throttling requests.', {
+      hint: "Try again shortly. Increasing the mount's ttlMs reduces how often this happens.",
+    });
   }
 
-  return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(response.status)}${detail === '' ? '' : `: ${detail}`}`);
+  if (code === 'ErrorItemNotFound' || code === 'ErrorInvalidIdMalformed') {
+    return new VfsError('ENOENT', 'That item no longer exists.', {
+      hint: 'The id may be stale. Try refreshing the listing.',
+    });
+  }
+
+  return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(status)}${detail === '' ? '' : `: ${detail}`}`);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Sleep, unless the caller gives up first.
+ *
+ * A throttled Graph request can be told to come back in thirty seconds, and until now that
+ * number was also how long a quit could take: the back-off was a bare timer with nothing
+ * watching the signal. Rejecting rather than resolving early matters, because the caller is
+ * a retry loop — waking it up quietly would just send it round again to issue a fetch on
+ * behalf of someone who has already left.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) return Promise.reject(new VfsError('ECANCELED', 'Request cancelled.'));
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new VfsError('ECANCELED', 'Request cancelled.'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }

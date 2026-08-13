@@ -473,6 +473,8 @@ capability.
 |---|---|---|
 | `Up` / `Down`, or `k` / `j` | Move the selection | `ls`, then a number |
 | `Left`, `h`, or `Backspace` | Go to the parent folder | `cd ..` |
+| `[` or `Alt+Left` | Go back to where you were | `cd <previous path>` |
+| `]` or `Alt+Right` | Go forward again | `cd <path>` |
 | `Right`, `l`, or `Enter` | Open the selection | `cd <name>` or `cat <n>` |
 | `Home` / `End` | First / last item | — |
 | `PageUp` / `PageDown` | Move by a screen | — |
@@ -497,6 +499,17 @@ named in the footer of every frame, so it is advertised rather than assumed.
 Arrow keys and vim-style `hjkl` are both accepted, so neither a hand on the arrow cluster nor
 a hand on the home row is the wrong hand. Quitting is always safe: nothing in this program
 holds an unsaved draft, and exiting prints where you were.
+
+Back is not the same as up, and the distinction is deliberate. `Backspace` goes to the
+parent folder — a fact about the path. `[` goes to wherever you actually were, which after a
+`:cd` or a search result may be nowhere near the parent. Both are bound because both are
+things people mean. Returning to a folder restores the selection you left on, so stepping
+into a message and back out does not lose your place in a thousand-row Inbox; a screen
+reader therefore re-announces the row you were already on rather than the top of the list.
+
+There is a deliberate asymmetry with the alternate-screen ban: back and forward are *not*
+scrollback navigation, and they never redraw history. Each is a plain `cd` that happens to
+know where you came from, so the line shell's transcript stays the record of what happened.
 
 ## Full-screen pane policy — and how the shipped pane complies
 

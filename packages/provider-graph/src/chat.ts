@@ -37,12 +37,13 @@ import {
   type ReadOptions,
   type VNode,
 } from '@mscomms/core';
-import type { GraphClient, GraphPage } from './client.js';
+import type { GraphApi, GraphPage } from './client.js';
 import {
   createClient,
   GRAPH_SHARED_OPTION_KEYS,
   htmlToText,
   preview,
+  validateSharedOptions,
   type GraphSharedOptions,
 } from './shared.js';
 
@@ -60,6 +61,11 @@ interface Chat {
   readonly chatType: string;
   readonly lastUpdatedDateTime: string | null;
   readonly members?: ReadonlyArray<{ displayName?: string }>;
+  readonly lastMessagePreview?: {
+    readonly createdDateTime?: string | null;
+    readonly body?: { readonly content?: string | null } | null;
+    readonly from?: { readonly user?: { readonly displayName?: string | null } | null } | null;
+  } | null;
 }
 
 interface Team {
@@ -99,7 +105,7 @@ export class GraphChatProvider implements Provider {
 
   readonly #options: GraphChatOptions;
   readonly #context: ProviderContext;
-  #client: GraphClient | undefined;
+  #client: GraphApi | undefined;
 
   constructor(options: GraphChatOptions, context: ProviderContext) {
     this.#options = options;
@@ -111,7 +117,12 @@ export class GraphChatProvider implements Provider {
     this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
-  get #api(): GraphClient {
+  /** Bring the transport up in the background. See `Provider.warm`. */
+  async warm(): Promise<void> {
+    await this.#client?.warm?.();
+  }
+
+  get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The Teams mount was not initialised.');
     return this.#client;
   }
@@ -161,9 +172,19 @@ export class GraphChatProvider implements Provider {
 
   async #listChats(options: ListOptions): Promise<ListPage> {
     const limit = Math.max(1, Math.min(options.limit ?? this.#options.pageSize ?? 50, 50));
+    // `$expand=members`, not `$expand=members($select=displayName)`: Graph rejects a nested
+    // `$select` inside an expand on this collection outright, with a 400 that takes the whole
+    // listing down. Expanding the whole member is a few hundred bytes more per chat and is
+    // what makes a group chat nameable at all.
+    //
+    // `lastMessagePreview` is expanded because it is what the list is *sorted* by, and
+    // showing `lastUpdatedDateTime` instead made a correctly ordered list look shuffled: that
+    // field tracks roster and topic edits, so a chat last spoken in minutes ago can carry a
+    // six-month-old date. Sorting by one field and displaying another is indistinguishable
+    // from not sorting at all.
     const page = await this.#api.getPage<Chat>(
       options.cursor ??
-        `/me/chats?$expand=members($select=displayName)&$top=${String(limit)}&$orderby=lastMessagePreview/createdDateTime desc`,
+        `/me/chats?$expand=members,lastMessagePreview&$top=${String(limit)}&$orderby=lastMessagePreview/createdDateTime desc`,
       options.signal === undefined ? {} : { signal: options.signal },
     );
     return {
@@ -452,17 +473,33 @@ function chatNode(chat: Chat): VNode {
         ? 'Chat'
         : names.slice(0, 3).join(', ') + (names.length > 3 ? ` and ${String(names.length - 3)} more` : '');
 
+  // The time of the last message, falling back to the roster/topic timestamp only when the
+  // preview is missing. This is the field the list is ordered by, so showing anything else
+  // makes a sorted list look shuffled.
+  const spoke = chat.lastMessagePreview?.createdDateTime;
+  const stamp = spoke !== null && spoke !== undefined && spoke !== '' ? spoke : chat.lastUpdatedDateTime;
+  const said = summaryOf(chat);
+  const who = chat.lastMessagePreview?.from?.user?.displayName;
+
   return {
     name: label,
     kind: 'dir',
     subtype: 'chat',
     title: label,
     id: chat.id,
-    ...(chat.lastUpdatedDateTime === null || chat.lastUpdatedDateTime === undefined
-      ? {}
-      : { mtime: new Date(chat.lastUpdatedDateTime) }),
+    ...(stamp === null || stamp === undefined ? {} : { mtime: new Date(stamp) }),
+    ...(said === undefined ? {} : { summary: said }),
+    ...(who === null || who === undefined || who === '' ? {} : { author: who }),
     meta: { chatType: chat.chatType },
   };
+}
+
+/** The last thing said in a chat, as one line, for the listing. */
+function summaryOf(chat: Chat): string | undefined {
+  const body = chat.lastMessagePreview?.body?.content;
+  if (body === null || body === undefined || body === '') return undefined;
+  const text = preview(htmlToText(body));
+  return text === '' ? undefined : text;
 }
 
 function threadNode(message: ChatMessage, teamId: string, channelId: string): VNode {
@@ -547,6 +584,7 @@ export const graphChatPlugin: ProviderPlugin<GraphChatOptions> = {
   description: 'Chats, teams, channels and threads as directories; messages as files.',
   optionKeys: [...GRAPH_SHARED_OPTION_KEYS, 'chatsOnly', 'pageSize', 'maxReplies'],
   validateOptions(raw) {
+    validateSharedOptions(raw);
     return (raw ?? {}) as GraphChatOptions;
   },
   create(options, context) {

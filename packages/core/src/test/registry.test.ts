@@ -10,18 +10,14 @@ import {
   type ProviderPlugin,
 } from '../index.js';
 
-// ---------------------------------------------------------------------------
-// Mount options that nothing reads
-// ---------------------------------------------------------------------------
-
 /**
- * The failure being pinned here is a real one, reported by a user.
+ * Mount options that nothing reads.
  *
- * Their config carried `"transport": "mcp"` on three mounts, written in the belief that it
- * would broker authentication through an existing sign-in. Nothing read it. The mounts came
- * up looking perfectly healthy and then asked for a device code on every launch, and there
- * was no way — from the config, the startup output, or `doctor` — to discover that the line
- * they were counting on had never done anything at all.
+ * The failure being pinned here is a real one: an option a provider does not understand is
+ * accepted in silence, so the file says one thing and the program does another and nothing
+ * ever mentions it. Someone who configures a behaviour that never runs has no way to tell
+ * that from a behaviour that ran and did nothing — the mount comes up looking healthy either
+ * way, and the config keeps saying what they meant.
  */
 
 function stubProvider(): Provider {
@@ -62,9 +58,9 @@ describe('mount options a provider never reads', () => {
   it('names the option, because "some config was ignored" is the problem, not the fix', async () => {
     const ignored = await build(
       plugin({ optionKeys: ['clientId', 'tenantId'] }),
-      { clientId: 'abc', transport: 'mcp' },
+      { clientId: 'abc', proxyUrl: 'http://localhost' },
     );
-    assert.deepEqual(ignored, ['transport']);
+    assert.deepEqual(ignored, ['proxyUrl']);
   });
 
   it('still mounts, since an option nobody reads is not a reason to lose the source', async () => {
@@ -82,10 +78,10 @@ describe('mount options a provider never reads', () => {
   it('reports every unread option, not just the first one found', async () => {
     const ignored = await build(plugin({ optionKeys: ['clientId'] }), {
       clientId: 'abc',
-      transport: 'mcp',
-      cache: true,
+      proxyUrl: 'http://localhost',
+      retries: 3,
     });
-    assert.deepEqual(ignored, ['transport', 'cache']);
+    assert.deepEqual(ignored, ['proxyUrl', 'retries']);
   });
 
   it('says nothing when every option is one the provider reads', async () => {
@@ -109,3 +105,4 @@ describe('mount options a provider never reads', () => {
     assert.equal(ignored, undefined);
   });
 });
+

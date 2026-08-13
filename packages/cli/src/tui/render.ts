@@ -133,6 +133,29 @@ function rule(width: number, options: RenderOptions): string {
   return paint('\u2500'.repeat(width), 'dim', options.color);
 }
 
+/**
+ * Braille spinner frames.
+ *
+ * Braille rather than ASCII `|/-\` because the glyphs are the same width and differ only in
+ * which dots are lit, so the indicator animates in place instead of appearing to jitter.
+ * They degrade to a box in a terminal without the font, which still visibly changes.
+ */
+const SPINNER = ['\u280B', '\u2819', '\u2839', '\u2838', '\u283C', '\u2834', '\u2826', '\u2827', '\u2807', '\u280F'];
+
+/**
+ * What the title bar says while something is outstanding.
+ *
+ * The elapsed count is withheld for the first two seconds. Below that it is noise — every
+ * operation would flash "0s" on its way past — and above it, it is the only thing that
+ * distinguishes "slow" from "wedged", which is precisely the question a user staring at a
+ * frozen-looking screen is asking.
+ */
+export function workingLabel(state: TuiState): string {
+  const frame = SPINNER[state.tick % SPINNER.length] ?? '';
+  const seconds = Math.floor(state.busyMs / 1000);
+  return seconds >= 2 ? `${frame} working ${String(seconds)}s` : `${frame} working`;
+}
+
 function titleLine(state: TuiState, width: number, options: RenderOptions): string {
   // The counts are spelled out rather than implied by a scrollbar, because a scrollbar is
   // a picture of a number and this is the number.
@@ -141,7 +164,7 @@ function titleLine(state: TuiState, width: number, options: RenderOptions): stri
     state.filter === ''
       ? `${String(shown.length)} items`
       : `${String(shown.length)} of ${String(state.entries.length)} match`;
-  const right = state.busy ? `${count} \u2014 working` : count;
+  const right = state.busy ? `${count} ${workingLabel(state)}` : count;
 
   const rightWidth = Math.min(displayWidth(right), Math.max(0, width - 8));
   const leftWidth = width - rightWidth;
@@ -279,6 +302,7 @@ export function renderHelp(options: RenderOptions): string[] {
     ['Home / End', 'first / last item'],
     ['Enter, Right, l', 'open a folder, or read a message'],
     ['Backspace, Left, h', 'go up one level'],
+    ['[  /  ]', 'back / forward through where you have been (also Alt+Left, Alt+Right)'],
     ['Tab', 'switch between the list and the preview'],
     ['/', 'filter as you type (Enter keeps it, Escape clears it)'],
     [':', 'run any command \u2014 ls, find, grep, cat, open, mark, watch\u2026'],

@@ -25,16 +25,27 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     },
 
     // --- Outlook mail via Microsoft Graph -------------------------------------
-    // The first time you use it, you will be given a short code and a URL to
-    // sign in with. Tokens are cached; you will not be asked again for weeks.
+    // If you already have an MCP server that provides Microsoft 365 access — the
+    // one Copilot installs is found automatically — it is used, and you are never
+    // asked to sign in. Otherwise you get a short code and a URL to sign in with,
+    // and the tokens are cached for weeks.
+    //
+    // Run \`doctor\` to see which of the two is in use.
     //
     // {
     //   "path": "/mail",
     //   "type": "graph-mail",
     //   "options": {
-    //     // Optional. Defaults to the Microsoft Graph Command Line Tools client,
-    //     // which is a first-party public client available in most tenants.
-    //     // If your tenant blocks it, register your own app and put its id here.
+    //     // "auto" (the default) prefers the MCP server and signs in only if
+    //     // there is none. Force one or the other with "mcp" or "device-code".
+    //     // "transport": "auto",
+    //     //
+    //     // Point at a different MCP server if you do not want the discovered one.
+    //     // "mcp": { "command": "npx", "args": ["-y", "@microsoft/workiq@latest", "mcp"] },
+    //     //
+    //     // Only used when signing in. Defaults to the Microsoft Graph Command
+    //     // Line Tools client, a first-party public client available in most
+    //     // tenants. If yours blocks it, register an app and put its id here.
     //     // "clientId": "00000000-0000-0000-0000-000000000000",
     //     // "tenantId": "common",
     //     "pageSize": 50,
@@ -60,8 +71,10 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //
     // Sending is off unless you ask for it. With "allowSend": true you can run
     // \`do 1 message --subject "..." --body "..."\` on a person, or \`do 3 reply\`
-    // on one of their messages. Turning it on requires signing in again so that
-    // consent covers Mail.Send, Chat.ReadWrite and ChatMessage.Send.
+    // on one of their messages. When signing in, turning it on requires signing
+    // in again so that consent covers Mail.Send, Chat.ReadWrite and
+    // ChatMessage.Send; through an MCP server, that server's own permissions
+    // decide whether sending is allowed.
     //
     // {
     //   "path": "/people",
@@ -76,16 +89,21 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   },
     // },
 
-    // --- GitHub issues and pull requests --------------------------------------
+    // --- GitHub issues, pull requests, discussions and projects ---------------
     // Uses GH_TOKEN or GITHUB_TOKEN if either is set, and otherwise borrows the
     // credential from \`gh auth login\`. Without any of the three it still works on
-    // public repositories, just at 60 requests an hour.
+    // public repositories, just at 60 requests an hour — though discussions and
+    // project boards need a token either way, because GitHub's GraphQL API has no
+    // anonymous access at all. Boards additionally need the \`read:project\` scope.
     //
     // {
     //   "path": "/github",
     //   "type": "github",
     //   "options": {
     //     "repos": ["octocat/hello-world"],
+    //     // Boards that span repositories belong to the org, not to any one repo,
+    //     // so an owner can be listed on its own to reach them.
+    //     // "owners": ["octocat"],
     //     // Or, instead of repos, your notification inbox — everything across
     //     // every repository that is actually waiting on you. Needs a token.
     //     // "includeNotifications": true,
@@ -184,6 +202,37 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   "includeUpdates": false,
     // },
   ],
+
+  // ---------------------------------------------------------------------------
+  // Local snapshot. Off by default; this is the setting that makes the tool feel
+  // instant. Mail is synced into a local Turso (libSQL) database in the
+  // background, listings are served from disk instead of the network, and
+  // \`find\` searches locally before it searches remotely.
+  //
+  // It keeps the most recent items per folder rather than replicating your
+  // mailbox, so it is honest about what it can answer: a plain \`ls\` comes from
+  // the snapshot, a filtered one goes to the source, and search never concludes
+  // "no results" from local data alone.
+  //
+  // The database never leaves this machine. It holds message bodies, so there is
+  // deliberately no setting that points it at a hosted database.
+  // ---------------------------------------------------------------------------
+  // "cache": {
+  //   "enabled": true,
+  //
+  //   // Items kept per folder. The rest are evicted; this is what stops a large
+  //   // mailbox from turning the first sync into an overnight job.
+  //   "recent": 500,
+  //
+  //   // Message bodies to pre-download per folder per sync, so \`cat\` on
+  //   // something recent is instant and \`body:\` works offline. 0 disables.
+  //   "bodies": 25,
+  //
+  //   // Record every fetch in an AgentFS tool_calls log inside the snapshot:
+  //   // what was called, which path, how long, and whether it failed. Paths and
+  //   // sizes only, never message content. Shown in \`cache\`.
+  //   // "audit": true,
+  // },
 
   // ---------------------------------------------------------------------------
   // Notifications.

@@ -33,12 +33,13 @@ import {
   type ReadOptions,
   type VNode,
 } from '@mscomms/core';
-import type { GraphClient, GraphPage } from './client.js';
+import type { GraphApi, GraphPage } from './client.js';
 import {
   createClient,
   GRAPH_SHARED_OPTION_KEYS,
   htmlToText,
   preview,
+  validateSharedOptions,
   type GraphSharedOptions,
 } from './shared.js';
 
@@ -101,7 +102,7 @@ export class GraphMailProvider implements Provider {
 
   readonly #options: GraphMailOptions;
   readonly #context: ProviderContext;
-  #client: GraphClient | undefined;
+  #client: GraphApi | undefined;
 
   constructor(options: GraphMailOptions, context: ProviderContext) {
     this.#options = options;
@@ -113,7 +114,12 @@ export class GraphMailProvider implements Provider {
     this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
-  get #api(): GraphClient {
+  /** Bring the transport up in the background. See `Provider.warm`. */
+  async warm(): Promise<void> {
+    await this.#client?.warm?.();
+  }
+
+  get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The mail mount was not initialised.');
     return this.#client;
   }
@@ -480,6 +486,7 @@ export const graphMailPlugin: ProviderPlugin<GraphMailOptions> = {
   description: 'Mail folders as directories and messages as files, read-only by default.',
   optionKeys: [...GRAPH_SHARED_OPTION_KEYS, 'includeHiddenFolders', 'pageSize'],
   validateOptions(raw) {
+    validateSharedOptions(raw);
     return (raw ?? {}) as GraphMailOptions;
   },
   create(options, context) {
