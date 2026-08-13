@@ -28,8 +28,6 @@
 import {
   VfsError,
   timestampPrefix,
-  type ActionDescriptor,
-  type ActionResult,
   type Capability,
   type ChangeEvent,
   type Document,
@@ -48,6 +46,7 @@ import { htmlToText, preview } from '@mscomms/provider-graph';
 
 import { AdoClient, segment, type FetchLike } from './client.js';
 import { resolveCredential, type AdoAuthOptions } from './auth.js';
+import { ADO_ACTIONS } from './actions.js';
 import { WORK_ITEM_FIELDS, buildWiql, type WiqlScope } from './wiql.js';
 
 export interface AdoBoardsOptions extends AdoAuthOptions {
@@ -439,6 +438,7 @@ export class AdoBoardsProvider implements Provider {
         level: 'workitem',
         project,
         workItemId: item.id,
+        ...(item.rev === undefined ? {} : { rev: item.rev }),
         ...(type === '' ? {} : { type }),
         ...(state === '' ? {} : { state }),
         ...(text(fields['System.BoardColumn']) === '' ? {} : { column: text(fields['System.BoardColumn']) }),
@@ -446,6 +446,7 @@ export class AdoBoardsProvider implements Provider {
         // Omitted rather than blank when empty: `stat` prints every key, and a row that
         // reads aloud as "tags, nothing" is pure noise through a screen reader.
         ...(tags === '' ? {} : { tags: tags.split(';').map((tag) => tag.trim()).filter(Boolean).join(', ') }),
+        ...(tags === '' ? {} : { tagsRaw: tags }),
         ...(text(fields['System.AreaPath']) === '' ? {} : { area: text(fields['System.AreaPath']) }),
         ...(text(fields['System.IterationPath']) === '' ? {} : { iteration: text(fields['System.IterationPath']) }),
         ...(priority === undefined ? {} : { priority }),
@@ -588,14 +589,12 @@ export class AdoBoardsProvider implements Provider {
     return { changes, cursor: next };
   }
 
-  async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
-    if (node.meta?.['url'] === undefined) return [];
-    return [{ name: 'url', label: 'Show the web URL', description: 'Print the canonical Azure DevOps URL for this work item.' }];
+  async actions(node: VNode) {
+    return ADO_ACTIONS.descriptors(node, { client: this.#api });
   }
 
-  async invoke(action: string, node: VNode, _params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
-    if (action !== 'url') throw VfsError.unsupported(`Action "${action}"`, this.id);
-    return { ok: true, message: String(node.meta?.['url'] ?? '') };
+  async invoke(action: string, node: VNode, params: Readonly<Record<string, MetaValue>>) {
+    return ADO_ACTIONS.invoke(action, node, params, { client: this.#api }, this.id);
   }
 
   /** Exposed for diagnostics: `mounts` and `doctor` want to say how a mount signed in. */

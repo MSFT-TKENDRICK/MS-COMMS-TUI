@@ -127,6 +127,80 @@ export class GitHubClient {
   }
 
   /**
+   * Mutating requests are deliberately single-shot.
+   *
+   * A GET can be replayed after a transient failure because reading twice is still reading.
+   * A POST or PUT might have succeeded just before the connection dropped, and trying again
+   * is how someone approves a pull request twice or merges with a stale title. GitHub will
+   * tell the user what happened; the provider must not guess by repeating the write.
+   */
+  async post<T>(path: string, body: unknown, options: { signal?: AbortSignal; accept?: string } = {}): Promise<T> {
+    return this.#write<T>('POST', path, body, options);
+  }
+
+  async patch<T>(path: string, body: unknown, options: { signal?: AbortSignal; accept?: string } = {}): Promise<T> {
+    return this.#write<T>('PATCH', path, body, options);
+  }
+
+  async put<T>(path: string, body: unknown, options: { signal?: AbortSignal; accept?: string } = {}): Promise<T> {
+    return this.#write<T>('PUT', path, body, options);
+  }
+
+  async delete<T>(path: string, options: { signal?: AbortSignal; accept?: string } = {}): Promise<T> {
+    return this.#write<T>('DELETE', path, undefined, options);
+  }
+
+  async #write<T>(
+    method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
+    path: string,
+    body: unknown,
+    options: { signal?: AbortSignal; accept?: string },
+  ): Promise<T> {
+    if (!this.authenticated) {
+      throw new VfsError('EAUTH', 'Changing GitHub data requires a token.', {
+        hint: 'Set GITHUB_TOKEN, or run `gh auth login`; anonymous writes fail with an unhelpful GitHub 401.',
+      });
+    }
+
+    const url = this.#resolve(path);
+    const headers: Record<string, string> = {
+      accept: options.accept ?? 'application/vnd.github+json',
+      'content-type': 'application/json',
+      'x-github-api-version': '2022-11-28',
+      'user-agent': this.#userAgent,
+      authorization: this.#bearer(),
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+    options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+
+    try {
+      const response = await this.#fetch(url, {
+        method,
+        headers,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) throw this.#describeFailure(response, url);
+      if (response.status === 204) return {} as T;
+      const text = await response.text();
+      return (text === '' ? {} : JSON.parse(text)) as T;
+    } catch (error) {
+      if (error instanceof VfsError) throw error;
+      if (controller.signal.aborted) {
+        throw new VfsError('ETIMEDOUT', 'GitHub did not respond in time.', {
+          hint: 'Check connectivity, or raise timeoutMs on the mount.',
+        });
+      }
+      throw new VfsError('ENETWORK', `Could not reach GitHub: ${String(error)}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
    * Turn a path or absolute URL into the URL to actually request.
    *
    * Absolute URLs arrive from two places: GitHub's own `Link` headers, and paging cursors.

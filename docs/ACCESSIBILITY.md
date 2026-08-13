@@ -398,6 +398,7 @@ capability.
 | `Home` / `End` | First / last item | — |
 | `PageUp` / `PageDown` | Move by a screen | — |
 | `Tab` | Switch between list and preview | — |
+| `a` | Act on the selection | `actions <n>`, then `do <verb> <n>` |
 | `/` | Start filtering | `find -q ...` |
 | `Enter` while filtering | Keep the filter, return to browsing | — |
 | `Escape` while filtering | Clear the filter | — |
@@ -408,12 +409,22 @@ capability.
 | `q` | Quit | `quit` |
 | `Ctrl+C` | Quit — **from any mode, including mid-filter** | — |
 
-Letters are never text unless you have explicitly entered a text mode with `/` or `:`.
-An earlier draft let any unbound letter start a filter, on the theory that typing a name
-should just work. It was removed: because `q`, `r` and `hjkl` are bindings, the real rule
-was "any letter except six", and a user filtering for *quarterly* would press `q` and watch
-the program exit. One sentence with no exceptions beats a convenience with six. `/` is
-named in the footer of every frame, so it is advertised rather than assumed.
+Letters are never text unless you have explicitly entered a text mode with `/`, `:`, or a
+prompt that `a` opened. An earlier draft let any unbound letter start a filter, on the theory
+that typing a name should just work. It was removed: because `q`, `r`, `a` and `hjkl` are
+bindings, the real rule was "any letter except seven", and a user filtering for *quarterly*
+would press `q` and watch the program exit. One sentence with no exceptions beats a
+convenience with seven. `/` is named in the footer of every frame, so it is advertised rather
+than assumed.
+
+Acting on something is a sequence of announced steps rather than a form. `a` lists only the
+verbs that apply to the selection right now, each with its own letter; choosing one asks for
+each argument it declared, one question per screen, with the question on the input line where
+a screen reader is already reading; anything irreversible asks `y/n` first, and only `y`
+confirms, because `Enter` is the key that was just pressed. `Escape` backs out at every step,
+and nothing is sent until the last answer is given. The same verbs are reachable by typing
+`actions <n>` and `do <verb> <n> --body "..."`, so the palette is a shortcut and never the
+only route.
 
 Arrow keys and vim-style `hjkl` are both accepted, so neither a hand on the arrow cluster nor
 a hand on the home row is the wrong hand. Quitting is always safe: nothing in this program

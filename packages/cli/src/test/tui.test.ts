@@ -18,11 +18,12 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import type { VNode } from '@mscomms/core';
-import { DEFAULT_FORMAT } from '../format.js';
+import type { ActionDescriptor, VNode } from '@mscomms/core';
+import { DEFAULT_FORMAT, displayWidth } from '../format.js';
 import { bodyRows, fit, render, renderHelp, workingLabel, CHROME_ROWS } from '../tui/render.js';
 import type { RenderOptions } from '../tui/render.js';
 import {
+  accelerators,
   describeSelection,
   initialState,
   isFetching,
@@ -30,6 +31,8 @@ import {
   selectedNode,
   shouldRefuseTui,
   visibleEntries,
+  withActionResult,
+  withActions,
   withError,
   withFreshListing,
   withListing,
@@ -874,3 +877,305 @@ describe('tui: the last stage of a staged read', () => {
     assert.ok(next.selected >= 0 && next.selected < 1, 'the selection must stay on the list');
   });
 });
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Tests for acting on the selection.
+ *
+ * The palette is the part of the pane that can do damage, so these lean on the two
+ * questions that matter: can something be sent that the user did not mean to send, and can
+ * the user get out of it. Every path into `invoke` is asserted to carry the exact
+ * parameters that were typed, because the failure mode is not a crash — it is an approval
+ * with the comment silently dropped.
+ */
+describe('tui: acting on the selection', () => {
+  const REPLY: ActionDescriptor = {
+    name: 'reply',
+    label: 'Reply',
+    group: 'reply',
+    key: 'r',
+    params: [{ name: 'body', type: 'text', label: 'Reply', required: true }],
+  };
+  const APPROVE: ActionDescriptor = { name: 'approve', label: 'Approve', group: 'review' };
+  const MERGE: ActionDescriptor = { name: 'merge', label: 'Merge', group: 'review', destructive: true };
+  const CLOSE: ActionDescriptor = {
+    name: 'close',
+    label: 'Close',
+    destructive: true,
+    params: [{ name: 'reason', type: 'choice', label: 'Reason', choices: ['completed', 'not-planned'] }],
+  };
+  const ALL = [APPROVE, MERGE, REPLY, CLOSE];
+
+  function palette(descriptors: readonly ActionDescriptor[] = ALL): TuiState {
+    const state = stateWith();
+    return withActions(state, ENTRIES[1] as VNode, '/mail/2024-01-01-budget-review.eml', descriptors);
+  }
+
+  it('asks the provider what is possible instead of guessing', () => {
+    const step = reduce(stateWith(), key('a'));
+    assert.deepEqual(step.effects, [
+      { kind: 'actions', node: ENTRIES[0], path: '/mail/Inbox' },
+    ]);
+    assert.equal(step.state.mode, 'browse', 'the palette opens only once the answer arrives');
+  });
+
+  it('works from the preview pane, so a reader never has to go back to the list', () => {
+    const reading = withPreview(stateWith(), 'Inbox', ['body']);
+    const step = reduce(reading, key('a'));
+    assert.equal(step.effects[0]?.kind, 'actions');
+  });
+
+  it('says so rather than opening an empty menu', () => {
+    const state = withActions(stateWith(), ENTRIES[1] as VNode, '/mail/x', []);
+    assert.equal(state.mode, 'browse');
+    assert.match(state.status, /nothing you can do/i);
+  });
+
+  it('names the item and the first action out loud when it opens', () => {
+    const state = palette();
+    assert.match(state.status, /4 actions for 2024-01-01-budget-review\.eml/);
+    assert.match(state.status, /1 of 4, Approve/);
+  });
+
+  it('honours a provider\u2019s requested letter, and never assigns it twice', () => {
+    // `reply` asks for `r`; `review`-group verbs would otherwise have taken it first.
+    assert.deepEqual(accelerators(ALL), ['a', 'm', 'r', 'c']);
+    assert.equal(new Set(accelerators(ALL)).size, ALL.length);
+  });
+
+  it('gives every action an accelerator even when the letters run out', () => {
+    const same: readonly ActionDescriptor[] = [
+      { name: 'aa', label: 'A' },
+      { name: 'aa2', label: 'B', key: 'a' },
+      { name: 'a', label: 'C' },
+    ];
+    const keys = accelerators(same);
+    assert.equal(keys[1], 'a', 'the explicit request wins');
+    assert.equal(new Set(keys).size, 3, keys.join(','));
+    assert.ok(keys.every((k) => k !== ' '), keys.join(','));
+  });
+
+  it('runs a parameterless action straight away', () => {
+    const step = reduce(palette(), char('a'));
+    assert.deepEqual(step.effects, [
+      {
+        kind: 'invoke',
+        action: 'approve',
+        node: ENTRIES[1],
+        path: '/mail/2024-01-01-budget-review.eml',
+        params: {},
+        label: 'Approve',
+      },
+    ]);
+    assert.equal(step.state.mode, 'browse');
+  });
+
+  it('can also be driven with the arrows and Enter, for anyone who cannot see the letters', () => {
+    let state = palette();
+    state = reduce(state, key('down')).state;
+    assert.match(state.status, /2 of 4, Merge/);
+    const step = reduce(state, key('return'));
+    assert.equal(step.state.mode, 'confirm', 'merge is destructive');
+  });
+
+  it('wraps rather than sticking at the ends', () => {
+    let state = palette();
+    state = reduce(state, key('up')).state;
+    assert.equal(state.actionIndex, 3);
+    state = reduce(state, key('down')).state;
+    assert.equal(state.actionIndex, 0);
+  });
+
+  it('collects a parameter and passes exactly what was typed', () => {
+    let state = palette();
+    state = reduce(state, char('r')).state;
+    assert.equal(state.mode, 'param');
+    assert.match(state.status, /Reply.*required/);
+
+    for (const c of 'on it') state = reduce(state, char(c)).state;
+    const step = reduce(state, key('return'));
+
+    assert.equal(step.effects.length, 1);
+    const effect = step.effects[0];
+    assert.ok(effect?.kind === 'invoke');
+    assert.deepEqual(effect.params, { body: 'on it' });
+  });
+
+  it('turns a typed \\n into a real line break', () => {
+    let state = reduce(palette(), char('r')).state;
+    for (const c of 'one\\ntwo') state = reduce(state, char(c)).state;
+    const effect = reduce(state, key('return')).effects[0];
+    assert.ok(effect?.kind === 'invoke');
+    assert.deepEqual(effect.params, { body: 'one\ntwo' });
+  });
+
+  it('will not send an empty answer to a required parameter', () => {
+    const state = reduce(palette(), char('r')).state;
+    const step = reduce(state, key('return'));
+    assert.equal(step.state.mode, 'param', 'still asking');
+    assert.match(step.state.status, /required/);
+    assert.deepEqual(
+      step.effects.map((effect) => effect.kind),
+      ['bell'],
+    );
+  });
+
+  it('lets an optional parameter be skipped, so the default applies', () => {
+    let state = reduce(palette(), char('c')).state;
+    assert.equal(state.mode, 'param');
+    state = reduce(state, key('return')).state;
+    assert.equal(state.mode, 'confirm', 'skipped straight to the confirmation');
+    const step = reduce(state, key('y'));
+    const effect = step.effects[0];
+    assert.ok(effect?.kind === 'invoke');
+    assert.deepEqual(effect.params, {}, 'absent, not blank — the provider applies its own default');
+  });
+
+  it('asks before doing something destructive', () => {
+    const state = reduce(palette(), char('m')).state;
+    assert.equal(state.mode, 'confirm');
+    assert.match(state.status, /press y to confirm/);
+    assert.deepEqual(reduce(state, char('m')).effects, [], 'anything but y cancels');
+  });
+
+  // Enter is the key someone is already pressing when a prompt appears, which is precisely
+  // why it must not be the one that merges a pull request.
+  it('does not accept Enter as a confirmation', () => {
+    const state = reduce(palette(), char('m')).state;
+    const step = reduce(state, key('return'));
+    assert.deepEqual(step.effects, []);
+    assert.match(step.state.status, /Nothing was sent/);
+  });
+
+  it('lets Escape out at every stage, sending nothing', () => {
+    const chosen = reduce(palette(), char('r')).state;
+    for (const state of [palette(), chosen, reduce(palette(), char('m')).state]) {
+      const step = reduce(state, key('escape'));
+      assert.deepEqual(step.effects, []);
+      assert.equal(step.state.mode, 'browse');
+      assert.equal(step.state.pending, undefined);
+    }
+  });
+
+  it('keeps Ctrl+C working mid-parameter', () => {
+    const state = reduce(palette(), char('r')).state;
+    const step = reduce(state, key('c', { ctrl: true }));
+    assert.deepEqual(
+      step.effects.map((effect) => effect.kind),
+      ['quit'],
+    );
+  });
+
+  it('rings rather than silently ignoring a letter that is not bound', () => {
+    const step = reduce(palette(), char('z'));
+    assert.equal(step.state.mode, 'actions', 'the palette stays open');
+    assert.deepEqual(
+      step.effects.map((effect) => effect.kind),
+      ['bell'],
+    );
+  });
+
+  it('reports the result in the provider\u2019s own words', () => {
+    const state = withActionResult(palette(), {
+      ok: true,
+      message: 'Approved #14.',
+      details: ['Comment: looks right.'],
+    });
+    assert.equal(state.status, 'Approved #14. Comment: looks right.');
+    assert.equal(state.mode, 'browse');
+    assert.equal(state.busy, false);
+  });
+
+  it('abandons a half-filled action when something goes wrong', () => {
+    const mid = reduce(palette(), char('r')).state;
+    const state = withError(mid, 'The network went away.');
+    assert.equal(state.mode, 'browse');
+    assert.equal(state.pending, undefined);
+  });
+
+  it('treats acting as work, so keys are refused while it happens', () => {
+    assert.equal(isFetching({ kind: 'actions', node: ENTRIES[0] as VNode, path: '/mail/Inbox' }), true);
+    assert.equal(
+      isFetching({ kind: 'invoke', action: 'approve', node: ENTRIES[0] as VNode, path: '/x', params: {}, label: 'Approve' }),
+      true,
+    );
+  });
+});
+
+describe('tui: the palette on screen', () => {
+  const ACTIONS: readonly ActionDescriptor[] = [
+    { name: 'approve', label: 'Approve', group: 'review' },
+    { name: 'merge', label: 'Merge', group: 'review', destructive: true },
+    { name: 'reply', label: 'Reply', group: 'reply', key: 'r' },
+  ];
+
+  function palette(columns = 80): { state: TuiState; lines: string[] } {
+    const state = withActions(stateWith(), ENTRIES[1] as VNode, '/mail/x', ACTIONS);
+    return { state, lines: render(state, { ...OPTIONS, columns }) };
+  }
+
+  it('shows every action with the key that runs it', () => {
+    const text = palette().lines.map(strip).join('\n');
+    for (const [key, label] of [
+      ['a', 'Approve'],
+      ['m', 'Merge'],
+      ['r', 'Reply'],
+    ]) {
+      assert.match(text, new RegExp(`${key as string}\\s+${label as string}`), `${label as string} needs its key shown`);
+    }
+  });
+
+  it('groups them, and marks the ones that will ask first', () => {
+    const text = palette().lines.map(strip).join('\n');
+    assert.match(text, /review/);
+    assert.match(text, /Merge !/);
+    assert.doesNotMatch(text, /Approve !/);
+  });
+
+  it('names the item it is about', () => {
+    assert.match(palette().lines.map(strip).join('\n'), /Actions .* Budget review/);
+  });
+
+  it('takes the whole width when there is no room to split', () => {
+    const { lines } = palette(40);
+    const text = lines.map(strip).join('\n');
+    assert.match(text, /Approve/, 'the palette must still be reachable on a narrow terminal');
+  });
+
+  it('keeps every row exactly the terminal width', () => {
+    for (const columns of [40, 60, 80, 120]) {
+      for (const line of palette(columns).lines) {
+        assert.equal(displayWidth(strip(line)), Math.max(24, columns), `${String(columns)}: ${strip(line)}`);
+      }
+    }
+  });
+
+  it('prompts on the input line while a parameter is being typed', () => {
+    const withParam: readonly ActionDescriptor[] = [
+      { name: 'reply', label: 'Reply', params: [{ name: 'body', type: 'text', label: 'Reply', required: true }] },
+    ];
+    let state = withActions(stateWith(), ENTRIES[1] as VNode, '/mail/x', withParam);
+    state = reduce(state, char('r')).state;
+    for (const c of 'hi') state = reduce(state, char(c)).state;
+
+    const lines = render(state, OPTIONS).map(strip);
+    assert.match(lines[lines.length - 1] ?? '', /Reply: hi/);
+    // The chosen action stays highlighted, so the screen still answers "into what?".
+    assert.match(lines.join('\n'), /> .*Reply/);
+  });
+
+  it('says what confirms and what cancels', () => {
+    let state = withActions(stateWith(), ENTRIES[1] as VNode, '/mail/x', ACTIONS);
+    state = reduce(state, char('m')).state;
+    const lines = render(state, OPTIONS).map(strip);
+    assert.match(lines[lines.length - 1] ?? '', /press y to go ahead, any other key to cancel/);
+  });
+
+  it('advertises the key in the footer and documents it in help', () => {
+    assert.match(render(stateWith(), OPTIONS).map(strip).join('\n'), /a act/);
+    assert.match(renderHelp(OPTIONS).map(strip).join('\n'), /what you can do with the selected item/);
+  });
+});
+
+

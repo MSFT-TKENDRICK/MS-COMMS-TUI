@@ -858,3 +858,173 @@ describe('dispatcher: cross-source find', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+
+describe('do: passing an action its arguments', () => {
+  /**
+   * A tree with the subtypes the action commands look for, so the verbs under test are
+   * actually offered. TREE above deliberately leaves subtype off, which makes every item
+   * a plain note with only the state verbs.
+   */
+  const ACTIONABLE: readonly MemoryItem[] = [
+    {
+      id: 'inbox',
+      title: 'Inbox',
+      subtype: 'folder',
+      children: [
+        {
+          id: 'am1',
+          title: 'FY26 budget review',
+          subtype: 'message',
+          author: 'Tom Okafor',
+          agoMinutes: 20,
+          body: 'The budget review is on Thursday.',
+          flags: ['unread'],
+        },
+      ],
+    },
+    {
+      id: 'pulls',
+      title: 'Pulls',
+      subtype: 'folder',
+      children: [
+        {
+          id: 'ap1',
+          title: 'Cap default listings',
+          subtype: 'pull',
+          author: 'Dana Whitfield',
+          agoMinutes: 60,
+          body: 'Adds paging.',
+          flags: ['open'],
+        },
+      ],
+    },
+  ];
+
+  async function actionable(): Promise<Harness> {
+    const registry = new PluginRegistry(NULL_LOGGER);
+    registry.register(memoryPlugin);
+
+    const config: AppConfig = {
+      ...DEFAULT_CONFIG,
+      mounts: [
+        {
+          id: 'work',
+          path: '/work',
+          type: 'memory',
+          options: { items: ACTIONABLE, displayName: 'Test work', now: () => NOW },
+        },
+      ],
+      ui: { ...DEFAULT_CONFIG.ui, plain: true, color: 'never' },
+    };
+
+    const session = new Session({
+      config,
+      registry,
+      logger: NULL_LOGGER,
+      paths: PATHS,
+      mode: 'plain',
+      color: false,
+      width: 100,
+      write: () => undefined,
+      writeError: () => undefined,
+    });
+    await session.start();
+
+    const dispatcher = new Dispatcher(buildTable());
+    return {
+      session,
+      dispatcher,
+      run: async (line) => session.capture(async () => dispatcher.execute(session, line)),
+    };
+  }
+
+  it('takes the token after --body as the body', async () => {
+    // The regression: an action parameter is not a declared flag of `do`, so a parser that
+    // only gives values to flags it knows about turns `--body "text"` into a bare switch
+    // plus a stray positional. The approval then goes out with no comment on it, which is
+    // both wrong and silent.
+    const h = await actionable();
+    await h.run('cd /work/Pulls');
+    await h.run('ls');
+    const out = await h.run('do approve 1 --body "Paging looks right."');
+    assert.match(out, /Approved/);
+    assert.match(out, /Paging looks right\./);
+  });
+
+  it('accepts --body=value too', async () => {
+    const h = await actionable();
+    await h.run('cd /work/Pulls');
+    await h.run('ls');
+    const out = await h.run('do approve 1 --body=Looks-good');
+    assert.match(out, /Looks-good/);
+  });
+
+  it('keeps a declared switch a switch', async () => {
+    // `--yes` must not eat the number after it, or confirming a merge would silently
+    // retarget the command.
+    const h = await actionable();
+    await h.run('cd /work/Pulls');
+    await h.run('ls');
+    const out = await h.run('do merge 1 --yes');
+    assert.match(out, /Merged/);
+  });
+
+  it('still asks first without --yes', async () => {
+    const h = await actionable();
+    await h.run('cd /work/Pulls');
+    await h.run('ls');
+    const out = await h.run('do merge 1');
+    assert.match(out, /--yes/);
+    assert.doesNotMatch(out, /Merged/);
+  });
+
+  it('names the parameter the user meant to type', async () => {
+    const h = await actionable();
+    await h.run('cd /work/Pulls');
+    await h.run('ls');
+    const out = await h.run('do approve 1 --boddy x');
+    assert.match(out, /no parameter called "boddy"/);
+    assert.match(out, /Did you mean "body"/);
+  });
+
+  it('refuses an action the item does not offer, and says what it does', async () => {
+    const h = await actionable();
+    await h.run('cd /work/Pulls');
+    await h.run('ls');
+    const out = await h.run('do reply 1 --body hello');
+    assert.match(out, /no action called "reply"/);
+    assert.match(out, /approve/);
+  });
+
+  it('reports a missing required argument rather than sending a blank one', async () => {
+    const h = await actionable();
+    await h.run('cd /work/Inbox');
+    await h.run('ls');
+    const out = await h.run('do reply 1');
+    assert.match(out, /body/);
+    assert.doesNotMatch(out, /Replied/);
+  });
+
+  it('lists the arguments an action wants', async () => {
+    const h = await actionable();
+    await h.run('cd /work/Inbox');
+    await h.run('ls');
+    const out = await h.run('actions 1');
+    assert.match(out, /reply/);
+    assert.match(out, /--body\*/, 'a required argument is marked');
+  });
+
+  it('applies the reply to the conversation, not to the message', async () => {
+    // A reply hung off the message would turn a readable mail into a folder.
+    const h = await actionable();
+    await h.run('cd /work/Inbox');
+    await h.run('ls');
+    await h.run('do reply 1 --body "On it, thanks."');
+    const out = await h.run('ls');
+    // The listing sanitises `:` out of a file name, so the reply reads "Re- ...".
+    assert.match(out, /Re[:-] FY26 budget review/);
+    assert.match(out, /2 items|1 item/, 'the reply is a sibling, not a child');
+  });
+});

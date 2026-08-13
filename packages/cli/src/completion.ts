@@ -153,19 +153,23 @@ export class Completer {
    */
   #argKindFor(command: Command, tokens: readonly string[], currentIndex: number, current: string): ArgKind {
     const valueFlags = new Set<string>();
+    const switches = new Set<string>();
     for (const flag of command.flags ?? []) {
-      if (flag.value === true) {
-        valueFlags.add(`--${flag.name}`);
-        valueFlags.add(`-${flag.name}`);
-        for (const alias of flag.aliases ?? []) {
-          valueFlags.add(`--${alias}`);
-          valueFlags.add(`-${alias}`);
-        }
+      const target = flag.value === true ? valueFlags : switches;
+      for (const name of [flag.name, ...(flag.aliases ?? [])]) {
+        target.add(`--${name}`);
+        target.add(`-${name}`);
       }
     }
 
+    /** Mirrors the parser: under {@link Command.openFlags} an undeclared flag takes a value. */
+    const eatsNext = (token: string): boolean =>
+      valueFlags.has(token) || (command.openFlags === true && !switches.has(token));
+
     const previous = tokens[currentIndex - 1];
-    if (previous !== undefined && valueFlags.has(previous)) {
+    if (previous !== undefined && previous.startsWith('-') && eatsNext(previous)) {
+      // Free text belongs to whoever declared the flag; there is nothing to offer for it.
+      if (!valueFlags.has(previous)) return 'none';
       return previous.replace(/^-+/, '') === 'q' || previous.endsWith('query') ? 'query' : 'none';
     }
 
@@ -176,7 +180,7 @@ export class Completer {
     for (let i = 1; i < currentIndex; i += 1) {
       const token = tokens[i] as string;
       if (token.startsWith('-')) {
-        if (valueFlags.has(token)) i += 1;
+        if (eatsNext(token)) i += 1;
         continue;
       }
       positionalIndex += 1;

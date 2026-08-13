@@ -56,6 +56,7 @@ import {
 } from '@mscomms/core';
 import { GitHubClient, type FetchLike } from './client.js';
 import { ghToken } from './gh.js';
+import { GITHUB_ACTIONS, type GitHubActionContext } from './actions.js';
 import {
   DISCUSSIONS_QUERY,
   DISCUSSION_QUERY,
@@ -653,10 +654,11 @@ export class GitHubProvider implements Provider {
           summary: `${item.reason} in ${item.repository.full_name}`,
           meta: {
             level: 'notification',
+            threadId: item.id,
             reason: item.reason,
             repository: item.repository.full_name,
             type: item.subject.type,
-            ...(item.subject.url === null ? {} : { apiUrl: item.subject.url }),
+            ...(item.subject.url === null ? {} : { apiUrl: item.subject.url, url: item.subject.url }),
           },
         };
       }),
@@ -795,6 +797,7 @@ export class GitHubProvider implements Provider {
       ...(item.author === null ? {} : { author: item.author.login, authorId: item.author.login }),
       meta: {
         level: 'discussion',
+        discussionId: item.id,
         owner,
         repo,
         number: item.number,
@@ -1261,13 +1264,15 @@ export class GitHubProvider implements Provider {
   }
 
   async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
-    if (node.meta?.['url'] === undefined) return [];
-    return [{ name: 'url', label: 'Show the web URL', description: 'Print the canonical GitHub URL for this item.' }];
+    return GITHUB_ACTIONS.descriptors(node, this.#actionContext());
   }
 
-  async invoke(action: string, node: VNode, _params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
-    if (action !== 'url') throw VfsError.unsupported(`Action "${action}"`, this.id);
-    return { ok: true, message: String(node.meta?.['url'] ?? '') };
+  async invoke(action: string, node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    return GITHUB_ACTIONS.invoke(action, node, params, this.#actionContext(), this.id);
+  }
+
+  #actionContext(): GitHubActionContext {
+    return { client: this.#api };
   }
 }
 

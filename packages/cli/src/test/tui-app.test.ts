@@ -119,6 +119,8 @@ async function harness(
      * exactly wrong for testing behaviour that only exists because real sources are not.
      */
     readonly hold?: () => Promise<void>;
+    /** A different tree, for tests that need subtypes the action commands look for. */
+    readonly items?: readonly MemoryItem[];
   } = {},
 ): Promise<Harness> {
   const registry = new PluginRegistry(NULL_LOGGER);
@@ -134,7 +136,7 @@ async function harness(
               id: 'mail',
               path: '/mail',
               type: 'memory',
-              options: { items: TREE, displayName: 'Test mail', now: () => NOW },
+              options: { items: options.items ?? TREE, displayName: 'Test mail', now: () => NOW },
             },
           ],
     ui: { ...DEFAULT_CONFIG.ui, color: 'never' },
@@ -670,6 +672,159 @@ describe('tui app: while a source is slow', () => {
       g.release();
     }
 
+    await h.send('q');
+    await h.done;
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * The palette, end to end: real bytes in, real frames out, a real provider mutated.
+ *
+ * `state.ts` proves the state machine and `render.ts` proves the frame, but neither can
+ * prove that `a` reaches the reducer, that the effect it asks for is actually performed, or
+ * that the listing is re-read afterwards. That last one is the failure worth a test of its
+ * own: an action that works but leaves the pane showing the state from before it ran is
+ * indistinguishable, to the person looking at the screen, from an action that silently did
+ * nothing.
+ */
+describe('tui app: acting on the selection', () => {
+  const ACTIONABLE: readonly MemoryItem[] = [
+    {
+      id: 'inbox',
+      title: 'Inbox',
+      subtype: 'folder',
+      children: [
+        {
+          id: 'am1',
+          title: 'FY26 budget review',
+          subtype: 'message',
+          author: 'Tom Okafor',
+          agoMinutes: 20,
+          body: 'The budget review is on Thursday.',
+          flags: ['unread'],
+        },
+        {
+          id: 'am2',
+          title: 'Deployment window moved',
+          subtype: 'message',
+          author: 'Dana Whitfield',
+          agoMinutes: 90,
+          body: 'Moved to Friday at noon.',
+        },
+      ],
+    },
+  ];
+
+  it('opens a palette of only the verbs that apply', async () => {
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('\r'); // into Inbox
+    await h.send('a');
+
+    const frame = h.frame();
+    assert.match(frame, /Reply/, 'a message can be replied to');
+    assert.match(frame, /Forward/);
+    assert.match(frame, /Mark as read/, 'this one is unread');
+    assert.doesNotMatch(frame, /Mark as unread/, 'and so cannot be marked unread');
+    assert.doesNotMatch(frame, /Approve/, 'a mail is not a pull request');
+
+    await h.send('\u001B', 700); // a real Escape needs the escape-sequence timeout to lapse
+    assert.doesNotMatch(h.frame(), /Forward/, 'the palette is closed');
+    await h.send('q');
+    await h.done;
+  });
+
+  it('asks for each declared argument, then runs the action', async () => {
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('\r');
+    await h.send('a');
+    await h.send('r'); // reply
+
+    assert.match(h.frame(), /Reply/, 'the prompt names what it is asking for');
+
+    await h.send('On it, thanks.');
+    await h.send('\r');
+
+    assert.match(h.text(), /Replied to/, 'the result is announced');
+    await h.send('q');
+    await h.done;
+  });
+
+  it('re-reads the listing so the screen shows what just happened', async () => {
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('\r');
+    await h.send('a');
+    await h.send('r');
+    await h.send('Noted.');
+    await h.send('\r', 120);
+
+    assert.match(h.frame(), /Re[:-] FY26 budget review/, 'the reply is in the folder on screen');
+    await h.send('q');
+    await h.done;
+  });
+
+  it('confirms a destructive verb, and does nothing when refused', async () => {
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('\r');
+    await h.send('a');
+    await h.send('d'); // delete
+
+    assert.match(h.frame(), /y\/n|cannot be undone|Delete/i, 'it must ask before deleting');
+
+    await h.send('n', 120);
+    assert.doesNotMatch(h.text(), /Deleted "FY26/, 'refusing must not delete');
+    assert.match(h.frame(), /FY26 budget review/, 'the message is still there');
+
+    await h.send('q');
+    await h.done;
+  });
+
+  it('treats a bare Enter at the confirmation as "no"', async () => {
+    // Enter is the key that was just pressed to get here. Accepting it as "yes" turns a
+    // double-tap into an irreversible action, which is the exact accident the prompt exists
+    // to prevent — so it cancels rather than confirming.
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('\r');
+    await h.send('a');
+    await h.send('d');
+    await h.send('\r', 120);
+    assert.doesNotMatch(h.text(), /Deleted "FY26/);
+    assert.match(h.frame(), /FY26 budget review/, 'the message survived');
+
+    await h.send('q');
+    await h.done;
+  });
+
+  it('deletes when the confirmation is answered with y', async () => {
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('\r');
+    await h.send('a');
+    await h.send('d');
+    await h.send('y', 150);
+    assert.match(h.text(), /Deleted/);
+    await h.send('q');
+    await h.done;
+  });
+
+  it('offers a folder only the verbs a folder can answer', async () => {
+    // The palette is not "the verbs this source has"; it is "the verbs this node has". A
+    // folder is taggable and flaggable and nothing else, and offering it Reply would be
+    // offering something that could only fail.
+    const h = await harness({ items: ACTIONABLE });
+    await ready(h);
+    await h.send('a');
+
+    const frame = h.frame();
+    assert.match(frame, /Add a tag|Flag/);
+    assert.doesNotMatch(frame, /Reply|Forward/);
+    await h.send('\u001B', 700);
     await h.send('q');
     await h.done;
   });

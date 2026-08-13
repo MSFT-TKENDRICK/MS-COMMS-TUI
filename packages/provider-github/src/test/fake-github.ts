@@ -346,7 +346,7 @@ export function createFakeGitHub(options: FakeOptions = {}): FakeGitHub {
       return json({ message: 'Server Error' }, 500);
     }
 
-    return url.pathname === '/graphql' ? graphql(record, options) : rest(url, options);
+    return url.pathname === '/graphql' ? graphql(record, options) : rest(record, url, options);
   };
 
   return {
@@ -357,9 +357,42 @@ export function createFakeGitHub(options: FakeOptions = {}): FakeGitHub {
   };
 }
 
-function rest(url: URL, _options: FakeOptions): Response {
+function rest(record: RecordedRequest, url: URL, _options: FakeOptions): Response {
   const path = url.pathname;
   const repo = `/repos/${OWNER}/${REPO}`;
+
+  if (record.method !== 'GET') {
+    if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/reviews$/.test(path) && record.method === 'POST') {
+      return json({ id: 9001, ...(record.body as Record<string, unknown>) }, 200);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/comments$/.test(path) && record.method === 'POST') {
+      return json({ id: 9002, ...(record.body as Record<string, unknown>) }, 201);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/merge$/.test(path) && record.method === 'PUT') {
+      return json({ merged: true, message: 'Pull Request successfully merged' }, 200);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(path) && record.method === 'PATCH') {
+      return json({ ...(record.body as Record<string, unknown>) }, 200);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/issues\/\d+$/.test(path) && record.method === 'PATCH') {
+      return json({ ...(record.body as Record<string, unknown>) }, 200);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/pulls\/\d+\/requested_reviewers$/.test(path) && record.method === 'POST') {
+      return json({ requested_reviewers: (record.body as { reviewers?: unknown }).reviewers ?? [] }, 201);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/assignees$/.test(path) && record.method === 'POST') {
+      return json({ assignees: (record.body as { assignees?: unknown }).assignees ?? [] }, 201);
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/labels$/.test(path) && record.method === 'POST') {
+      return json((record.body as { labels?: unknown }).labels ?? [], 200);
+    }
+    if (/^\/notifications\/threads\/[^/]+$/.test(path) && record.method === 'PATCH') {
+      return new Response(null, { status: 204 });
+    }
+    if (/^\/notifications\/threads\/[^/]+\/subscription$/.test(path) && record.method === 'PUT') {
+      return json({ ignored: true }, 200);
+    }
+  }
 
   if (path === '/notifications') {
     const perPage = Number(url.searchParams.get('per_page') ?? '50');
@@ -617,6 +650,16 @@ function graphql(record: RecordedRequest, options: FakeOptions): Response {
       });
     }
 
+    case 'AddDiscussionComment':
+      return json({
+        data: {
+          addDiscussionComment: {
+            comment: { id: 'DC_new' },
+          },
+        },
+        errors,
+      });
+
     default:
       return json({ data: null, errors: [{ type: 'BAD_REQUEST', message: `Unknown operation ${String(record.operation)}` }] });
   }
@@ -631,5 +674,5 @@ function json(payload: unknown, status = 200, headers: Record<string, string> = 
 
 /** The operation name out of a query document, so the fake can route on it. */
 function operationName(query: string): string {
-  return /query\s+(\w+)/.exec(query)?.[1] ?? '';
+  return /(?:query|mutation)\s+(\w+)/.exec(query)?.[1] ?? '';
 }
