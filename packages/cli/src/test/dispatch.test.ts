@@ -213,6 +213,89 @@ describe('session: capture', () => {
   });
 });
 
+describe('session: beforeFirstWrite', () => {
+  it('fires immediately ahead of the first byte, not before the command runs', async () => {
+    // The ordering is the whole point. The shell uses this to erase a progress line that
+    // occupies the cursor's current row: erase too early and it is erased before it has
+    // finished animating, too late and the command's output has already scrolled past it,
+    // stranding a spinner in the scrollback.
+    const { session } = await harness();
+    const events: string[] = [];
+    await session.beforeFirstWrite(
+      () => events.push('erase'),
+      async () => {
+        events.push('working');
+        session.print('first');
+        events.push('after-write');
+        session.print('second');
+        return Promise.resolve();
+      },
+    );
+    assert.deepEqual(events, ['working', 'erase', 'after-write']);
+  });
+
+  it('fires once however much is printed', async () => {
+    const { session } = await harness();
+    let fired = 0;
+    await session.beforeFirstWrite(
+      () => (fired += 1),
+      async () => {
+        session.print('a');
+        session.status('b');
+        session.print('c');
+        return Promise.resolve();
+      },
+    );
+    assert.equal(fired, 1);
+  });
+
+  it('does not fire for a command that prints nothing', async () => {
+    // A silent command never disturbed the line, so there is nothing to erase.
+    const { session } = await harness();
+    let fired = 0;
+    await session.beforeFirstWrite(
+      () => (fired += 1),
+      async () => Promise.resolve(),
+    );
+    assert.equal(fired, 0);
+  });
+
+  it('watches stderr too, since a warning also lands on the line', async () => {
+    const { session } = await harness();
+    let fired = 0;
+    await session.beforeFirstWrite(
+      () => (fired += 1),
+      async () => {
+        session.status('warning');
+        return Promise.resolve();
+      },
+    );
+    assert.equal(fired, 1);
+  });
+
+  it('restores the sinks even when the command throws', async () => {
+    // Same silent-wedge failure as `capture`: a throwing command must not leave the session
+    // writing through a filter that outlives it, or every later line re-triggers `before`.
+    const { session } = await harness();
+    let fired = 0;
+    await assert.rejects(
+      session.beforeFirstWrite(
+        () => (fired += 1),
+        async () => {
+          throw new Error('boom');
+        },
+      ),
+      /boom/,
+    );
+    const output = await session.capture(async () => {
+      session.print('still working');
+      return Promise.resolve();
+    });
+    assert.ok(output.includes('still working'));
+    assert.equal(fired, 0, 'nothing was printed, so nothing needed erasing');
+  });
+});
+
 describe('dispatch: the shared command path', () => {
   it('runs a named command', async () => {
     const { run } = await harness();

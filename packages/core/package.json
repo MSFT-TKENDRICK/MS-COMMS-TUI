@@ -10,8 +10,14 @@
     ".": "./dist/index.js",
     "./testing": "./dist/testing/index.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc --build"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.17.4",
+    "agentfs-sdk": "^0.6.4"
   }
 }

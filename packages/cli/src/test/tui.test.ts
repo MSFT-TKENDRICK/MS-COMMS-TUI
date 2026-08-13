@@ -20,18 +20,22 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { VNode } from '@mscomms/core';
 import { DEFAULT_FORMAT } from '../format.js';
-import { bodyRows, fit, render, renderHelp, CHROME_ROWS } from '../tui/render.js';
+import { bodyRows, fit, render, renderHelp, workingLabel, CHROME_ROWS } from '../tui/render.js';
 import type { RenderOptions } from '../tui/render.js';
 import {
   describeSelection,
   initialState,
+  isFetching,
   reduce,
   selectedNode,
   shouldRefuseTui,
   visibleEntries,
   withError,
+  withFreshListing,
   withListing,
   withPreview,
+  withProgress,
+  withRefusal,
   withRows,
 } from '../tui/state.js';
 import type { Key, TuiState } from '../tui/state.js';
@@ -134,7 +138,7 @@ describe('tui: movement', () => {
 describe('tui: opening things', () => {
   it('asks to list a folder, using the joined path', () => {
     const step = reduce(stateWith(), key('return'));
-    assert.deepEqual(step.effects, [{ kind: 'list', path: '/mail/Inbox' }]);
+    assert.deepEqual(step.effects, [{ kind: 'list', path: '/mail/Inbox', nav: 'push' }]);
   });
 
   it('asks to read a file', () => {
@@ -147,7 +151,7 @@ describe('tui: opening things', () => {
   it('goes up with Backspace, Left and h alike', () => {
     for (const k of ['backspace', 'left', 'h']) {
       const step = reduce(stateWith(), key(k));
-      assert.deepEqual(step.effects, [{ kind: 'list', path: '/' }], `${k} should go up`);
+      assert.deepEqual(step.effects, [{ kind: 'list', path: '/', nav: 'push' }], `${k} should go up`);
     }
   });
 
@@ -638,5 +642,235 @@ describe('tui: external transitions', () => {
     const state = withError({ ...stateWith(), busy: true }, 'Network unreachable.');
     assert.equal(state.busy, false);
     assert.equal(state.status, 'Network unreachable.');
+  });
+});
+
+describe('tui: showing that it is alive', () => {
+  it('advances the frame and the clock while busy', () => {
+    const busy = { ...stateWith(), busy: true };
+    const later = withProgress(withProgress(busy, 100), 250);
+    assert.equal(later.tick, 2);
+    assert.equal(later.busyMs, 250);
+  });
+
+  it('ignores a tick that arrives after the work finished', () => {
+    // The repaint timer is cleared in a `finally`, but a timer that has already fired is
+    // already queued. A settled screen must not start spinning again.
+    const settled = withListing({ ...stateWith(), busy: true }, '/mail', ENTRIES);
+    const stray = withProgress(settled, 9_000);
+    assert.equal(stray.busy, false);
+    assert.equal(stray.tick, 0);
+    assert.equal(stray.busyMs, 0);
+  });
+
+  it('resets the clock when an operation ends, so the next one starts from zero', () => {
+    const slow = withProgress({ ...stateWith(), busy: true }, 8_000);
+    assert.ok(slow.busyMs > 0);
+    for (const settled of [
+      withListing(slow, '/mail', ENTRIES),
+      withPreview(slow, 'Note', ['body']),
+      withError(slow, 'Nope.'),
+    ]) {
+      assert.equal(settled.tick, 0, 'tick should be cleared');
+      assert.equal(settled.busyMs, 0, 'elapsed should be cleared');
+    }
+  });
+
+  it('changes what it draws from one tick to the next', () => {
+    // The old view drew a static "— working" once and never touched it again, which for a
+    // ten-second fetch is indistinguishable from a hang.
+    const busy = { ...stateWith(), busy: true };
+    const labels = new Set([0, 1, 2, 3].map((tick) => workingLabel({ ...busy, tick })));
+    assert.equal(labels.size, 4);
+  });
+
+  it('shows the elapsed seconds only once they distinguish slow from stuck', () => {
+    const busy = { ...stateWith(), busy: true };
+    assert.doesNotMatch(workingLabel({ ...busy, busyMs: 1_500 }), /\ds/);
+    assert.match(workingLabel({ ...busy, busyMs: 7_000 }), /7s/);
+  });
+
+  it('draws the indicator in the frame, not just in the state', () => {
+    const busy = withProgress({ ...stateWith(), busy: true }, 5_000);
+    const frame = strip(render(busy, OPTIONS).join('\n'));
+    assert.match(frame, /working 5s/);
+    assert.doesNotMatch(strip(render(stateWith(), OPTIONS).join('\n')), /working/);
+  });
+});
+
+describe('tui: keys during a slow load', () => {
+  it('knows which effects would cost a round trip', () => {
+    // This predicate is what lets the view stay responsive: anything it calls false is safe
+    // to honour while a request is outstanding.
+    assert.equal(isFetching({ kind: 'list', path: '/mail' }), true);
+    assert.equal(isFetching({ kind: 'read', node: ENTRIES[1] as VNode }), true);
+    assert.equal(isFetching({ kind: 'refresh' }), true);
+    assert.equal(isFetching({ kind: 'command', line: 'ls' }), true);
+    assert.equal(isFetching({ kind: 'quit' }), false);
+    assert.equal(isFetching({ kind: 'bell' }), false);
+  });
+
+  it('moving the selection asks for nothing, so it can always be honoured', () => {
+    const step = reduce(stateWith(), key('down'));
+    assert.equal(step.effects.some(isFetching), false);
+  });
+
+  it('quitting asks for nothing, so there is always a way out of a slow load', () => {
+    for (const name of ['q', 'escape']) {
+      const step = reduce(stateWith(), key(name));
+      assert.equal(step.effects.some(isFetching), false);
+      assert.ok(step.effects.some((effect) => effect.kind === 'quit'));
+    }
+  });
+
+  it('opening something does ask, so it is the case that must be refused', () => {
+    const step = reduce(stateWith(), key('return'));
+    assert.equal(step.effects.some(isFetching), true);
+  });
+
+  it('a refusal explains itself and leaves the work running', () => {
+    const busy = withProgress({ ...stateWith(), busy: true }, 3_000);
+    const refused = withRefusal(busy);
+    assert.equal(refused.busy, true, 'the outstanding request is untouched');
+    assert.equal(refused.busyMs, busy.busyMs, 'and its clock keeps running');
+    assert.match(refused.status, /still working/i);
+    assert.match(refused.status, /q/, 'should say how to get out');
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('tui: going back and forth', () => {
+  /** Walk the reducer the way the app does: press a key, then apply the listing it asked for. */
+  function navigate(state: TuiState, k: Key, entries: readonly VNode[] = ENTRIES): TuiState {
+    const step = reduce(state, k);
+    const effect = step.effects.find((e) => e.kind === 'list');
+    if (effect === undefined || effect.kind !== 'list') return step.state;
+    return withListing(step.state, effect.path, entries, effect.nav === undefined ? {} : { nav: effect.nav });
+  }
+
+  it('remembers where it has been, and goes back there', () => {
+    let state = stateWith();
+    state = navigate(state, key('return')); // into /mail/Inbox
+    assert.equal(state.cwd, '/mail/Inbox');
+
+    state = navigate(state, char('['));
+    assert.equal(state.cwd, '/mail', 'back should return to where we came from');
+  });
+
+  it('goes forward again after going back', () => {
+    let state = stateWith();
+    state = navigate(state, key('return'));
+    state = navigate(state, char('['));
+    state = navigate(state, char(']'));
+    assert.equal(state.cwd, '/mail/Inbox');
+  });
+
+  it('back is not the same as up', () => {
+    // The distinction that makes a history worth having. A `:` command can jump anywhere,
+    // so back is wherever you were, while up is still the parent of where you are.
+    let state = withListing(initialState('/', 10), '/teams/Chats', ENTRIES);
+    state = withListing(state, '/mail/Inbox', ENTRIES);
+
+    const afterBack = navigate(state, char('['));
+    assert.equal(afterBack.cwd, '/teams/Chats', 'back follows the trail');
+
+    const afterUp = navigate(state, key('backspace'));
+    assert.equal(afterUp.cwd, '/mail', 'up follows the path');
+  });
+
+  it('a new move discards the forward trail', () => {
+    // Otherwise forward offers a route the user has just abandoned.
+    let state = stateWith();
+    state = navigate(state, key('return'));
+    state = navigate(state, char('['));
+    state = navigate(state, key('backspace')); // somewhere new from here
+    const step = reduce(state, char(']'));
+    assert.deepEqual(step.effects, [{ kind: 'bell' }]);
+    assert.match(step.state.status, /forward/i);
+  });
+
+  it('says so at the ends of the trail rather than ignoring the key', () => {
+    const step = reduce(stateWith(), char('['));
+    assert.deepEqual(step.effects, [{ kind: 'bell' }]);
+    assert.match(step.state.status, /back/i);
+  });
+
+  it('accepts Alt+Left and Alt+Right as well', () => {
+    let state = stateWith();
+    state = navigate(state, key('return'));
+    state = navigate(state, key('left', { meta: true }));
+    assert.equal(state.cwd, '/mail', 'Alt+Left should go back, not up');
+    state = navigate(state, key('right', { meta: true }));
+    assert.equal(state.cwd, '/mail/Inbox');
+  });
+
+  it('puts the highlight back where it was', () => {
+    // The difference between returning to a place and arriving at a new one. Without it,
+    // stepping into a message and back out drops you at the top of a thousand-item Inbox.
+    let state = stateWith();
+    state = reduce(state, key('down')).state;
+    state = reduce(state, key('down')).state;
+    assert.equal(state.selected, 2);
+
+    state = navigate(state, key('backspace')); // up to /
+    assert.equal(state.selected, 0, 'a place never visited starts at the top');
+
+    state = navigate(state, char('['));
+    assert.equal(state.cwd, '/mail');
+    assert.equal(state.selected, 2, 'returning should restore the selection');
+  });
+});
+
+describe('tui: the last stage of a staged read', () => {
+  const FRESH: readonly VNode[] = [
+    node('urgent.eml', { title: 'Urgent', author: 'Ada Lovelace' }),
+    ...ENTRIES,
+  ];
+
+  it('replaces the entries without moving the user', () => {
+    // A snapshot answered instantly with something minutes old and the source has now said
+    // what is really there. The list must catch up; the highlight must not.
+    let state = stateWith();
+    state = reduce(state, key('down')).state;
+    const anchored = visibleEntries(state)[state.selected];
+
+    const next = withFreshListing(state, '/mail', FRESH);
+    assert.equal(next.entries.length, FRESH.length, 'the fresh listing should be shown');
+    assert.equal(
+      visibleEntries(next)[next.selected]?.name,
+      anchored?.name,
+      'the same item must still be selected, even though a row appeared above it',
+    );
+    assert.notEqual(next.selected, state.selected, 'which means the index had to move');
+  });
+
+  it('ignores news about somewhere else', () => {
+    const state = stateWith();
+    assert.equal(withFreshListing(state, '/teams', FRESH), state);
+  });
+
+  it('does not redraw underneath someone who is typing', () => {
+    // Filter and command modes are the moments when the screen changing is most hostile:
+    // the list is being narrowed keystroke by keystroke against what is on it.
+    const filtering = reduce(stateWith(), char('/')).state;
+    assert.equal(withFreshListing(filtering, '/mail', FRESH), filtering);
+
+    const commanding = reduce(stateWith(), char(':')).state;
+    assert.equal(withFreshListing(commanding, '/mail', FRESH), commanding);
+  });
+
+  it('does not pull the reader out of a message', () => {
+    const reading = withPreview(stateWith(), 'Budget review', ['body']);
+    assert.equal(withFreshListing(reading, '/mail', FRESH), reading);
+  });
+
+  it('copes with the selected item having gone away', () => {
+    let state = stateWith();
+    state = reduce(state, key('down')).state;
+    state = reduce(state, key('down')).state;
+    const next = withFreshListing(state, '/mail', [ENTRIES[0] as VNode]);
+    assert.equal(next.entries.length, 1);
+    assert.ok(next.selected >= 0 && next.selected < 1, 'the selection must stay on the list');
   });
 });

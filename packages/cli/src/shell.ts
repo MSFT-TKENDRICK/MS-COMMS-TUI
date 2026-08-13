@@ -31,6 +31,7 @@ import { vpath } from '@mscomms/core';
 import { Completer } from './completion.js';
 import { Dispatcher } from './dispatch.js';
 import { relativeTime, sanitizeForDisplay } from './format.js';
+import { Progress, progressLabel } from './progress.js';
 import type { Session } from './session.js';
 import type { CommandTable } from './commands/types.js';
 
@@ -39,6 +40,12 @@ export interface ShellOptions {
   readonly table: CommandTable;
   readonly input?: NodeJS.ReadableStream;
   readonly output?: NodeJS.WritableStream;
+  /**
+   * Where chrome goes: the prompt and the progress line. Defaults to stderr, and the
+   * progress line writes here *directly* rather than through the session — see the
+   * constructor for why that matters.
+   */
+  readonly errorOutput?: NodeJS.WritableStream;
   /** Skip the banner, for tests. */
   readonly quiet?: boolean;
 }
@@ -50,6 +57,8 @@ export class Shell {
   readonly #dispatcher: Dispatcher;
   readonly #historyFile: string;
   #rl: Interface | undefined;
+  /** Undefined when output is piped or announced — see the constructor. */
+  readonly #progress: Progress | undefined;
 
   constructor(private readonly options: ShellOptions) {
     this.#session = options.session;
@@ -61,6 +70,24 @@ export class Shell {
       write: (text) => options.session.write(text),
     });
     this.#historyFile = join(options.session.paths.stateDir, 'history');
+
+    // Only for an interactive terminal, and never in announce mode. Both exclusions are
+    // about not writing chrome where it does damage: a pipe would have the spinner's escape
+    // codes in its data, and a screen reader would hear every frame of it.
+    const inputStream = (options.input ?? process.stdin) as { isTTY?: boolean };
+    const interactive =
+      process.stderr.isTTY === true && inputStream.isTTY === true && options.session.format.mode !== 'announce';
+    // The spinner writes straight to the stream rather than through `session.writeError`,
+    // and that indirection is load-bearing. `beforeFirstWrite` latches on the first byte
+    // through the session's sinks so the progress line can be erased just ahead of the
+    // command's output — but the spinner is chrome, not output. Routed through the session
+    // it would trip its own latch on its first frame, the erase would be spent on nothing,
+    // and the command's real output would land on top of the spinner: "⠋ ls…Inbox",
+    // stranded in the scrollback forever. Which is the exact thing this mechanism exists
+    // to prevent.
+    this.#progress = interactive
+      ? new Progress({ write: (text) => (options.errorOutput ?? process.stderr).write(text), enabled: true })
+      : undefined;
   }
 
   async run(): Promise<number> {
@@ -158,9 +185,31 @@ export class Shell {
    *
    * Errors are caught and printed as sentences. An unhandled stack trace at an interactive
    * prompt is noise at best; through speech it is thirty seconds of unreadable file paths.
+   *
+   * The progress indicator is wrapped around the whole thing rather than started by
+   * individual slow commands: which commands are slow depends on what is mounted and what
+   * is cached, so it is not something a command can know about itself.
    */
   async #execute(line: string): Promise<void> {
-    await this.#dispatcher.execute(this.#session, line);
+    const progress = this.#progress;
+    if (progress === undefined) {
+      await this.#dispatcher.execute(this.#session, line);
+      return;
+    }
+
+    progress.start(progressLabel(line));
+    try {
+      await this.#session.beforeFirstWrite(
+        () => {
+          progress.clear();
+        },
+        async () => {
+          await this.#dispatcher.execute(this.#session, line);
+        },
+      );
+    } finally {
+      progress.stop();
+    }
   }
 
   /**

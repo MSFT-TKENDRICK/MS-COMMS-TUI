@@ -31,11 +31,15 @@ import type { RenderOptions } from './render.js';
 import {
   describeSelection,
   initialState,
+  isFetching,
   reduce,
   shouldRefuseTui,
   withError,
   withListing,
+  withFreshListing,
   withPreview,
+  withProgress,
+  withRefusal,
   withRows,
   withStatus,
 } from './state.js';
@@ -58,6 +62,14 @@ const CLEAR_SCREEN = '\u001B[2J';
  */
 const LIST_LIMIT = 500;
 
+/**
+ * How often the working indicator advances, in milliseconds.
+ *
+ * Fast enough to read as motion, slow enough that a repaint of the whole screen every frame
+ * is nothing next to the network call it is reporting on.
+ */
+const TICK_MS = 120;
+
 export interface TuiOptions {
   readonly session: Session;
   readonly table: CommandTable;
@@ -77,8 +89,11 @@ export class Tui {
   #onKeypress: ((chunk: string, key: Key | undefined) => void) | undefined;
   #onResize: (() => void) | undefined;
   #onSigint: (() => void) | undefined;
+  #unsubscribe: (() => void) | undefined;
   /** Set while an effect is in flight, so a held-down arrow cannot stack requests. */
   #working = false;
+  /** Repaint timer that animates the working indicator. Only alive while {@link #working}. */
+  #ticker: NodeJS.Timeout | undefined;
 
   constructor(options: TuiOptions) {
     this.#session = options.session;
@@ -100,14 +115,19 @@ export class Tui {
     }
 
     this.#enter();
-    // The first listing is fetched before the first paint, so the user never sees an empty
-    // frame that then fills in — a repaint a screen reader would announce twice.
-    await this.#perform({ kind: 'list', path: this.#session.cwd });
 
     return new Promise<number>((resolve) => {
       this.#resolve = resolve;
       this.#listen();
+      // Painted *before* the first listing, not after. The initial state already says
+      // "Loading…", and the whole complaint about this view was that a slow first fetch
+      // showed a blank alternate screen for as long as it took — the frame existed, it was
+      // just never drawn. A screen reader announcing "Loading" and then the result is the
+      // correct behaviour here; announcing nothing at all was not.
       this.#paint();
+      void this.#perform({ kind: 'list', path: this.#session.cwd }).then(() => {
+        this.#paint();
+      });
     });
   }
 
@@ -125,6 +145,9 @@ export class Tui {
   #restore(): void {
     if (this.#restored) return;
     this.#restored = true;
+    this.#stopTicking();
+    this.#unsubscribe?.();
+    this.#unsubscribe = undefined;
     if (this.#onKeypress !== undefined) this.#stdin.off('keypress', this.#onKeypress);
     if (this.#onResize !== undefined) this.#stdout.off('resize', this.#onResize);
     if (this.#onSigint !== undefined) process.off('SIGINT', this.#onSigint);
@@ -151,6 +174,18 @@ export class Tui {
     this.#stdin.on('keypress', this.#onKeypress);
     this.#stdout.on('resize', this.#onResize);
     process.on('SIGINT', this.#onSigint);
+
+    // The last stage of a staged read. The first answer for a folder can come from the
+    // local snapshot and be minutes old; when the engine has since checked with the source,
+    // it says so here and the screen catches up on its own. Without this the user is left
+    // reading a stale list with no way to know it, and pressing refresh — the one thing
+    // preloading exists to make unnecessary.
+    this.#unsubscribe = this.#session.vfs.onListingChanged((event) => {
+      const next = withFreshListing(this.#state, event.path, event.entries);
+      if (next === this.#state) return;
+      this.#state = next;
+      this.#paint();
+    });
   }
 
   #finish(): void {
@@ -171,13 +206,28 @@ export class Tui {
 
   async #handle(chunk: string, key: Key | undefined): Promise<void> {
     if (this.#restored) return;
-    // Keys arriving while a fetch is outstanding are dropped rather than queued. Queuing
-    // means a held-down arrow fires a burst of requests that all resolve after the user has
-    // stopped moving, and the selection then lurches somewhere they did not ask for.
-    if (this.#working) return;
 
     const resolved: Key = key ?? { sequence: chunk };
     const step = reduce(this.#state, resolved);
+
+    // A request is already in flight. Keys that only move the cursor or type into the filter
+    // are still honoured — they cost nothing, and a browser that stops scrolling because a
+    // message is loading is the frozen-feeling behaviour this view had. Keys that would
+    // start a *second* fetch are refused, because queueing them is how a held-down arrow
+    // turns into a burst of requests that all land after the user has stopped moving.
+    //
+    // Quit is the important exception: it is checked before the refusal, so there is always
+    // a way out of a slow load.
+    if (this.#working) {
+      if (step.effects.some((effect) => effect.kind === 'quit')) {
+        this.#finish();
+        return;
+      }
+      this.#state = step.effects.some(isFetching) ? withRefusal(this.#state) : step.state;
+      this.#paint();
+      return;
+    }
+
     this.#state = step.state;
 
     for (const effect of step.effects) {
@@ -191,9 +241,36 @@ export class Tui {
     this.#paint();
   }
 
+  /**
+   * Repaint on a timer while an operation is outstanding.
+   *
+   * Without this the "working" marker is drawn once and then sits there, unchanged, for
+   * however long the fetch takes — which is not meaningfully different from showing nothing,
+   * because the thing a user reads as "alive" is motion, not text.
+   *
+   * `unref` matters: this timer must never be the reason the process stays up. If everything
+   * else has finished, a spinner is not a reason to keep a terminal open.
+   */
+  #startTicking(): void {
+    if (this.#ticker !== undefined) return;
+    const startedAt = Date.now();
+    this.#ticker = setInterval(() => {
+      this.#state = withProgress(this.#state, Date.now() - startedAt);
+      this.#paint();
+    }, TICK_MS);
+    this.#ticker.unref?.();
+  }
+
+  #stopTicking(): void {
+    if (this.#ticker === undefined) return;
+    clearInterval(this.#ticker);
+    this.#ticker = undefined;
+  }
+
   async #perform(effect: Effect): Promise<void> {
     if (effect.kind === 'quit') return;
     this.#working = true;
+    this.#startTicking();
     try {
       switch (effect.kind) {
         case 'bell':
@@ -203,7 +280,9 @@ export class Tui {
         case 'list': {
           const result = await this.#session.vfs.list(effect.path, { limit: LIST_LIMIT });
           this.#session.cwd = effect.path;
-          this.#state = withListing(this.#state, effect.path, result.entries);
+          this.#state = withListing(this.#state, effect.path, result.entries, {
+            ...(effect.nav === undefined ? {} : { nav: effect.nav }),
+          });
           // A first run with no config lands on an empty root. "/ is empty." is true but
           // useless — and unlike the line shell, a user in the pane can't just type `demo`,
           // so the way out has to name the `:` key explicitly.
@@ -247,6 +326,7 @@ export class Tui {
       this.#state = withError(this.#state, messageOf(error));
     } finally {
       this.#working = false;
+      this.#stopTicking();
     }
   }
 

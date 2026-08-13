@@ -29,9 +29,11 @@ and `cat` once instead of learning five clients.
 | `@mscomms/cli` | The shell, commands, completion, formatting |
 | `@mscomms/provider-*` | memory, rss, github, graph, ado, exec |
 
-No third-party runtime dependencies anywhere. For a program that reads corporate mail,
-every transitive package is another party who can change what it does, and the parsing this
-needs — JSONC, RSS, MIME-ish headers — is a few hundred well-tested lines each.
+Runtime dependencies are kept few and chosen deliberately, not avoided on principle. Today
+there is one: `@libsql/client`, which backs the local snapshot store — see **The local
+snapshot** below. The small parsing this program needs (JSONC, RSS, MIME-ish headers) is
+still written here, because each is a few hundred well-tested lines and a package would be
+more surface than substance.
 
 ## Core, module by module
 
@@ -54,14 +56,27 @@ every provider gets whether or not it declared one. See below.
 **`mapping.ts`** — the declarative surface an integration author uses instead of
 implementing `Provider` by hand. Covered in [PLUGINS.md](PLUGINS.md#the-mapping-surface).
 
-**`graphql.ts`** — a lexer and parser for the subset of GraphQL a projection needs. No
-dependency, for the reason above; the subset is deliberate and documented in
-[PROJECTIONS.md](PROJECTIONS.md).
+**`graphql.ts`** — a lexer and parser for the subset of GraphQL a projection needs; the
+subset is deliberate and documented in [PROJECTIONS.md](PROJECTIONS.md).
 
 **`projection.ts`** — evaluating a query against the graph space, and the `projection`
 mount type that turns the result back into a tree.
 
 **`cache.ts`** — TTL cache for listings and documents, with explicit invalidation.
+
+**`sql.ts`** — the storage seam: one small async interface over libSQL or Node's built-in
+SQLite. See **The local snapshot** below.
+
+**`snapshot.ts`** — the on-disk snapshot: listings, bodies, full-text and vector indexes,
+sync cursors, retention.
+
+**`vector.ts`** — hashed lexical embeddings and cosine similarity, so `find` can match on
+meaning without a model or a network round trip.
+
+**`prefetch.ts`** — the priority queue and the transition model behind predictive
+cache-ahead.
+
+**`sync.ts`** — the background loop that keeps the snapshot current.
 
 **`notify.ts` / `watcher.ts`** — polling watches, desktop notifications, and the log that
 outlives them.
@@ -125,6 +140,146 @@ This is also why the Lucene modifiers had to survive `stringifyQuery` round-trip
 A boost or a slop value that vanished on the way out would make two different queries
 render identically, and the engine would then trust a filter that was never applied.
 Every new AST field is therefore covered by a round-trip test.
+
+## The local snapshot
+
+Caching in memory makes the second `ls` fast. It does nothing for the first one, and the
+first one is the one people judge the tool by — a mail client that stares at you for three
+seconds on launch feels broken even when it isn't.
+
+So there is an optional local database. It is off by default and every part of it is an
+accelerator: a snapshot that will not open, cannot be written or answers nothing is a
+slower program, never a broken one. Nothing in the read path treats its absence as an error.
+
+### The storage seam
+
+`sql.ts` defines a small async interface — `all`, `get`, `run`, `batch`, `exec` — and two
+implementations chosen at open time:
+
+| Driver | Storage | Vector similarity |
+|---|---|---|
+| `libsql` | local file | in the database |
+| `node-sqlite` | local file | in this process |
+
+The seam exists because of a fact about the world, not a preference: the native libSQL
+binary has no prebuilt for every platform this program runs on — win32-arm64 among them —
+and on those platforms importing it throws at load. `auto` takes the best available and
+says which one it took in `cache`; pinning one that cannot load is a startup error with a
+hint, because a stack trace at startup is a worse answer than a working local cache.
+
+**The snapshot never leaves the machine.** libSQL will replicate a local file to a hosted
+Turso database by setting one key, `syncUrl`, and this layer deliberately does not offer
+it. The snapshot holds subjects, participants and message bodies, so a replica is an
+export of corporate mail to somebody else's server, and one config line is too short a
+distance between "cache" and "exfiltration". The capability is *absent* rather than
+discouraged: `createClient` is handed a file URL and nothing else, and `cache.syncUrl` and
+`cache.authToken` are rejected by the config validator rather than ignored — a setting
+that looks accepted and silently does nothing would leave somebody believing their mail is
+somewhere it is not.
+
+Vector support is *probed*, not inferred from the driver name — it depends on the build
+that actually loaded. Guessing would turn "your SQLite is older than you thought" into an
+unexplained query failure halfway through a search.
+
+FTS5 is probed the same way, and for a reason found by running the code rather than
+reasoning about it: Node did not bundle the extension in `node:sqlite` until v23, so on
+Node 22 — an LTS, inside the supported range — creating the index raises "no such module:
+fts5". That used to abort `SnapshotStore.open`, which meant the entire snapshot silently
+did not work on a supported runtime. Now the index is created separately from the rest of
+the schema and its absence is recorded, so text search degrades to a LIKE scan while
+listings, retention, prefetch and vector similarity carry on unaffected. The probe runs on
+every open rather than once, because FTS5 is a property of the SQLite build and the same
+file can be opened by two different Nodes.
+
+### What it stores, and what it refuses to
+
+Listings, item metadata, message bodies, an FTS5 index, and float32 embeddings — capped at
+the `recent` most recent items per folder. Directories are exempt from that cap: evicting a
+folder would make the tree itself appear to shrink.
+
+The cap is what makes the design honest. The snapshot holds the recent past, so it is
+allowed to answer questions the recent past can answer and not the others:
+
+- An ordinary `ls` is served from it, because the newest items are exactly what it has.
+- A **filtered** `ls` goes to the provider. `is:unread` answered locally could report
+  nothing while an unread message from six months ago sits outside the window — a wrong
+  answer wearing the costume of a right one.
+- `search` treats it as one source among many and **never concludes absence from it alone**.
+  Local matches appear immediately, remote ones merge in as they land, and the CLI reports
+  how many came from where.
+
+It also honours the push-down trust boundary above. The snapshot never claims an
+`appliedQuery`; it returns *candidates* and `evaluateQuery` decides. One query
+implementation, so a filter cannot mean two different things depending on how recently you
+restarted.
+
+### Search order
+
+Local index first, network second, both merged. The local half is FTS5 plus cosine
+similarity over hashed lexical embeddings — enough for "quarterly numbers" to find "Q3
+financials" without a model, a GPU or a round trip. `--local` stops there and is the
+fastest answer available; on a plane it is the only one.
+
+### Predicting the next folder
+
+`prefetch.ts` keeps a transition model: from here, where do people go? Navigating into a
+folder schedules speculative fetches of the likeliest next ones, plus the next page of the
+current listing and the bodies of the first few messages, at descending priority and
+bounded concurrency.
+
+Three rules keep speculation from becoming a liability. A guess that fails is discarded
+silently — it was never asked for, so it cannot produce an error the user has to read.
+Invalidation cancels in-flight work, so a refresh cannot be undone from behind by a fetch
+that started before it. And the model learns only from unfiltered navigation: a filtered
+`ls` is someone interrogating a folder, not moving to it, and counting it would poison the
+model with places nobody went.
+
+### AgentFS, and why the gap was the driver
+
+[Turso AgentFS](https://github.com/tursodatabase/agentfs) specifies a filesystem *as a
+SQLite schema* — inodes, dentries, chunked file data, an insert-only `tool_calls` log and a
+key-value store. That is an unusually good fit here, because this program's whole premise
+is that comms are already a filesystem. Its tree can be written out as an actual one.
+
+The interesting part was making it run at all. The `agentfs-sdk` package depends on
+`@tursodatabase/database`, which publishes no build for win32-arm64, so importing the
+package's entry point fails with *"Cannot find native binding."* The obvious reading is
+that AgentFS is unavailable on this platform.
+
+That reading is wrong, and reading the SDK's shipped source rather than its documentation
+is what showed it. `AgentFS`, `ToolCalls` and `KvStore` take the database as a
+**constructor argument** and use only `exec` and `prepare`/`run`/`get`/`all`. The database
+type is imported *type-only*, so it erases at compile time and the classes have no runtime
+dependency on the native module whatsoever. **The missing piece is the driver, not the
+filesystem** — and `sql.ts` is already a driver. A twelve-line adapter from `SqlDriver` to
+the shape AgentFS expects is the entire integration:
+
+```ts
+{ exec: (sql) => driver.exec(sql),
+  prepare: (sql) => ({ run: (...a) => driver.run(sql, a), /* get, all */ }) }
+```
+
+So `agentfs.ts` imports the submodules directly (resolved via `import.meta.resolve`, which
+locates the package without executing its entry point) when the public entry fails, and
+falls back to it automatically when the native binding *is* present. The tests drive the
+real, unmodified SDK — and check that it stamps `schema_version` itself, which is how we
+know we are testing AgentFS rather than a reimplementation of it.
+
+Two things are built on top:
+
+**`cache export <path>`** turns the snapshot into a mountable filesystem. `NameAllocator`
+matters more here than anywhere else: `fs_dentry` has `UNIQUE(parent_ino, name)`, so two
+messages that collide on a name would not error — the second would silently overwrite the
+first. Losing a message quietly is the worst failure this code could have. Export failures
+are collected and reported rather than thrown, and rendered messages collapse newlines in
+header values, because a subject containing `\r\nFrom: ceo@…` must not be able to forge a
+sender in the file that comes out.
+
+**`"audit": true`** records provider fetches in `tool_calls`. It stores paths and result
+shapes — a byte count, an entry count — and never content: an audit log that became a
+second copy of your mail would be worse than the problem it solves. It is off by default,
+excluded from exports, and wrapped so that a failure to record can never interrupt the
+sync it is recording.
 
 ## The graph model
 
@@ -274,6 +429,58 @@ for both the results and the queue. Every provider gets the fix; only this one n
 same applies to `provider-memory`, whose fixtures can now be graphs (`refs`) rather than
 trees, so the offline demo models the real shape instead of a convenient approximation of it.
 
+## Two ways into Microsoft 365
+
+The three Graph providers reach Microsoft the same way, through one narrow interface in
+`provider-graph/src/client.ts`:
+
+```ts
+interface GraphApi {
+  get<T>(path): Promise<T>;
+  getPage<T>(path): Promise<GraphPage<T>>;
+  getBytes(path): Promise<{ bytes: Uint8Array; contentType: string }>;
+  post<T>(path, body): Promise<T>;
+  patch<T>(path, body): Promise<T>;
+}
+```
+
+Five methods, and `mail.ts`, `chat.ts` and `people.ts` know nothing else about how a request
+is made. There are two implementations behind it, and `createClient` in `shared.ts` is the
+single place that chooses:
+
+**`GraphClient` — HTTPS with a device-code token.** The original path. Prints a URL and a
+code, caches the refresh token in the data directory, and talks to `graph.microsoft.com`.
+
+**`McpGraphApi` — an already-authenticated MCP server over stdio.** Spawns a Microsoft 365
+MCP server, speaks JSON-RPC 2.0 over newline-delimited stdio, and maps each `GraphApi` call
+onto a tool: `get`/`getPage` → `fetch`, `getBytes` → `fetch_blob`, `post` → `do_action`,
+`patch` → `update_entity`. **The server holds the identity**, which is the whole point: on a
+machine where the user is already signed into M365, asking them to sign in again is not a
+security property, it is a second credential to manage and a prompt to dismiss.
+
+`resolveTransport` picks: an explicit `transport` wins, then a non-blank
+`MSCOMMS_GRAPH_TOKEN` (already promptless, and it names an exact audience), then an MCP
+server if one can be discovered, then device code. Discovery is **by name**, never by
+guessing which installed server looks mail-capable.
+
+Three things about this were only learnt by running it, and are worth not rediscovering:
+
+**Relative paths, absolute next links.** The MCP server requires relative entity paths, but
+`@odata.nextLink` is always absolute. Without `toRelativeGraphPath` stripping the origin,
+page one works and page two silently returns nothing — the failure appears as a short list,
+not as an error. A mutation test guards it.
+
+**The payload is not where the protocol says it is.** `tools/call` returns `content: []` and
+puts the real body in `structuredContent`. The parser prefers `structuredContent` and falls
+back to a JSON block in `content[].text`, so the day a server does the conventional thing it
+keeps working.
+
+**A child process is three handles, not one.** The child *and each of its stdio pipes* keep
+the libuv loop alive, so a one-shot command like `mscomms ls /mail` printed its answer and
+then hung forever. `unref()` on all four fixes it; an in-flight request holds the loop open
+via its own timeout timer. Shutdown ends stdin first and only then kills, because on Windows
+the direct child is `cmd.exe` and killing it would orphan the real server.
+
 ## The CLI
 
 **`session.ts`** holds mounts, cwd, the last listing, and display settings. The last listing
@@ -305,9 +512,10 @@ stating as a rule rather than a habit.
 running against a corporate mail account, and the cache makes it fast enough. The cost is
 that watches only run while the shell is open.
 
-**Offline sync.** The cache is a cache, not a store; there is no local mirror to fall out of
-date, no reconciliation, no "why does it show a message I deleted last week". A future
-offline mode would sit behind the same provider interface.
+**Offline authoring.** The snapshot makes reading work with a slow or absent network, but
+there is no outbox: composing a reply on a plane and having it send itself later would need
+conflict handling and a delivery guarantee this does not have. Writes go to the provider or
+they fail loudly.
 
 **Write-by-default.** The Graph providers ship read-only. `Mail.ReadWrite` is opt-in via
 `scopes`, and `graph-people`'s sending actions are opt-in via `allowSend`, because a program
@@ -319,7 +527,7 @@ are mechanical rather than aesthetic and are set out in [ACCESSIBILITY.md](ACCES
 
 ## Testing
 
-1148 tests, no test framework — `node --test` and `node:assert`.
+1395 tests, no test framework — `node --test` and `node:assert`.
 
 The load-bearing one is `packages/core/src/testing/conformance.ts`: the provider contract
 expressed as an executable suite that every provider runs, including the example `exec`

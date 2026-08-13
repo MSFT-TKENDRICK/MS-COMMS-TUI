@@ -117,11 +117,55 @@ The graph is genuinely cyclic — your manager's `reports/` contains you — and
 person however you got there, so `find /people -q "is:unanswered"` lists each thing you owe a
 reply to exactly once.
 
+## The local snapshot
+
+Turn on the cache and mail is pulled into a local Turso (libSQL) database in the
+background, so the tool stops waiting on the network to show you things it already knows.
+
+```jsonc
+"cache": { "enabled": true, "recent": 500, "bodies": 25 }
+```
+
+What changes:
+
+- **Cold start is not cold.** The first `ls` of the day reads from disk. Milliseconds, not
+  seconds.
+- **Navigation is predicted.** Moving into a folder speculatively fetches where you usually
+  go next, and the next page of where you are. The folder is often loaded before you ask.
+- **Search hits the local index first**, then the network, and merges. Local matches appear
+  immediately; remote ones join as they land. With embeddings on, the local half matches on
+  meaning too, so "quarterly numbers" finds "Q3 financials".
+- **`find --local`** never touches the network at all. On a plane it is the only answer; the
+  rest of the time it is the fastest one.
+
+It keeps the *n* most recent items per folder rather than replicating the mailbox, and it is
+careful about what that entitles it to say. A plain `ls` is served locally; a filtered one
+goes to the source, because answering `is:unread` from a truncated cache could report
+nothing while an unread message sits just outside the window. Search never concludes
+absence from the cache alone, and `find` tells you how many results came from it.
+
+The whole thing is an accelerator: if it cannot open, the shell starts anyway and `cache`
+says why. The database stays on your machine — libSQL can replicate to a hosted Turso
+database and this deliberately does not, because a snapshot of your mail on somebody
+else's server is a different thing from a cache. Details in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#cache).
+
+Because the snapshot is SQLite, [Turso AgentFS](https://github.com/tursodatabase/agentfs)
+can be pointed at it. `cache export ~/mail.db` writes your mail out as a real AgentFS
+filesystem — one `.eml` per message, folders intact — that anything speaking AgentFS can
+mount. Setting `"audit": true` additionally records every fetch the background sync made in
+AgentFS's `tool_calls` log: paths and result sizes, never message content.
+
 ## Install
 
-Node 20.11 or newer. No third-party runtime dependencies — deliberately: this program reads
-your corporate mail, and every transitive package is somebody else's ability to change what
-it does. The only `dependencies` entries are this repo's own workspace packages.
+Node 20.11 or newer. Two runtime dependencies: `@libsql/client`, which backs the optional
+local snapshot — the on-disk Turso database that makes a cold start fast and search
+instant — and `agentfs-sdk`, which reads and writes that snapshot as a filesystem.
+Everything else is this repo's own workspace packages.
+
+The snapshot is **off by default**: turning it on writes corporate mail to a file on your
+machine, and that is a decision to make deliberately rather than to inherit. `cache enable`
+asks once and records the answer.
 
 ```sh
 git clone https://github.com/MSFT-TKENDRICK/MS-COMMS-TUI
@@ -218,8 +262,14 @@ Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Credentials never live in the config. GitHub takes an explicit `token`, then `GH_TOKEN` or
 `GITHUB_TOKEN`, and failing both it borrows the credential from `gh auth login` — so on a
-machine with the GitHub CLI signed in, the `token` line above is unnecessary. The Microsoft
-sources sign in interactively the first time you open them and cache the result.
+machine with the GitHub CLI signed in, the `token` line above is unnecessary.
+
+The Microsoft sources work the same way. If a Microsoft 365 MCP server is configured on the
+machine, they go through it and **you are never asked to sign in**, because the server
+already holds the identity — on a machine you are logged into anyway, a second credential to
+manage is not a security feature. Failing that they fall back to the OAuth device code flow,
+which prompts once and caches the result. `mscomms doctor` reports which path each mount
+will take, so you can check before you rely on it.
 
 ## Add your own source
 
@@ -305,6 +355,36 @@ hole in your scrollback.
 prompt, but the pane has no prompt until it has drawn itself, so on an unconfigured machine
 it would otherwise open onto an empty tree.
 
+## Waiting for things, and mostly not
+
+Opening a folder is answered by whatever can answer first, then corrected:
+
+- **The local snapshot** replies in about a millisecond, and is allowed to be slightly out
+  of date. A cold start stops being a cold start.
+- **Warm-up** pays the expensive part before you ask. First contact with a Microsoft Graph
+  source costs seven to eleven seconds — starting an MCP server — against a quarter of a
+  second for the fetch itself. Launch spends that in the background while you read the
+  banner, so `ls /mail` a second later takes about fifteen milliseconds rather than eleven
+  seconds.
+- **The live answer** arrives when the network says so. If the folder changed, the view
+  updates in place, keeping your selection on the row it was on. If it didn't — which is
+  most of the time — nothing repaints.
+
+Nothing about this blocks the prompt: local commands answer immediately whatever the network
+is doing, anything genuinely slow shows a progress indicator after a grace period, and
+quitting is immediate even mid-startup. In the pane, `[` and `]` (or `Alt+Left` and
+`Alt+Right`) move back and forward through where you have been, and returning to a folder
+puts you back on the item you left. `docs/CONFIGURATION.md` has the details.
+
+Quitting deserves a word, because it is where "in the background" usually stops being free.
+Shutdown asks the background sync to stop and waits a quarter of a second for it to notice —
+which is ample, since work that honours the request unwinds in about a millisecond. Anything
+still running after that is abandoned rather than waited for, and cannot write to the cache
+afterwards. A sync cut short this way is not an error and is not reported as one; the next
+launch simply picks the directory up again. The alternative is a program that will not close
+because something it started is not answering, which is how quitting came to take twenty-six
+seconds before this existed.
+
 ## Scripting
 
 ```sh
@@ -332,10 +412,11 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 ## Status
 
 Working and tested: the VFS engine, the query language (including Lucene syntax and
-relevance ranking), cross-source search, cache, notifications, the line shell, tab
+relevance ranking), cross-source search, cache, the local Turso snapshot with background
+sync, predictive prefetching and vector search, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1163 tests.
+1395 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been

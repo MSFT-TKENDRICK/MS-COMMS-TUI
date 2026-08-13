@@ -46,8 +46,10 @@
  * 3. **A sign-in cannot happen behind the pane.** The Microsoft device-code prompt is written
  *    to stderr, which is right for a command line and useless underneath an alternate screen
  *    buffer: the code and the URL land somewhere invisible and opening /mail looks like a
- *    hang. So on a machine that has never signed in, that happens here first, on an ordinary
- *    screen, before the pane is entered.
+ *    hang. So on a machine that has never signed in *and* has no already-authenticated
+ *    Microsoft 365 MCP server to go through, that happens here first, on an ordinary screen,
+ *    before the pane is entered. With an MCP server there is nothing to do and nothing is
+ *    said.
  *
  * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the terminal check, MSCOMMS_RUN_TUI=0 falls
  * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_SIGNIN=0
@@ -64,6 +66,7 @@ import { ROOT, flag } from './lib/npm.mjs';
 
 const BIN = join(ROOT, 'packages', 'cli', 'dist', 'bin.js');
 const CORE = join(ROOT, 'packages', 'core', 'dist', 'index.js');
+const GRAPH = join(ROOT, 'packages', 'provider-graph', 'dist', 'index.js');
 const SETUP = join(ROOT, 'scripts', 'app-setup.mjs');
 const MODULES = join(ROOT, 'node_modules');
 
@@ -112,6 +115,30 @@ async function loadSources() {
 const INTERACTIVE_SOURCE = /^(graph-|ado-)/;
 
 /**
+ * Whether a mount will actually put a prompt on the screen.
+ *
+ * The Graph sources have two ways in, and only one of them prompts: when an already
+ * signed-in Microsoft 365 MCP server is available they use it and no credential is ever
+ * asked for. That distinction has to be made here, because the alternative is worse than a
+ * wasted round trip — a machine on the MCP path never writes a token cache, so the "has this
+ * machine signed in before?" check below is false *forever*, and every single run would
+ * announce a sign-in that is not going to happen.
+ *
+ * Asks the provider's own resolver rather than re-deriving the rule; a second copy of the
+ * discovery order here is a copy that eventually disagrees. Any failure counts as "yes, it
+ * might prompt", which keeps the pre-step's original purpose intact.
+ */
+async function willPrompt(mount) {
+  if (!mount.type.startsWith('graph-')) return true;
+  try {
+    const { resolveTransport } = await import(pathToFileURL(GRAPH).href);
+    return resolveTransport(mount.options ?? {}) !== 'mcp';
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Whether a Microsoft sign-in has already been completed and cached.
  *
  * Looks for the cache rather than the config because the question is about this machine's
@@ -139,13 +166,21 @@ function hasCachedSignIn(stateDir) {
  * an ordinary screen, where the code can be read and typed.
  *
  * Only for a machine that has never signed in — after that the refresh token answers and
- * this would be a network round trip for nothing.
+ * this would be a network round trip for nothing. And only for a mount that will actually
+ * prompt: a Graph mount going through an already signed-in MCP server needs nothing, and
+ * announcing a sign-in that never comes is worse than saying nothing at all.
  */
 async function signInFirst(mounts, paths) {
   if (!flag('MSCOMMS_RUN_SIGNIN', true)) return;
   if (paths === undefined || hasCachedSignIn(paths.stateDir)) return;
 
-  const mount = mounts.find((candidate) => INTERACTIVE_SOURCE.test(candidate.type));
+  let mount;
+  for (const candidate of mounts.filter((entry) => INTERACTIVE_SOURCE.test(entry.type))) {
+    if (await willPrompt(candidate)) {
+      mount = candidate;
+      break;
+    }
+  }
   if (mount === undefined) return;
 
   console.error(`Signing in before opening the pane, so the code below is visible.`);

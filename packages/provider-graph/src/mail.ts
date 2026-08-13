@@ -33,8 +33,14 @@ import {
   type ReadOptions,
   type VNode,
 } from '@mscomms/core';
-import type { GraphClient, GraphPage } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import type { GraphApi, GraphPage } from './client.js';
+import {
+  createClient,
+  htmlToText,
+  preview,
+  validateSharedOptions,
+  type GraphSharedOptions,
+} from './shared.js';
 
 export interface GraphMailOptions extends GraphSharedOptions {
   /** Include folders Outlook hides by default (Conversation History, and similar). */
@@ -95,7 +101,7 @@ export class GraphMailProvider implements Provider {
 
   readonly #options: GraphMailOptions;
   readonly #context: ProviderContext;
-  #client: GraphClient | undefined;
+  #client: GraphApi | undefined;
 
   constructor(options: GraphMailOptions, context: ProviderContext) {
     this.#options = options;
@@ -107,7 +113,12 @@ export class GraphMailProvider implements Provider {
     this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
-  get #api(): GraphClient {
+  /** Bring the transport up in the background. See `Provider.warm`. */
+  async warm(): Promise<void> {
+    await this.#client?.warm?.();
+  }
+
+  get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The mail mount was not initialised.');
     return this.#client;
   }
@@ -473,6 +484,7 @@ export const graphMailPlugin: ProviderPlugin<GraphMailOptions> = {
   displayName: 'Outlook mail (Microsoft Graph)',
   description: 'Mail folders as directories and messages as files, read-only by default.',
   validateOptions(raw) {
+    validateSharedOptions(raw);
     return (raw ?? {}) as GraphMailOptions;
   },
   create(options, context) {

@@ -73,6 +73,59 @@ export interface NotificationConfig {
   readonly maxEntries?: number;
 }
 
+/**
+ * The local snapshot: a libSQL/SQLite database that keeps recent mail on disk so a cold
+ * start is not a cold network.
+ *
+ * Off by default, and that default is deliberate. Turning it on means corporate mail is
+ * written to a file on this machine, which is a real decision with real consequences —
+ * backup software, disk encryption, shared workstations — and it is not one to make on a
+ * user's behalf. `cache enable` asks once, in plain language, and writes it here.
+ */
+export interface CacheConfig {
+  readonly enabled?: boolean;
+  /** Database file. Defaults to `snapshot.db` under the cache directory. */
+  readonly path?: string;
+  /**
+   * Which backend to open the snapshot with. `auto` takes the best this platform can
+   * load: the native libSQL client, else Node's built-in SQLite. Both store the same
+   * schema in the same local file. See docs/ARCHITECTURE.md.
+   */
+  readonly driver?: 'auto' | 'libsql' | 'node-sqlite';
+  /** How many items to keep per folder. The "n most recent"; everything older is evicted. */
+  readonly recent?: number;
+  /** Freshness window for a snapshot listing, in milliseconds. */
+  readonly ttlMs?: number;
+  /** Background sync period in milliseconds. Floors at 30s. */
+  readonly intervalMs?: number;
+  /** How deep below each mount root to sync. */
+  readonly depth?: number;
+  /** Message bodies to pre-download per folder per cycle. 0 disables body sync. */
+  readonly bodies?: number;
+  /** Build lexical embeddings for vector search. */
+  readonly vectors?: boolean;
+  /**
+   * Predictive cache-ahead: warming mount roots at startup and likely next steps on
+   * navigation.
+   *
+   * On by default, and *independent of {@link enabled}* — the snapshot decides whether
+   * warmed results survive the process, not whether warming happens. Gating one on the
+   * other meant a default install preloaded nothing at all, so every folder was a cold
+   * round trip and the program appeared to stall on each keystroke.
+   *
+   * Costs bandwidth on a guess, so it remains switchable for a metered connection.
+   */
+  readonly prefetch?: boolean;
+  /** Speculative fetches in flight at once. */
+  readonly prefetchConcurrency?: number;
+  /**
+   * Record every provider fetch in an AgentFS `tool_calls` log. Off by default: it is a
+   * write per fetch, and a program that reads your mail should not start keeping a record
+   * of what it read without being told to.
+   */
+  readonly audit?: boolean;
+}
+
 export interface AppConfig {
   readonly plugins: readonly string[];
   readonly mounts: readonly MountConfig[];
@@ -80,6 +133,7 @@ export interface AppConfig {
   readonly watches: readonly WatchConfig[];
   readonly ui: UiConfig;
   readonly notifications: NotificationConfig;
+  readonly cache: CacheConfig;
   readonly keymap: Readonly<Record<string, string>>;
   readonly ttlMs?: number;
   /** Where this config was loaded from; undefined when defaults were used. */
@@ -93,6 +147,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   watches: [],
   ui: {},
   notifications: {},
+  cache: {},
   keymap: {},
 };
 
@@ -249,6 +304,7 @@ const KNOWN_CONFIG_KEYS = new Set([
   'watches',
   'ui',
   'notifications',
+  'cache',
   'keymap',
   'ttlMs',
   // Conventional no-ops, so a file can carry an editor schema reference or a note.
@@ -386,10 +442,74 @@ function validateConfigBody(raw: unknown, sourcePath?: string): AppConfig {
     watches,
     ui: asObject(root['ui'], 'ui') as UiConfig,
     notifications: asObject(root['notifications'], 'notifications') as NotificationConfig,
+    cache: validateCache(root['cache']),
     keymap: asObject(root['keymap'], 'keymap') as Record<string, string>,
     ...(typeof root['ttlMs'] === 'number' ? { ttlMs: root['ttlMs'] } : {}),
     ...(sourcePath === undefined ? {} : { sourcePath }),
   };
+}
+
+const CACHE_DRIVERS = new Set(['auto', 'libsql', 'node-sqlite']);
+
+/**
+ * Settings that used to point the snapshot at a hosted database.
+ *
+ * These are rejected rather than ignored. `validateCache` builds its result from a list of
+ * keys it knows, so an unrecognised one is dropped without a word — and "I configured
+ * replication and it silently did nothing" is exactly the sort of quiet failure that
+ * leaves somebody believing their mail is somewhere it is not.
+ */
+const REMOTE_KEYS = ['syncUrl', 'authToken', 'syncInterval', 'syncIntervalMs'] as const;
+
+function validateCache(entry: unknown): CacheConfig {
+  const raw = asObject(entry, 'cache') as Record<string, unknown>;
+
+  const driver = raw['driver'];
+  if (driver !== undefined && (typeof driver !== 'string' || !CACHE_DRIVERS.has(driver))) {
+    throw VfsError.config(
+      `cache.driver must be one of: ${[...CACHE_DRIVERS].join(', ')}.`,
+      '"auto" picks the best backend this machine can load, and is almost always what you want.',
+    );
+  }
+
+  for (const key of REMOTE_KEYS) {
+    if (raw[key] === undefined) continue;
+    throw VfsError.config(
+      `cache.${key} is not supported: the snapshot is local to this machine.`,
+      'It holds message bodies, so it is deliberately never replicated to a hosted database. ' +
+        `Remove "${key}".`,
+    );
+  }
+
+  const numbers = ['recent', 'ttlMs', 'intervalMs', 'depth', 'bodies', 'prefetchConcurrency'] as const;
+  const out: Record<string, unknown> = {};
+  for (const key of numbers) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw VfsError.config(`cache.${key} must be a number of 0 or more.`, `Got: ${JSON.stringify(value)}.`);
+    }
+    out[key] = value;
+  }
+  for (const key of ['enabled', 'vectors', 'prefetch', 'audit'] as const) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'boolean') {
+      throw VfsError.config(`cache.${key} must be true or false.`, `Got: ${JSON.stringify(value)}.`);
+    }
+    out[key] = value;
+  }
+  for (const key of ['path'] as const) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw VfsError.config(`cache.${key} must be a non-empty string.`, `Got: ${JSON.stringify(value)}.`);
+    }
+    out[key] = value;
+  }
+  if (typeof driver === 'string') out['driver'] = driver;
+
+  return out as CacheConfig;
 }
 
 function validateMount(entry: unknown, index: number): MountConfig {

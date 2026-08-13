@@ -9,8 +9,20 @@
  */
 
 import { performance } from 'node:perf_hooks';
-import { VfsError, isVfsError, QUERY_FIELD_HELP } from '@mscomms/core';
+import {
+  VfsError,
+  isVfsError,
+  QUERY_FIELD_HELP,
+  exportToAgentFs,
+  openSqlDriver,
+  type SqlDriver,
+} from '@mscomms/core';
 import { formatRows } from '../format.js';
+import {
+  resolveMcpServer,
+  resolveTransport,
+  type GraphSharedOptions,
+} from '@mscomms/provider-graph';
 import { OUTPUT_FLAGS, flagBool, modeFrom, quoteCorrection, type Command, type CommandTable } from './types.js';
 
 export function createHelpCommand(table: CommandTable): Command {
@@ -213,6 +225,27 @@ export const doctorCommand: Command = {
       }
     }
 
+    // How the Microsoft 365 mounts actually reach M365. Worth reporting even when nothing
+    // is wrong: "why is it asking me to sign in?" is only answerable if the tool will say
+    // which way it is set up.
+    const graphMounts = session.config.mounts.filter((mount) => mount.type.startsWith('graph-'));
+    if (graphMounts.length > 0) {
+      const options = graphMounts.map((mount) => (mount.options ?? {}) as GraphSharedOptions);
+      const viaMcp = options.filter((option) => resolveTransport(option) === 'mcp');
+      const prompting = options.length - viaMcp.length;
+      const server = viaMcp[0] === undefined ? undefined : resolveMcpServer(viaMcp[0].mcp ?? {});
+      const total = String(options.length);
+
+      checks.push({
+        name: 'microsoft 365 access',
+        status: 'ok',
+        detail:
+          prompting === 0
+            ? `All ${total} Microsoft 365 source(s) go through the MCP server \`${[server?.command, ...(server?.args ?? [])].join(' ')}\`, which is already signed in. You will not be asked to sign in.`
+            : `${String(prompting)} of ${total} Microsoft 365 source(s) will ask you to sign in with a device code. Set "transport": "mcp" on the mount, or install an MCP server that provides Microsoft 365 access, to avoid that.`,
+      });
+    }
+
     checks.push({
       name: 'output mode',
       status: 'ok',
@@ -363,27 +396,184 @@ export const cacheCommand: Command = {
   name: 'cache',
   group: 'system',
   summary: 'Show how much is cached and how well the cache is working.',
-  usage: 'cache',
-  maxPositional: 0,
+  usage: 'cache [clear|sync|export <path>]',
+  args: ['action'],
+  maxPositional: 2,
   flags: [...OUTPUT_FLAGS],
   async run(session, args) {
+    const action = args.positional[0];
+
+    if (action === 'clear') {
+      session.vfs.invalidate('/');
+      await session.vfs.flush();
+      await session.snapshot?.clear();
+      session.lastListing = undefined;
+      session.print(session.snapshot === undefined ? 'Cleared the in-memory cache.' : 'Cleared the cache and the local snapshot.');
+      return;
+    }
+
+    if (action === 'sync') {
+      if (session.sync === undefined) {
+        throw VfsError.invalid(
+          'Background sync is not running.',
+          'Set "cache": { "enabled": true } in your config to keep a local snapshot.',
+        );
+      }
+      const status = await session.sync.runOnce();
+      session.print(
+        `Synced ${count(status.directories, 'folder')} and ${count(status.items, 'item')}` +
+          `${status.bodies === 0 ? '' : `, with ${count(status.bodies, 'body', 'bodies')}`}` +
+          `${status.evicted === 0 ? '' : `, evicting ${String(status.evicted)} past retention`}.`,
+      );
+      for (const error of status.errors) session.writeError(`Warning: ${error}\n`);
+      return;
+    }
+
+    if (action === 'export') {
+      const target = args.positional[1];
+      if (target === undefined) {
+        throw VfsError.invalid(
+          'Nowhere to export to.',
+          'Give a file to write, for example: cache export ~/mail.agentfs.db',
+        );
+      }
+      if (session.snapshot === undefined) {
+        throw VfsError.invalid(
+          'There is no local snapshot to export.',
+          'Set "cache": { "enabled": true } in your config, then run "cache sync".',
+        );
+      }
+
+      const driver = await openSqlDriver({ path: target });
+      try {
+        const result = await exportToAgentFs({ driver, snapshot: session.snapshot });
+        session.print(
+          `Exported ${count(result.files, 'item')} into ${count(result.directories, 'folder')}` +
+            `${result.stubs === 0 ? '' : `, ${String(result.stubs)} without bodies`} (${formatBytes(result.bytes)}).`,
+        );
+        // Chrome, not data: someone piping the line above wants the counts, and this is
+        // the bit that tells a human what the file is actually for.
+        session.writeError(`Wrote an AgentFS filesystem to ${target}.\n`);
+        session.writeError(`Mount it with: agentfs mount ${target} ./mnt\n`);
+        for (const { path, reason } of result.skipped) {
+          session.writeError(`Skipped ${path}: ${reason}\n`);
+        }
+      } finally {
+        await driver.close();
+      }
+      return;
+    }
+
+    if (action !== undefined) {
+      throw VfsError.invalid(
+        `Unknown action "${action}".`,
+        'Use "cache", "cache clear", "cache sync" or "cache export <path>".',
+      );
+    }
+
     const stats = session.vfs.cacheStats;
-    session.print(
-      formatRows(
-        ['cache', 'entries', 'hits', 'misses', 'hit rate'],
-        [
-          ['listings', String(stats.directories.size), String(stats.directories.hits), String(stats.directories.misses), rate(stats.directories.hits, stats.directories.misses)],
-          ['documents', String(stats.documents.size), String(stats.documents.hits), String(stats.documents.misses), rate(stats.documents.hits, stats.documents.misses)],
-        ],
-        session.withMode(modeFrom(args)),
-      ),
-    );
+    const rows: string[][] = [
+      ['listings', String(stats.directories.size), String(stats.directories.hits), String(stats.directories.misses), rate(stats.directories.hits, stats.directories.misses)],
+      ['documents', String(stats.documents.size), String(stats.documents.hits), String(stats.documents.misses), rate(stats.documents.hits, stats.documents.misses)],
+    ];
+
+    if (session.snapshot !== undefined) {
+      const snapshot = await session.snapshot.stats();
+      rows.push([
+        'snapshot',
+        `${String(snapshot.nodes)} items`,
+        String(snapshot.hits),
+        String(snapshot.misses),
+        rate(snapshot.hits, snapshot.misses),
+      ]);
+    }
+
+    const prefetch = session.vfs.prefetchStats;
+    if (prefetch !== undefined) {
+      rows.push([
+        'prefetch',
+        `${String(prefetch.queued)} queued`,
+        String(prefetch.completed),
+        String(prefetch.failed),
+        `${String(prefetch.canceled)} cancelled`,
+      ]);
+    }
+
+    session.print(formatRows(['cache', 'entries', 'hits', 'misses', 'hit rate'], rows, session.withMode(modeFrom(args))));
+
+    // The state of the snapshot belongs on stderr, not in the table: the table is data
+    // someone may be piping, and "your cache is off" is chrome about the run.
+    if (session.cacheError !== undefined) {
+      session.writeError(`The local snapshot is not running: ${session.cacheError}\n`);
+    } else if (session.snapshot === undefined) {
+      session.writeError('No local snapshot. Set "cache": { "enabled": true } in your config to keep one.\n');
+    } else {
+      const snapshot = await session.snapshot.stats();
+      const size = snapshot.bytes === undefined ? '' : ` (${formatBytes(snapshot.bytes)})`;
+      session.writeError(
+        `Snapshot: ${count(snapshot.nodes, 'item')} in ${count(snapshot.directories, 'folder')}, ` +
+          `${String(snapshot.documents)} with bodies, ${String(snapshot.vectors)} indexed for semantic search${size}.\n`,
+      );
+      // Which backend opened matters: the three differ in whether they replicate and
+      // whether similarity is computed in the database. Someone wondering why semantic
+      // search is slower here than on their laptop deserves to see the answer.
+      const driver = session.snapshot.driver;
+      session.writeError(
+        `Storage: ${driver.description}` +
+          `${driver.nativeVector ? ', vector search in the database' : ', vector search in this process'}.\n`,
+      );
+
+      // Worth saying out loud: without FTS5 the local half of `find` still works but ranks
+      // by a scan, and someone comparing two machines deserves to know which they are on.
+      if (!snapshot.fts) {
+        session.writeError('No FTS5 in this SQLite build, so local text search scans instead of using an index.\n');
+      }
+
+      // Only shown when the log exists, which means only when it was switched on. A line
+      // saying "auditing: off" on every run would be noise about a feature you declined.
+      const audit = await auditSummary(driver);
+      if (audit !== undefined) session.writeError(audit);
+    }
   },
 };
+
+/**
+ * A one-line summary of the audit log, or nothing at all if there isn't one. Read
+ * straight from the table rather than through AgentFS: `cache` runs on every prompt in
+ * the shell and should not pay to load an SDK to tell you a feature is off.
+ */
+async function auditSummary(driver: SqlDriver): Promise<string | undefined> {
+  try {
+    const present = await driver.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tool_calls'");
+    if (present === undefined) return undefined;
+    const row = await driver.get(
+      "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS failed FROM tool_calls",
+    );
+    const total = Number(row?.['total'] ?? 0);
+    if (total === 0) return undefined;
+    const failed = Number(row?.['failed'] ?? 0);
+    const trouble = failed === 0 ? '' : `, ${String(failed)} failed`;
+    return `Audit: ${count(total, 'recorded fetch', 'recorded fetches')}${trouble}.\n`;
+  } catch {
+    // A summary of the bookkeeping is the least important thing on screen; it must never
+    // be the reason `cache` reports an error.
+    return undefined;
+  }
+}
 
 function rate(hits: number, misses: number): string {
   const total = hits + misses;
   return total === 0 ? 'n/a' : `${String(Math.round((hits / total) * 100))}%`;
+}
+
+function count(value: number, singular: string, plural = `${singular}s`): string {
+  return `${String(value)} ${value === 1 ? singular : plural}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${String(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export const quitCommand: Command = {
@@ -488,3 +678,4 @@ export function systemCommands(table: CommandTable): readonly Command[] {
     quitCommand,
   ];
 }
+

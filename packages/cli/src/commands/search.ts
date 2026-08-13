@@ -103,11 +103,18 @@ export const findCommand: Command = {
     },
     { name: 'n', description: 'Maximum results.', value: true, aliases: ['limit'] },
     { name: 'depth', description: 'How many folder levels to search. Default 4.', value: true },
+    {
+      name: 'local',
+      description: 'Answer from the local snapshot only, without contacting any source.',
+      aliases: ['offline'],
+    },
+    { name: 'no-semantic', description: 'Skip the local vector index; match text only.' },
     ...OUTPUT_FLAGS,
   ],
   examples: [
     'find -q "is:unread"',
     'find -a -q "from:alice after:7d"',
+    'find --local -q "budget"',
     'find -a --source mail,gh -q "subject:budg* OR subject:forecast^2"',
   ],
   async run(session, args) {
@@ -156,10 +163,19 @@ export const findCommand: Command = {
       );
     }
 
+    const local = flagBool(args, 'local', 'offline');
+    if (local && session.snapshot === undefined) {
+      throw new Error(
+        'There is no local snapshot to search. Set "cache": { "enabled": true } in your config, or drop --local.',
+      );
+    }
+
     const result = await session.vfs.search(path, query, {
       limit,
       ...(flagNumber(args, 'depth') === undefined ? {} : { maxDepth: flagNumber(args, 'depth') as number }),
       ...(sources === undefined ? {} : { sources }),
+      ...(local ? { local: true } : {}),
+      ...(flagBool(args, 'no-semantic') ? { semantic: false } : {}),
     });
 
     session.print(formatListing(result.entries, { ...session.withMode(mode), startIndex: 1 }));
@@ -251,13 +267,32 @@ function describeSources(sources: readonly SearchSourceReport[] | undefined): re
     );
   }
 
-  const cut = [...complete, ...partial].filter((source) => source.truncated).map((source) => source.id);
+  const cut = [...complete, ...partial]
+    .filter((source) => source.truncated && source.id !== SNAPSHOT_SOURCE_ID)
+    .map((source) => source.id);
   if (cut.length > 0) {
     lines.push(`More to find in: ${cut.join(', ')}. Raise \`-n\` to see further into each source.`);
   }
 
+  // The snapshot is always truncated by construction, so the generic "raise -n" advice
+  // would be wrong for it — no page size reaches a message that was never cached. Say what
+  // is actually true instead, and only when it changes what the user should conclude.
+  const snapshot = sources.find((source) => source.id === SNAPSHOT_SOURCE_ID);
+  if (snapshot !== undefined && snapshot.status !== 'ok') {
+    lines.push(
+      `The local snapshot could not be searched${snapshot.error === undefined ? '' : ` (${sanitizeForDisplay(snapshot.error)})`}, so these results came from the network alone.`,
+    );
+  } else if (snapshot !== undefined && snapshot.matches > 0) {
+    lines.push(
+      `${String(snapshot.matches)} came from the local snapshot, which holds recent items only.`,
+    );
+  }
+
   return lines;
 }
+
+/** Matches the id the engine gives its own snapshot in a {@link SearchSourceReport}. */
+const SNAPSHOT_SOURCE_ID = 'snapshot';
 
 
 export const grepCommand: Command = {
