@@ -468,14 +468,109 @@ describe('azure devops boards: polling and actions', () => {
     assert.equal(fake.requests.length, before, 'polling the root should not talk to Azure DevOps');
   });
 
-  it('offers the web URL as an action and returns it', async () => {
+  it('offers contextual work-item actions and omits close for an already-closed item', async () => {
     const { provider } = await harness();
     const column = await activeColumn(provider);
     const page = await provider.list(column, { limit: 1 });
     const node = page.entries[0] as VNode;
 
     const actions = await provider.actions(node);
-    assert.deepEqual(actions.map((action) => action.name), ['url']);
+    assert.deepEqual(actions.map((action) => action.name), ['comment', 'assign', 'state', 'close', 'title', 'tag', 'url']);
+
+    const project = await child(provider, null, PROJECT);
+    const assigned = await provider.list(await child(provider, project, 'Assigned to me'), { limit: 100 });
+    const closed = assigned.entries.find((entry) => entry.id === '8') as VNode;
+    assert.ok(closed !== undefined, 'closed fixture item was not listed');
+    assert.equal((await provider.actions(closed)).some((action) => action.name === 'close'), false);
+  });
+
+  it('assigns with JSON Patch and the mandatory Azure DevOps content type', async () => {
+    const { provider, fake } = await harness();
+    const column = await activeColumn(provider);
+    const page = await provider.list(column, { limit: 1 });
+    const node = page.entries[0] as VNode;
+
+    fake.requests.length = 0;
+    const result = await provider.invoke('assign', node, { to: 'sam@contoso.example' });
+
+    assert.equal(result.message, 'Assigned #1 "Ship the board provider" to sam@contoso.example.');
+    const patch = fake.requests.at(-1);
+    assert.equal(patch?.method, 'PATCH');
+    assert.equal(patch?.contentType, 'application/json-patch+json');
+    assert.deepEqual(patch?.body, [
+      { op: 'test', path: '/rev', value: 3 },
+      { op: 'add', path: '/fields/System.AssignedTo', value: 'sam@contoso.example' },
+    ]);
+  });
+
+  it('changes state with JSON Patch', async () => {
+    const { provider, fake } = await harness();
+    const column = await activeColumn(provider);
+    const page = await provider.list(column, { limit: 1 });
+    const node = page.entries[0] as VNode;
+
+    fake.requests.length = 0;
+    const result = await provider.invoke('state', node, { state: 'Resolved' });
+
+    assert.equal(result.message, 'Moved #1 "Ship the board provider" to Resolved.');
+    assert.deepEqual(fake.requests.at(-1)?.body, [
+      { op: 'test', path: '/rev', value: 3 },
+      { op: 'add', path: '/fields/System.State', value: 'Resolved' },
+    ]);
+  });
+
+  it('appends tags instead of replacing the existing Azure DevOps tag string', async () => {
+    const { provider, fake } = await harness();
+    const column = await activeColumn(provider);
+    const page = await provider.list(column, { limit: 1 });
+    const node = page.entries[0] as VNode;
+
+    fake.requests.length = 0;
+    const result = await provider.invoke('tag', node, { tags: 'accessibility; platform' });
+
+    assert.equal(result.message, 'Added tags to #1 "Ship the board provider": accessibility, platform.');
+    assert.deepEqual(fake.requests.at(-1)?.body, [
+      { op: 'test', path: '/rev', value: 3 },
+      { op: 'add', path: '/fields/System.Tags', value: 'platform; vfs; accessibility' },
+    ]);
+  });
+
+  it('posts discussion comments as comments', async () => {
+    const { provider, fake } = await harness();
+    const column = await activeColumn(provider);
+    const page = await provider.list(column, { limit: 1 });
+    const node = page.entries[0] as VNode;
+
+    fake.requests.length = 0;
+    const result = await provider.invoke('comment', node, { body: 'Looks good to me.' });
+
+    assert.equal(result.message, 'Added a comment to #1 "Ship the board provider".');
+    const comment = fake.requests.at(-1);
+    assert.equal(comment?.method, 'POST');
+    assert.equal(comment?.path, `/${PROJECT}/_apis/wit/workItems/1/comments`);
+    assert.equal(comment?.query.get('api-version'), '7.0-preview.3');
+    assert.deepEqual(comment?.body, { text: 'Looks good to me.' });
+  });
+
+  it('refuses a missing required parameter before any HTTP request', async () => {
+    const { provider, fake } = await harness();
+    const column = await activeColumn(provider);
+    const page = await provider.list(column, { limit: 1 });
+    const node = page.entries[0] as VNode;
+
+    fake.requests.length = 0;
+    await assert.rejects(
+      () => provider.invoke('assign', node, {}),
+      (error: unknown) => error instanceof VfsError && error.code === 'EINVAL',
+    );
+    assert.equal(fake.requests.length, 0);
+  });
+
+  it('returns the web URL action result', async () => {
+    const { provider } = await harness();
+    const column = await activeColumn(provider);
+    const page = await provider.list(column, { limit: 1 });
+    const node = page.entries[0] as VNode;
 
     const result = await provider.invoke('url', node, {});
     assert.equal(result.ok, true);

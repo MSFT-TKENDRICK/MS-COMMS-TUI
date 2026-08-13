@@ -30,6 +30,7 @@ import {
   evaluateQuery,
   isMatchAll,
 } from '@mscomms/core';
+import { MEMORY_ACTIONS, type MemoryActionHost } from './actions.js';
 import { FIXTURES } from './fixtures.js';
 import type { MemoryAttachment, MemoryItem, MemoryProviderOptions } from './types.js';
 
@@ -37,9 +38,18 @@ interface Entry {
   readonly item: MemoryItem;
   readonly parentId: string | null;
   readonly children: string[];
-  readonly mtime: Date;
+  mtime: Date;
   /** Mutable so actions (mark read, flag) have somewhere to land. */
   flags: Set<string>;
+  /**
+   * Metadata written by actions, layered over the fixture's own.
+   *
+   * `MemoryItem` is deliberately readonly — fixtures are shared module-level constants, and
+   * a provider that edited them in place would leak one test's approvals into the next.
+   * An overlay keeps the declared data pristine while still letting `state: merged` show up
+   * everywhere metadata is read.
+   */
+  readonly overrides: Map<string, MetaValue>;
 }
 
 const CURSOR_PREFIX = 'mem:';
@@ -102,6 +112,7 @@ export class MemoryProvider implements Provider {
       children: [],
       mtime,
       flags: new Set(item.flags ?? []),
+      overrides: new Map(),
     };
     this.#entries.set(item.id, entry);
     for (const child of item.children ?? []) entry.children.push(this.#index(child, item.id, base));
@@ -201,7 +212,7 @@ export class MemoryProvider implements Provider {
     headers.push(['Date', entry.mtime.toISOString()]);
     headers.push(['Subject', item.title]);
     if (entry.flags.size > 0) headers.push(['Flags', [...entry.flags].sort().join(', ')]);
-    for (const [key, value] of Object.entries(item.meta ?? {})) {
+    for (const [key, value] of Object.entries(this.#metaOf(entry) ?? {})) {
       headers.push([key, String(value)]);
     }
 
@@ -310,61 +321,64 @@ export class MemoryProvider implements Provider {
   }
 
   async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
-    const entry = this.#entries.get(node.id);
-    if (entry === undefined) return [];
-    const descriptors: ActionDescriptor[] = [];
-
-    if (entry.flags.has('unread')) {
-      descriptors.push({ name: 'read', label: 'Mark as read', description: 'Clear the unread flag.' });
-    } else {
-      descriptors.push({ name: 'unread', label: 'Mark as unread', description: 'Set the unread flag.' });
-    }
-    descriptors.push({
-      name: 'flag',
-      label: entry.flags.has('flagged') ? 'Remove flag' : 'Flag',
-      description: 'Toggle the flagged marker.',
-    });
-    descriptors.push({
-      name: 'tag',
-      label: 'Add a tag',
-      description: 'Attach an arbitrary flag, to exercise action parameters.',
-      params: [{ name: 'tag', type: 'string', label: 'Tag name', required: true }],
-    });
-    return descriptors;
+    if (!this.#entries.has(node.id)) return [];
+    return MEMORY_ACTIONS.descriptors(node, this.#host);
   }
 
   async invoke(action: string, node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
-    const entry = this.#entries.get(node.id);
-    if (entry === undefined) throw VfsError.notFound(node.path ?? node.name);
+    if (!this.#entries.has(node.id)) throw VfsError.notFound(node.path ?? node.name);
+    return MEMORY_ACTIONS.invoke(action, node, params, this.#host, this.id);
+  }
 
-    switch (action) {
-      case 'read':
-        entry.flags.delete('unread');
-        return { ok: true, message: `Marked "${entry.item.title}" as read.`, invalidates: [node.path ?? ''] };
-      case 'unread':
-        entry.flags.add('unread');
-        return { ok: true, message: `Marked "${entry.item.title}" as unread.`, invalidates: [node.path ?? ''] };
-      case 'flag': {
-        const nowFlagged = !entry.flags.has('flagged');
-        if (nowFlagged) entry.flags.add('flagged');
-        else entry.flags.delete('flagged');
-        return {
-          ok: true,
-          message: `${nowFlagged ? 'Flagged' : 'Unflagged'} "${entry.item.title}".`,
-          invalidates: [node.path ?? ''],
-        };
+  /**
+   * The only door the action commands get.
+   *
+   * Built once and handed to every invocation so commands stay ordinary values that can be
+   * unit-tested against a hand-written host, rather than methods that need a whole provider
+   * and a fixture to exercise.
+   */
+  readonly #host: MemoryActionHost = {
+    flagsOf: (id) => this.#require(id).flags,
+    setFlag: (id, flag, on) => {
+      const entry = this.#require(id);
+      if (on) entry.flags.add(flag);
+      else entry.flags.delete(flag);
+      entry.mtime = new Date(this.#now());
+    },
+    metaOf: (id) => {
+      const entry = this.#require(id);
+      return { ...entry.item.meta, ...Object.fromEntries(entry.overrides) };
+    },
+    setMeta: (id, key, value) => {
+      const entry = this.#require(id);
+      entry.overrides.set(key, value);
+      entry.mtime = new Date(this.#now());
+    },
+    titleOf: (id) => this.#require(id).item.title,
+    parentIdOf: (id) => this.#require(id).parentId,
+    append: (parentId, item) => {
+      const parent = this.#require(parentId);
+      // A node is a directory precisely when it can hold children, so appending into a leaf
+      // would produce an item that `list` shows and `cat` refuses. Better to refuse here,
+      // where the message can still name the thing that went wrong.
+      if (parent.item.children === undefined && parent.item.refs === undefined && parent.children.length === 0) {
+        throw VfsError.invalid(
+          `"${parent.item.title}" cannot hold messages.`,
+          'Replies are added to the conversation or folder the message is in.',
+        );
       }
-      case 'tag': {
-        const tag = params['tag'];
-        if (typeof tag !== 'string' || tag.length === 0) {
-          throw VfsError.invalid('The "tag" action needs a tag name.', 'Try: do tag 3 tag=followup');
-        }
-        entry.flags.add(tag);
-        return { ok: true, message: `Tagged "${entry.item.title}" with ${tag}.`, invalidates: [node.path ?? ''] };
-      }
-      default:
-        throw VfsError.unsupported(`Action "${action}"`, this.id);
-    }
+      const id = this.#index(item, parentId, this.#now());
+      // Newest first: the same order `poll` synthesis uses, and the order the listing sorts
+      // into anyway, so what you just sent is where you expect to find it.
+      parent.children.unshift(id);
+      return id;
+    },
+  };
+
+  #require(id: string): Entry {
+    const entry = this.#entries.get(id);
+    if (entry === undefined) throw VfsError.notFound(id);
+    return entry;
   }
 
   async readAttachment(node: VNode, attachmentId: string): Promise<{ name: string; contentType: string; data: Uint8Array }> {
@@ -400,13 +414,18 @@ export class MemoryProvider implements Provider {
   #toNode(id: string): VNode {    const entry = this.#entries.get(id);
     if (entry === undefined) throw VfsError.notFound(id);
     const item = entry.item;
-    const isDir = item.children !== undefined || item.refs !== undefined;
+    // `entry.children` and not just `item.children`, because an action can add the first
+    // child at runtime — and `read` already refuses anything with children, so a node that
+    // reported itself a file here would be one nothing could open.
+    const isDir = item.children !== undefined || item.refs !== undefined || entry.children.length > 0;
     const body = item.body ?? '';
 
     const unread = entry.children.reduce((count, childId) => {
       const child = this.#entries.get(childId);
       return count + (child?.flags.has('unread') === true ? 1 : 0);
     }, 0);
+
+    const meta = this.#metaOf(entry);
 
     return {
       name: nameFor(item, entry.mtime, isDir),
@@ -420,9 +439,15 @@ export class MemoryProvider implements Provider {
       ...(item.summary === undefined ? {} : { summary: item.summary }),
       ...(item.author === undefined ? {} : { author: item.author }),
       ...(item.authorId === undefined ? {} : { authorId: item.authorId }),
-      ...(item.meta === undefined ? {} : { meta: item.meta }),
+      ...(meta === undefined ? {} : { meta }),
       ...(isDir ? { childCount: entry.children.length, unreadCount: unread } : {}),
     };
+  }
+
+  /** Fixture metadata with anything an action has since changed layered on top. */
+  #metaOf(entry: Entry): Readonly<Record<string, MetaValue>> | undefined {
+    if (entry.overrides.size === 0) return entry.item.meta;
+    return { ...entry.item.meta, ...Object.fromEntries(entry.overrides) };
   }
 
   async #simulate(signal: AbortSignal | undefined): Promise<void> {
