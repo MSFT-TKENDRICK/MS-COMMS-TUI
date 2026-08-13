@@ -29,8 +29,18 @@ export class Dispatcher {
   /**
    * Run a line. Errors are reported to the session rather than thrown, because both callers
    * want to keep going: the REPL prints the next prompt, the pane draws the next frame.
+   *
+   * The first thing it does is wait for the session to be ready, which is what makes a
+   * background startup safe. Both interfaces now accept input while the sources are still
+   * connecting — that is the point of it — and a command that ran anyway would see an empty
+   * tree and answer "no such folder" about a mailbox that exists. Waiting here means the
+   * worst case is the wait the user used to have before the prompt appeared, except that
+   * now it only happens if they typed something that needs it, and the shell's progress
+   * indicator is already saying so.
    */
   async execute(session: Session, line: string): Promise<void> {
+    await session.ready();
+
     const source = line.startsWith('!') ? `cd ${line.slice(1)}` : line;
 
     const head = source.split(/\s+/)[0] ?? '';

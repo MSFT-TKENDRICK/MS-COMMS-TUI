@@ -32,6 +32,7 @@ import { Completer } from './completion.js';
 import { Dispatcher } from './dispatch.js';
 import { relativeTime, sanitizeForDisplay } from './format.js';
 import { Progress, progressLabel } from './progress.js';
+import { externalTasks, isSettled, ownTasks, readySummary } from './startup.js';
 import type { Session } from './session.js';
 import type { CommandTable } from './commands/types.js';
 
@@ -57,6 +58,8 @@ export class Shell {
   readonly #dispatcher: Dispatcher;
   readonly #historyFile: string;
   #rl: Interface | undefined;
+  /** Redraws the prompt in place; set while the REPL is running. */
+  #promptAgain: ((preserveCursor?: boolean) => void) | undefined;
   /** Undefined when output is piped or announced — see the constructor. */
   readonly #progress: Progress | undefined;
 
@@ -94,6 +97,13 @@ export class Shell {
     const session = this.#session;
 
     if (this.options.quiet !== true) this.#banner();
+
+    // Watching startup, not waiting for it. The prompt below is drawn while sources are
+    // still connecting, so the one thing owed to the user is a line — exactly one — saying
+    // when that finished and what it found. See {@link #watchStartup}.
+    const stopWatching = this.options.quiet === true ? () => undefined : this.#watchStartup(() => {
+      this.#promptAgain?.(true);
+    });
 
     const history = await this.#loadHistory();
 
@@ -148,6 +158,7 @@ export class Shell {
       rl.setPrompt(this.#prompt());
       rl.prompt(preserveCursor);
     };
+    this.#promptAgain = promptAgain;
 
     // Ctrl+C cancels the current line rather than exiting. Exiting on Ctrl+C loses the
     // session — and its numbering — for what is usually a typo.
@@ -176,6 +187,8 @@ export class Shell {
     }
 
     unsubscribe();
+    stopWatching();
+    this.#promptAgain = undefined;
     rl.close();
     return 0;
   }
@@ -230,20 +243,70 @@ export class Shell {
 
   #banner(): void {
     const session = this.#session;
-    const mountCount = session.vfs.mounts.length;
     const lines = [
       'MS-COMMS-TUI — your messages as folders and files.',
-      mountCount === 0
-        ? 'No sources configured. Type `demo` to try sample data, or `doctor` to see where the config file goes.'
-        : `${String(mountCount)} source${mountCount === 1 ? '' : 's'} available. Type \`ls\` to look around.`,
       'Type `help` for commands. Tab completes. After `ls`, act on items by number: `cat 3`.',
       '',
     ];
     session.status(lines.join('\n'));
+  }
 
-    for (const broken of session.brokenMounts) {
-      session.status(`Warning: ${broken.config.path} could not start — ${broken.error?.message ?? 'unknown error'}`);
-    }
+  /**
+   * Say one thing when startup finishes, and nothing while it runs.
+   *
+   * The temptation is a spinner. It would be wrong here for the same reason the pane is
+   * opt-in: this shell is the interface a screen reader gets, and a status line rewritten
+   * eight times a second is eight announcements of nothing. The line-oriented equivalent of
+   * a progress indicator is silence followed by a result.
+   *
+   * So the banner no longer claims a source count — it could not know one, now that sources
+   * connect in the background — and this prints it when it becomes true, above the prompt,
+   * without disturbing whatever is being typed. A user who types `ls` before it appears
+   * waits inside the command instead, where the progress indicator explains the delay.
+   *
+   * The prompt is redrawn afterwards because it may have changed: a session with exactly
+   * one source lands the user inside it, and that only becomes true when the mounts do.
+   *
+   * Checks belonging to the launcher get their own line, later, and only when they have
+   * something to say. They are not part of readiness — waiting for a rebuild before
+   * admitting the mail is there would reintroduce the original complaint one level up — and
+   * a no-op rebuild is not news, so the silent case stays silent.
+   */
+  #watchStartup(promptAgain: () => void): () => void {
+    const session = this.#session;
+    let announced = false;
+    const told = new Set<string>();
+
+    const report = (): void => {
+      const snapshot = session.tasks.snapshot();
+
+      if (!announced && session.tasks.finished) {
+        announced = true;
+        const summary = readySummary(ownTasks(snapshot));
+        const mounts = session.vfs.mounts.length;
+        session.status(
+          mounts === 0
+            ? `\n${summary} Type \`demo\` to try sample data, or \`doctor\` to see where the config file goes.`
+            : `\n${summary} Type \`ls\` to look around.`,
+        );
+        for (const broken of session.brokenMounts) {
+          session.status(`Warning: ${broken.config.path} could not start — ${broken.error?.message ?? 'unknown error'}`);
+        }
+        promptAgain();
+      }
+
+      for (const task of externalTasks(snapshot)) {
+        if (!isSettled(task) || told.has(task.id)) continue;
+        told.add(task.id);
+        if (task.state === 'ok' || task.state === 'skipped') continue;
+        session.status(`${task.label}: ${task.detail ?? task.state}`);
+        promptAgain();
+      }
+    };
+
+    const unsubscribe = session.tasks.subscribe(report);
+    report();
+    return unsubscribe;
   }
 
   // -------------------------------------------------------------------------
