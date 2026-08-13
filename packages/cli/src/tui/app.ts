@@ -33,7 +33,10 @@ import {
   initialState,
   isFetching,
   reduce,
+  selectedNode,
   shouldRefuseTui,
+  withActionResult,
+  withActions,
   withError,
   withListing,
   withFreshListing,
@@ -502,6 +505,24 @@ export class Tui {
         case 'command':
           await this.#runCommand(effect.line);
           break;
+
+        case 'actions': {
+          const descriptors = await this.#session.vfs.actions(effect.node);
+          this.#state = withActions(this.#state, effect.node, effect.path, descriptors);
+          break;
+        }
+
+        case 'invoke': {
+          const result = await this.#session.vfs.invoke(effect.action, effect.node, effect.params);
+          this.#state = withActionResult(this.#state, result);
+          // Acting on something changes it, and the whole point of doing it here rather than
+          // in a browser tab is seeing that immediately: the engine has already dropped the
+          // stale entries, so re-listing shows the reply that was just sent and the review
+          // that was just left. The status line survives it, because the result sentence is
+          // the only report the user gets.
+          await this.#refreshAfterAction(effect.node);
+          break;
+        }
       }
     } catch (error) {
       this.#state = withError(this.#state, messageOf(error));
@@ -509,6 +530,37 @@ export class Tui {
       this.#working = false;
       this.#stopTicking();
     }
+  }
+
+  /**
+   * Bring the screen back in line with what an action just changed.
+   *
+   * Failures here are deliberately swallowed down to the status line the action already
+   * produced. The action succeeded; a refresh that then fails is a lesser, separate problem,
+   * and replacing "Approved #14." with a listing error would tell the user the thing they
+   * care about did not happen.
+   */
+  async #refreshAfterAction(node: { readonly name: string }): Promise<void> {
+    const announced = this.#state.status;
+    try {
+      const result = await this.#session.vfs.list(this.#state.cwd, { limit: LIST_LIMIT });
+      this.#state = withFreshListing(this.#state, this.#state.cwd, result.entries);
+      this.#session.setListing({ path: this.#state.cwd, nodes: result.entries, startIndex: 1, source: 'ls' });
+
+      // Re-read only what is already open, and only if it is still the same item: replacing
+      // the preview with something the user did not ask to see is worse than leaving it.
+      if (this.#state.preview.length > 0 && this.#state.previewTitle === node.name) {
+        const fresh = selectedNode(this.#state);
+        if (fresh !== undefined && fresh.name === node.name) {
+          const doc = await this.#session.vfs.read(fresh);
+          const width = Math.max(20, Math.floor((this.#stdout.columns ?? 80) * 0.5) - 2);
+          this.#state = withPreview(this.#state, fresh.name, formatDocument(doc, { ...this.#session.format, width }).split('\n'));
+        }
+      }
+    } catch {
+      // Intentionally ignored; see above.
+    }
+    this.#state = withStatus(this.#state, announced);
   }
 
   /**

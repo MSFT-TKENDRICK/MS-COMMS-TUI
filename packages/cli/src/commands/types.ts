@@ -70,6 +70,16 @@ export interface Command {
    */
   correction?(positional: readonly string[]): string | undefined;
   readonly flags?: readonly CommandFlag[];
+  /**
+   * Treat an undeclared `--name value` as a flag with a value rather than a bare switch
+   * followed by a positional.
+   *
+   * Set only by `do`, and only because the flags it accepts are not knowable when the line
+   * is parsed: they are an action's parameters, declared by whichever provider owns the
+   * item. Without this, `do approve 2 --body "looks right"` parses the comment as a third
+   * positional and the approval goes out blank.
+   */
+  readonly openFlags?: boolean;
   readonly examples?: readonly string[];
   readonly group: 'navigate' | 'read' | 'search' | 'watch' | 'system';
   run(session: Session, args: CommandArgs): Promise<void>;
@@ -247,12 +257,25 @@ export function parseLine(line: string, known?: Command): ParsedLine {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   const valueFlags = new Set<string>();
+  const switches = new Set<string>();
   for (const flag of known?.flags ?? []) {
-    if (flag.value === true) {
-      valueFlags.add(flag.name);
-      for (const alias of flag.aliases ?? []) valueFlags.add(alias);
-    }
+    const target = flag.value === true ? valueFlags : switches;
+    target.add(flag.name);
+    for (const alias of flag.aliases ?? []) target.add(alias);
   }
+
+  /**
+   * Should `--name` swallow the token after it?
+   *
+   * Declared value-flags always do. Under {@link Command.openFlags} an undeclared name does
+   * too, provided the next token is not itself a flag — `do close 2 --yes` must keep `yes`
+   * a switch, and a trailing `--draft` with nothing after it is a switch by necessity.
+   */
+  const takesValue = (name: string, next: string | undefined): boolean => {
+    if (next === undefined || (next.startsWith('-') && !/^-\d/.test(next))) return false;
+    if (valueFlags.has(name)) return true;
+    return known?.openFlags === true && !switches.has(name);
+  };
 
   for (let i = 0; i < rest.length; i += 1) {
     const token = rest[i] as string;
@@ -263,7 +286,7 @@ export function parseLine(line: string, known?: Command): ParsedLine {
         continue;
       }
       const name = token.slice(2);
-      if (valueFlags.has(name) && i + 1 < rest.length) {
+      if (takesValue(name, rest[i + 1])) {
         flags[name] = rest[i + 1] as string;
         i += 1;
       } else {
@@ -274,7 +297,7 @@ export function parseLine(line: string, known?: Command): ParsedLine {
     // `-1` is a page size, not a flag; a leading digit disambiguates.
     if (token.startsWith('-') && token.length > 1 && !/^-\d/.test(token)) {
       const name = token.slice(1);
-      if (valueFlags.has(name) && i + 1 < rest.length) {
+      if (takesValue(name, rest[i + 1])) {
         flags[name] = rest[i + 1] as string;
         i += 1;
       } else {

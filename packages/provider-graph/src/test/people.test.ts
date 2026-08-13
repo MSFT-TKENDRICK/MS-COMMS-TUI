@@ -973,6 +973,32 @@ describe('graph-people: actions', () => {
       (error: unknown) => isVfsError(error) && error.code === 'ENOTSUP',
     );
   });
+
+  it('distinguishes a verb that does not exist from one that does not apply here', async () => {
+    // Told "no such action" about a verb they spelled correctly, a user goes and checks
+    // their spelling. Naming what *is* available turns the dead end into the next command.
+    const { provider } = await harness({ allowSend: true });
+    const dana = await walk(provider, 'Recent', 'Dana Whitfield');
+    assert.ok(!(await provider.actions(dana)).some((action) => action.name === 'reply'));
+    await assert.rejects(
+      () => provider.invoke('reply', dana, { body: 'Hi' }),
+      (error: unknown) => {
+        assert.ok(isVfsError(error));
+        assert.equal(error.code, 'EINVAL');
+        assert.match(error.hint ?? '', /mail/);
+        return true;
+      },
+    );
+  });
+
+  it('offers only the read-state verb that would change something', async () => {
+    const { provider } = await harness({ chats: false });
+    const page = await provider.list(await walk(provider, 'Recent', 'Dana Whitfield'), {});
+    const unread = page.entries[4] as VNode;
+    const names = (await provider.actions(unread)).map((action) => action.name);
+    assert.ok(names.includes('read'));
+    assert.ok(!names.includes('unread'), 'marking an unread message unread is a no-op');
+  });
 });
 
 // ---------------------------------------------------------------------------

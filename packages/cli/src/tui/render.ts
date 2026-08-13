@@ -30,7 +30,7 @@
 
 import { displayWidth, formatDate, padTo, paint, sanitizeForDisplay, truncateWidth } from '../format.js';
 import type { FormatOptions } from '../format.js';
-import { visibleEntries } from './state.js';
+import { accelerators, currentParam, visibleEntries } from './state.js';
 import type { TuiState } from './state.js';
 
 export interface RenderOptions extends FormatOptions {
@@ -62,7 +62,11 @@ export function render(state: TuiState, options: RenderOptions): string[] {
   if (state.mode === 'help') return renderHelp({ ...options, columns: width });
 
   const body = bodyRows(options.rows);
-  const split = state.preview.length > 0;
+  // The palette earns a pane the same way the preview does, and takes the preview's when
+  // both want one: you asked to act on the thing you are reading, so the thing you are
+  // reading is not what needs the space.
+  const choosing = isActing(state);
+  const split = state.preview.length > 0 || choosing;
   // The 1 column is the divider. Below ~60 columns a split leaves neither pane readable,
   // so we stop splitting rather than render two useless slivers.
   const listWidth = split && width >= 60 ? Math.floor((width - 1) * 0.45) : width;
@@ -70,8 +74,18 @@ export function render(state: TuiState, options: RenderOptions): string[] {
 
   const lines: string[] = [titleLine(state, width, options), rule(width, options)];
 
-  const left = renderList(state, listWidth, body, options);
-  const right = previewWidth > 0 ? renderPreview(state, previewWidth, body, options) : [];
+  // On a narrow terminal there is one pane, so the palette has to take it outright —
+  // otherwise choosing an action would mean choosing from a list you cannot see.
+  const left =
+    choosing && previewWidth <= 0
+      ? renderActions(state, listWidth, body, options)
+      : renderList(state, listWidth, body, options);
+  const right =
+    previewWidth <= 0
+      ? []
+      : choosing
+        ? renderActions(state, previewWidth, body, options)
+        : renderPreview(state, previewWidth, body, options);
 
   for (let i = 0; i < body; i += 1) {
     const listRow = left[i] ?? ' '.repeat(listWidth);
@@ -99,6 +113,11 @@ export function render(state: TuiState, options: RenderOptions): string[] {
  */
 export function statusRow(state: TuiState): string {
   return state.startup === '' ? state.status : state.startup;
+}
+
+/** True while the user is choosing, filling in, or confirming an action. */
+function isActing(state: TuiState): boolean {
+  return state.mode === 'actions' || state.mode === 'param' || state.mode === 'confirm';
 }
 
 function rule(width: number, options: RenderOptions): string {
@@ -195,13 +214,70 @@ function inputLine(state: TuiState, width: number, options: RenderOptions): stri
   if (state.mode === 'filter') return fit(`Filter: ${state.filter}\u2588`, width);
   if (state.mode === 'command') return fit(`: ${state.command}\u2588`, width);
 
+  if (state.mode === 'param' && state.pending !== undefined) {
+    const param = currentParam(state.pending);
+    const name = param === undefined ? 'Value' : (param.label ?? param.name);
+    return fit(`${name}: ${state.pending.input}\u2588`, width);
+  }
+  if (state.mode === 'confirm' && state.pending !== undefined) {
+    const label = state.pending.descriptor.label ?? state.pending.descriptor.name;
+    return paint(fit(`${label} \u2014 press y to go ahead, any other key to cancel`, width), 'bold', options.color);
+  }
+  if (state.mode === 'actions') {
+    return paint(fit('Press the letter, or Up/Down then Enter   Escape cancels', width), 'dim', options.color);
+  }
+
   // `/` appears in both hints. It is now the only way into a filter, so it has to be on
   // screen in every state it works in — which is both panes.
   const hint =
     state.pane === 'preview'
-      ? 'Tab list   Up/Down scroll   / filter   : command   ? help   q quit'
-      : 'Enter open   Backspace up   / filter   : command   ? help   q quit';
+      ? 'Tab list   Up/Down scroll   a act   / filter   : command   ? help   q quit'
+      : 'Enter open   a act   Backspace up   / filter   : command   ? help   q quit';
   return paint(fit(hint, width), 'dim', options.color);
+}
+
+/**
+ * The action palette.
+ *
+ * Grouped, because a flat list of fourteen verbs on a pull request is a wall: the groups a
+ * provider declares are the difference between "review, reply, triage" and fourteen equal
+ * choices. The accelerator is shown against every row — a menu whose shortcuts are secret
+ * is a menu nobody uses twice.
+ */
+function renderActions(state: TuiState, width: number, body: number, options: RenderOptions): string[] {
+  const target = state.actionTarget;
+  const heading = target === undefined ? 'Actions' : `Actions \u2014 ${target.title ?? target.name}`;
+  const rows: string[] = [paint(fit(heading, width), 'bold', options.color), ' '.repeat(width)];
+
+  const keys = accelerators(state.actions);
+  // The chosen action stays highlighted while its parameters are collected, so the screen
+  // still answers "what am I typing this into".
+  const active = state.pending?.descriptor.name;
+  let group: string | undefined;
+
+  for (const [index, descriptor] of state.actions.entries()) {
+    if (rows.length >= body) break;
+    if (descriptor.group !== group) {
+      group = descriptor.group;
+      if (group !== undefined && rows.length < body) {
+        rows.push(paint(fit(`  ${group}`, width), 'dim', options.color));
+      }
+    }
+    if (rows.length >= body) break;
+
+    const selected = active === undefined ? index === state.actionIndex : active === descriptor.name;
+    const marker = selected ? '>' : ' ';
+    const key = keys[index] ?? ' ';
+    const label = descriptor.label ?? descriptor.name;
+    // The exclamation is the only warning a destructive verb gets in the list itself; the
+    // real guard is the confirmation, and this is what tells you it is coming.
+    const warn = descriptor.destructive === true ? ' !' : '';
+    const line = fit(`${marker} ${key}  ${label}${warn}`, width);
+    rows.push(selected ? paint(line, 'cyan', options.color) : line);
+  }
+
+  while (rows.length < body) rows.push(' '.repeat(width));
+  return rows;
 }
 
 /**
@@ -221,6 +297,7 @@ export function renderHelp(options: RenderOptions): string[] {
     ['[  /  ]', 'back / forward through where you have been (also Alt+Left, Alt+Right)'],
     ['Tab', 'switch between the list and the preview'],
     ['/', 'filter as you type (Enter keeps it, Escape clears it)'],
+    ['a', 'what you can do with the selected item \u2014 reply, approve, comment, flag\u2026'],
     [':', 'run any command \u2014 ls, find, grep, cat, open, mark, watch\u2026'],
     ['r, F5', 'refresh the current folder'],
     ['?', 'this screen'],
@@ -231,6 +308,21 @@ export function renderHelp(options: RenderOptions): string[] {
   const keyWidth = keys.reduce((max, pair) => Math.max(max, displayWidth(pair[0])), 0);
   const out: string[] = [paint(fit('Keys', width), 'bold', options.color), ' '.repeat(width)];
   for (const [key, meaning] of keys) out.push(fit(`  ${padTo(key, keyWidth)}   ${meaning}`, width));
+
+  out.push(' '.repeat(width));
+  out.push(paint(fit('Acting on things', width), 'bold', options.color));
+  for (const line of [
+    '  a opens the actions the source says are possible for that item right now, so a',
+    '  merged pull request does not offer to merge and a message you have read does not',
+    '  offer to mark it read. Pick with the letter shown, or Up/Down then Enter.',
+    '  Anything marked ! asks you to press y before it happens.',
+    '  In a text answer, type \\n where you want a line break.',
+    '',
+    '  The same actions are available as commands: `actions` lists them and `do` runs',
+    '  one, so nothing here needs the pane.',
+  ]) {
+    out.push(fit(line, width));
+  }
 
   out.push(' '.repeat(width));
   out.push(paint(fit('The full-screen view adds no capability of its own.', width), 'bold', options.color));

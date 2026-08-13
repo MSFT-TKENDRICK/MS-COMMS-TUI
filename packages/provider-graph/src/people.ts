@@ -56,8 +56,10 @@
  */
 
 import {
+  ActionRegistry,
   VfsError,
   isVfsError,
+  requiredText,
   timestampPrefix,
   type ActionDescriptor,
   type ActionResult,
@@ -474,6 +476,76 @@ export class GraphPeopleProvider implements Provider {
    * disposed on the way down.
    */
   readonly #lifetime = new AbortController();
+  /**
+   * Every verb this mount offers, as command objects.
+   *
+   * `applies` carries the whole of "which node is this?" — a person is not a message and
+   * cannot be replied to, a chat message has no read state to toggle — so the list a user is
+   * shown is already the list that will run. `#requireSend` stays inside the writing
+   * commands rather than becoming an `applies` clause on purpose: a read-only mount should
+   * still *say* that sending exists and explain how to turn it on, because silently omitting
+   * the verb is indistinguishable from the feature not existing.
+   */
+  readonly #registry = new ActionRegistry<GraphPeopleProvider>([
+    {
+      descriptor: {
+        name: 'mail',
+        label: 'Send an email',
+        description: 'Compose and send a message to this person.',
+        group: 'reply',
+        key: 'm',
+        params: [
+          { name: 'subject', type: 'string', label: 'Subject', required: true },
+          { name: 'body', type: 'text', label: 'Message', required: true },
+        ],
+      },
+      applies: (node) => node.subtype === 'person',
+      run: ({ node, params, context }) => context.#sendMail(node, params),
+    },
+    {
+      descriptor: {
+        name: 'chat',
+        label: 'Send a Teams chat',
+        description: 'Send a one-to-one chat message, starting the chat if there is not one already.',
+        group: 'reply',
+        key: 'c',
+        params: [{ name: 'body', type: 'text', label: 'Message', required: true }],
+      },
+      applies: (node) => node.subtype === 'person',
+      run: ({ node, params, context }) => context.#sendChat(node, params),
+    },
+    {
+      descriptor: {
+        name: 'reply',
+        label: 'Reply',
+        description: 'Reply on the same channel this message arrived on.',
+        group: 'reply',
+        key: 'r',
+        params: [{ name: 'body', type: 'text', label: 'Reply', required: true }],
+      },
+      applies: (node) => node.subtype === 'message' || node.subtype === 'chat-message',
+      run: ({ node, params, context }) => context.#reply(node, params),
+    },
+    {
+      descriptor: { name: 'read', label: 'Mark as read', description: 'Clear the unread flag.', group: 'state' },
+      applies: (node) => node.subtype === 'message' && (node.flags ?? []).includes('unread'),
+      run: ({ node, context }) => context.#setRead(node, true),
+    },
+    {
+      descriptor: { name: 'unread', label: 'Mark as unread', description: 'Set the unread flag.', group: 'state' },
+      applies: (node) => node.subtype === 'message' && !(node.flags ?? []).includes('unread'),
+      run: ({ node, context }) => context.#setRead(node, false),
+    },
+    {
+      descriptor: { name: 'url', label: 'Show the web URL', description: 'Print the link to this item.', group: 'link', key: 'u' },
+      applies: (node) =>
+        node.subtype === 'person' ||
+        node.subtype === 'profile' ||
+        node.subtype === 'message' ||
+        node.subtype === 'chat-message',
+      run: ({ node, context }) => context.#urlAction(node),
+    },
+  ]);
   #client: GraphApi | undefined;
   #me: Promise<Person> | undefined;
   #signals: Promise<SignalIndex> | undefined;
@@ -1419,66 +1491,11 @@ export class GraphPeopleProvider implements Provider {
   // -------------------------------------------------------------------------
 
   async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
-    if (node.subtype === 'person') {
-      return [
-        {
-          name: 'mail',
-          label: 'Send an email',
-          description: 'Compose and send a message to this person.',
-          params: [
-            { name: 'subject', type: 'string', label: 'Subject', required: true },
-            { name: 'body', type: 'text', label: 'Message', required: true },
-          ],
-        },
-        {
-          name: 'chat',
-          label: 'Send a Teams chat',
-          description: 'Send a one-to-one chat message, starting the chat if there is not one already.',
-          params: [{ name: 'body', type: 'text', label: 'Message', required: true }],
-        },
-        { name: 'url', label: 'Show the mail address as a link' },
-      ];
-    }
-
-    if (node.subtype === 'message' || node.subtype === 'chat-message') {
-      const flags = node.flags ?? [];
-      const actions: ActionDescriptor[] = [
-        {
-          name: 'reply',
-          label: 'Reply',
-          description: 'Reply on the same channel this message arrived on.',
-          params: [{ name: 'body', type: 'text', label: 'Reply', required: true }],
-        },
-      ];
-      if (node.subtype === 'message') {
-        actions.push(flags.includes('unread') ? { name: 'read', label: 'Mark as read' } : { name: 'unread', label: 'Mark as unread' });
-      }
-      actions.push({ name: 'url', label: 'Show the web URL' });
-      return actions;
-    }
-
-    if (node.subtype === 'profile') return [{ name: 'url', label: 'Show the mail address as a link' }];
-    return [];
+    return this.#registry.descriptors(node, this);
   }
 
   async invoke(action: string, node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
-    if (action === 'url') return this.#urlAction(node);
-
-    this.#requireSend(action);
-
-    switch (action) {
-      case 'mail':
-        return this.#sendMail(node, params);
-      case 'chat':
-        return this.#sendChat(node, params);
-      case 'reply':
-        return this.#reply(node, params);
-      case 'read':
-      case 'unread':
-        return this.#setRead(node, action === 'read');
-      default:
-        throw VfsError.unsupported(`Action "${action}"`, this.id);
-    }
+    return this.#registry.invoke(action, node, params, this, this.id);
   }
 
   /**
@@ -1511,12 +1528,13 @@ export class GraphPeopleProvider implements Provider {
   }
 
   async #sendMail(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('mail');
     const person = await this.#personOf(node);
     if (person.address === undefined) {
       throw VfsError.invalid(`No mail address is known for ${person.displayName}.`);
     }
-    const subject = requireText(params, 'subject');
-    const body = requireText(params, 'body');
+    const subject = requiredText(params, 'subject');
+    const body = requiredText(params, 'body');
 
     await this.#api.post('/me/sendMail', {
       message: {
@@ -1535,8 +1553,9 @@ export class GraphPeopleProvider implements Provider {
   }
 
   async #sendChat(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('chat');
     const person = await this.#personOf(node);
-    const body = requireText(params, 'body');
+    const body = requiredText(params, 'body');
     const me = await this.#self();
 
     let chat = await this.#chatFor(person, me, undefined);
@@ -1573,7 +1592,8 @@ export class GraphPeopleProvider implements Provider {
   }
 
   async #reply(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
-    const body = requireText(params, 'body');
+    this.#requireSend('reply');
+    const body = requiredText(params, 'body');
 
     if (node.subtype === 'message') {
       await this.#api.post(`/me/messages/${encodeURIComponent(messageIdOf(node))}/reply`, { comment: body });
@@ -1595,6 +1615,7 @@ export class GraphPeopleProvider implements Provider {
   }
 
   async #setRead(node: VNode, read: boolean): Promise<ActionResult> {
+    this.#requireSend(read ? 'read' : 'unread');
     if (node.subtype !== 'message') {
       throw VfsError.unsupported('Marking chat messages read', this.id);
     }
@@ -1789,14 +1810,6 @@ function formatAddress(address: EmailAddress | undefined): string {
   if (address.name === undefined) return address.address ?? '(unknown)';
   if (address.address === undefined) return address.name;
   return `${address.name} <${address.address}>`;
-}
-
-function requireText(params: Readonly<Record<string, MetaValue>>, name: string): string {
-  const value = params[name];
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw VfsError.invalid(`The "${name}" parameter is required.`, `Try \`do <item> ${name}="…"\`.`);
-  }
-  return value;
 }
 
 /** The first free-text term in a query, which is what a directory lookup can push down. */

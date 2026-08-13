@@ -88,6 +88,19 @@ export {
   type Trilean,
 } from './query.js';
 
+export {
+  ActionRegistry,
+  metaNumber,
+  metaText,
+  optionalFlag,
+  optionalText,
+  requiredText,
+  resolveParams,
+  type ActionCommand,
+  type ActionInvocation,
+  type ActionParams,
+} from './actions.js';
+
 export { TtlCache, type CacheEntry, type CacheOptions, type CacheStats } from './cache.js';
 
 // ---------------------------------------------------------------------------
