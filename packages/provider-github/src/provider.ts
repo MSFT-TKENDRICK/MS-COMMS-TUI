@@ -55,6 +55,15 @@ import {
   queryFields,
 } from '@mscomms/core';
 import { GitHubClient, type FetchLike } from './client.js';
+import {
+  DISCUSSION_PRESENTATION,
+  ISSUE_PRESENTATION,
+  PULL_PRESENTATION,
+  discussionCard,
+  issueCard,
+  pullCard,
+  type PullReviewSummary,
+} from './card.js';
 import { ghToken } from './gh.js';
 import {
   DISCUSSIONS_QUERY,
@@ -110,6 +119,14 @@ interface IssuePayload {
   readonly title: string;
   readonly body: string | null;
   readonly state: string;
+  /**
+   * Why a closed issue was closed: `completed` or `not_planned`.
+   *
+   * Kept because "closed" alone does not answer the question people actually have, which is
+   * whether the thing was ever fixed. Optional because it is absent on open issues and on
+   * older GitHub Enterprise versions.
+   */
+  readonly state_reason?: string | null;
   readonly html_url: string;
   readonly created_at: string;
   readonly updated_at: string;
@@ -118,6 +135,7 @@ interface IssuePayload {
   readonly user: { login: string } | null;
   readonly labels: ReadonlyArray<{ name: string } | string>;
   readonly assignees?: ReadonlyArray<{ login: string }>;
+  readonly milestone?: { readonly title: string } | null;
   readonly pull_request?: unknown;
 }
 
@@ -1062,12 +1080,15 @@ export class GitHubProvider implements Provider {
     );
 
     const parts: string[] = [issue.data.body ?? '_No description._'];
+    const conversation: string[] = [];
 
     if (this.#options.includeComments !== false && issue.data.comments > 0) {
-      parts.push(...(await this.#issueComments(owner, repo, number, options)));
+      conversation.push(...(await this.#issueComments(owner, repo, number, options)));
+      parts.push(...conversation);
     }
 
     const labels = issue.data.labels.map((l) => (typeof l === 'string' ? l : l.name));
+    const assignees = (issue.data.assignees ?? []).map((a) => a.login);
     const headers: Array<readonly [string, string]> = [
       ['Author', issue.data.user?.login ?? 'unknown'],
       ['State', issue.data.state],
@@ -1084,6 +1105,28 @@ export class GitHubProvider implements Provider {
       body: parts.join('\n'),
       format: 'markdown',
       webUrl: issue.data.html_url,
+      card: issueCard({
+        number: issue.data.number,
+        title: issue.data.title,
+        author: issue.data.user?.login ?? 'unknown',
+        state: issue.data.state,
+        ...(issue.data.state_reason === null || issue.data.state_reason === undefined
+          ? {}
+          : { stateReason: issue.data.state_reason }),
+        repository: `${owner}/${repo}`,
+        createdAt: issue.data.created_at,
+        updatedAt: issue.data.updated_at,
+        labels,
+        assignees,
+        ...(issue.data.milestone === null || issue.data.milestone === undefined
+          ? {}
+          : { milestone: issue.data.milestone.title }),
+        comments: issue.data.comments,
+        body: issue.data.body ?? '',
+        conversation: conversation.join('\n'),
+        webUrl: issue.data.html_url,
+      }),
+      presentation: ISSUE_PRESENTATION,
     };
   }
 
@@ -1105,12 +1148,20 @@ export class GitHubProvider implements Provider {
     const merged = data.merged === true || data.merged_at !== null;
 
     const parts: string[] = [data.body ?? '_No description._'];
+    // Kept apart from the description so the card can put the verdicts above it. The joined
+    // form below is unchanged, because `plain`, `tsv` and `json` output is parsed by other
+    // programs and must stay byte-identical.
+    const conversation: string[] = [];
+    let reviews: readonly PullReviewSummary[] = [];
 
     if (this.#options.includeComments !== false) {
       // Reviews first, then the conversation. A reviewer's verdict is the thing a reader
       // is looking for, and burying it after forty comments means listening to all forty.
-      parts.push(...(await this.#pullReviews(owner, repo, number, options)));
-      if ((data.comments ?? 0) > 0) parts.push(...(await this.#issueComments(owner, repo, number, options)));
+      const reviewed = await this.#pullReviews(owner, repo, number, options);
+      conversation.push(...reviewed.parts);
+      reviews = reviewed.reviews;
+      if ((data.comments ?? 0) > 0) conversation.push(...(await this.#issueComments(owner, repo, number, options)));
+      parts.push(...conversation);
     }
 
     const labels = data.labels.map((l) => (typeof l === 'string' ? l : l.name));
@@ -1144,6 +1195,30 @@ export class GitHubProvider implements Provider {
       body: parts.join('\n'),
       format: 'markdown',
       webUrl: data.html_url,
+      card: pullCard({
+        number: data.number,
+        title: data.title,
+        author: data.user?.login ?? 'unknown',
+        state: data.state,
+        merged,
+        ...(data.draft === undefined ? {} : { draft: data.draft }),
+        repository: `${owner}/${repo}`,
+        ...(data.head === undefined ? {} : { headRef: data.head.ref }),
+        ...(data.base === undefined ? {} : { baseRef: data.base.ref }),
+        createdAt: data.created_at,
+        updatedAt: data.updated_at,
+        ...(data.mergeable === undefined ? {} : { mergeable: data.mergeable }),
+        ...(data.changed_files === undefined ? {} : { changedFiles: data.changed_files }),
+        ...(data.additions === undefined ? {} : { additions: data.additions }),
+        ...(data.deletions === undefined ? {} : { deletions: data.deletions }),
+        labels,
+        requestedReviewers: reviewers,
+        reviews,
+        body: data.body ?? '',
+        conversation: conversation.join('\n'),
+        webUrl: data.html_url,
+      }),
+      presentation: PULL_PRESENTATION,
     };
   }
 
@@ -1161,13 +1236,16 @@ export class GitHubProvider implements Provider {
     if (discussion === null || discussion === undefined) throw VfsError.notFound(node.path ?? node.name);
 
     const parts: string[] = [discussion.body ?? '_No description._'];
+    const conversation: string[] = [];
+    let answeredBy: string | undefined;
 
     // The whole thread in one document, comments and their replies, for the same reason
     // issue comments are inlined: a conversation read linearly is how a screen reader
     // reads and how anyone catching up actually wants it. Replies are indented as
     // blockquotes so the nesting survives being read aloud rather than depending on layout.
     for (const comment of nodesOf(discussion.comments)) {
-      parts.push(
+      if (comment.isAnswer === true) answeredBy = comment.author?.login ?? 'unknown';
+      conversation.push(
         '',
         '---',
         `**${comment.author?.login ?? 'unknown'}** commented on ${new Date(comment.createdAt).toLocaleString()}${
@@ -1177,7 +1255,7 @@ export class GitHubProvider implements Provider {
         comment.body ?? '',
       );
       for (const reply of nodesOf(comment.replies)) {
-        parts.push(
+        conversation.push(
           '',
           `> **${reply.author?.login ?? 'unknown'}** replied on ${new Date(reply.createdAt).toLocaleString()}:`,
           '>',
@@ -1185,6 +1263,7 @@ export class GitHubProvider implements Provider {
         );
       }
     }
+    parts.push(...conversation);
 
     const total = discussion.comments?.totalCount ?? 0;
     const shown = nodesOf(discussion.comments).length;
@@ -1210,6 +1289,26 @@ export class GitHubProvider implements Provider {
       body: parts.join('\n'),
       format: 'markdown',
       webUrl: discussion.url,
+      card: discussionCard({
+        number: discussion.number,
+        title: discussion.title,
+        author: discussion.author?.login ?? 'unknown',
+        ...(discussion.category?.name === undefined ? {} : { category: discussion.category.name }),
+        repository: `${owner}/${repo}`,
+        createdAt: discussion.createdAt,
+        upvotes: discussion.upvoteCount,
+        // A discussion in a category that cannot be answered is not "unanswered" — there is
+        // no question on the table. Saying otherwise would put a warning badge on every
+        // announcement in the repository.
+        answered: discussion.category?.isAnswerable !== true || discussion.isAnswered === true,
+        ...(answeredBy === undefined ? {} : { answeredBy }),
+        commentCount: total,
+        shownCount: shown,
+        body: discussion.body ?? '',
+        conversation: conversation.join('\n'),
+        webUrl: discussion.url,
+      }),
+      presentation: DISCUSSION_PRESENTATION,
     };
   }
 
@@ -1285,18 +1384,39 @@ export class GitHubProvider implements Provider {
     }
   }
 
-  async #pullReviews(owner: string, repo: string, number: number, options: ReadOptions): Promise<string[]> {
+  /**
+   * Reviews, as both the prose that goes in the document body and the structured verdicts
+   * the card needs.
+   *
+   * Returned together because they come from one request and disagreeing about what it
+   * said would be a bug waiting to happen.
+   */
+  async #pullReviews(
+    owner: string,
+    repo: string,
+    number: number,
+    options: ReadOptions,
+  ): Promise<{ parts: string[]; reviews: PullReviewSummary[] }> {
     try {
       const reviews = await this.#api.get<ReviewPayload[]>(
         `/repos/${owner}/${repo}/pulls/${String(number)}/reviews?per_page=100`,
         options.signal === undefined ? {} : { signal: options.signal },
       );
       const parts: string[] = [];
+      const summaries: PullReviewSummary[] = [];
       for (const review of reviews.data) {
         // A `PENDING` review is the viewer's own unsubmitted draft, and a `COMMENTED`
         // review with no body is the empty envelope GitHub creates around inline comments.
         // Neither says anything, and both would read aloud as a row of noise.
         if (review.state === 'PENDING') continue;
+        // The verdict still counts even when the envelope is empty: a `COMMENTED` review
+        // with no body says nothing worth quoting, but an approval with no body is
+        // exactly the thing a reader came to find.
+        summaries.push({
+          author: review.user?.login ?? 'unknown',
+          state: review.state,
+          ...(review.submitted_at === null ? {} : { submittedAt: review.submitted_at }),
+        });
         if ((review.body ?? '') === '' && review.state === 'COMMENTED') continue;
         parts.push(
           '',
@@ -1308,9 +1428,12 @@ export class GitHubProvider implements Provider {
           review.body ?? '_No comment._',
         );
       }
-      return parts;
+      return { parts, reviews: summaries };
     } catch (error) {
-      return ['', '---', `_Reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}_`];
+      return {
+        parts: ['', '---', `_Reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}_`],
+        reviews: [],
+      };
     }
   }
 

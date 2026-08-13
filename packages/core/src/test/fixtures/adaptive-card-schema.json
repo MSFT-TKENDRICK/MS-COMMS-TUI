@@ -1,0 +1,275 @@
+{
+  "source": "https://adaptivecards.io/schemas/adaptive-card.json",
+  "retrieved": "2026-08-13",
+  "sha256": "d42107e3a08f3d1ec5c35f82e497a5e349812bb0d86e90d5b85808999ae52a1a",
+  "bytes": 97026,
+  "schemaVersion": "Schema version that this card requires. If a client is **lower** than this version, the `fallbackText` will be rendered. NOTE: Version is not required for cards within an `Action.ShowCard`. However, it *is* required for the top-level card.",
+  "definitions": {
+    "AdaptiveCard": {
+      "version": null,
+      "properties": [
+        "$schema",
+        "actions",
+        "authentication",
+        "backgroundImage",
+        "body",
+        "fallbackText",
+        "lang",
+        "minHeight",
+        "refresh",
+        "rtl",
+        "selectAction",
+        "speak",
+        "type",
+        "version",
+        "verticalContentAlignment"
+      ],
+      "inherits": []
+    },
+    "TextBlock": {
+      "version": null,
+      "properties": [
+        "color",
+        "fallback",
+        "fontType",
+        "height",
+        "horizontalAlignment",
+        "id",
+        "isSubtle",
+        "isVisible",
+        "maxLines",
+        "requires",
+        "separator",
+        "size",
+        "spacing",
+        "style",
+        "text",
+        "type",
+        "weight",
+        "wrap"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Element"
+      ]
+    },
+    "FactSet": {
+      "version": null,
+      "properties": [
+        "facts",
+        "fallback",
+        "height",
+        "id",
+        "isVisible",
+        "requires",
+        "separator",
+        "spacing",
+        "type"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Element"
+      ]
+    },
+    "Fact": {
+      "version": null,
+      "properties": [
+        "title",
+        "type",
+        "value"
+      ],
+      "inherits": []
+    },
+    "Table": {
+      "version": "1.5",
+      "properties": [
+        "columns",
+        "fallback",
+        "firstRowAsHeader",
+        "gridStyle",
+        "height",
+        "horizontalCellContentAlignment",
+        "id",
+        "isVisible",
+        "requires",
+        "rows",
+        "separator",
+        "showGridLines",
+        "spacing",
+        "type",
+        "verticalCellContentAlignment"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Element"
+      ]
+    },
+    "TableCell": {
+      "version": "1.5",
+      "properties": [
+        "backgroundImage",
+        "bleed",
+        "items",
+        "minHeight",
+        "rtl?",
+        "selectAction",
+        "style",
+        "type",
+        "verticalContentAlignment"
+      ],
+      "inherits": []
+    },
+    "TableRow": {
+      "version": "1.5",
+      "properties": [
+        "cells",
+        "horizontalCellContentAlignment",
+        "style",
+        "type",
+        "verticalCellContentAlignment"
+      ],
+      "inherits": []
+    },
+    "ColumnSet": {
+      "version": null,
+      "properties": [
+        "bleed",
+        "columns",
+        "fallback",
+        "height",
+        "horizontalAlignment",
+        "id",
+        "isVisible",
+        "minHeight",
+        "requires",
+        "selectAction",
+        "separator",
+        "spacing",
+        "style",
+        "type"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Element"
+      ]
+    },
+    "Column": {
+      "version": null,
+      "properties": [
+        "backgroundImage",
+        "bleed",
+        "fallback",
+        "id",
+        "isVisible",
+        "items",
+        "minHeight",
+        "requires",
+        "rtl",
+        "selectAction",
+        "separator",
+        "spacing",
+        "style",
+        "type",
+        "verticalContentAlignment",
+        "width"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.ToggleableItem"
+      ]
+    },
+    "Container": {
+      "version": null,
+      "properties": [
+        "backgroundImage",
+        "bleed",
+        "fallback",
+        "height",
+        "id",
+        "isVisible",
+        "items",
+        "minHeight",
+        "requires",
+        "rtl?",
+        "selectAction",
+        "separator",
+        "spacing",
+        "style",
+        "type",
+        "verticalContentAlignment"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Element"
+      ]
+    },
+    "ActionSet": {
+      "version": "1.2",
+      "properties": [
+        "actions",
+        "fallback",
+        "height",
+        "id",
+        "isVisible",
+        "requires",
+        "separator",
+        "spacing",
+        "type"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Element"
+      ]
+    },
+    "Action.OpenUrl": {
+      "version": null,
+      "properties": [
+        "fallback",
+        "iconUrl",
+        "id",
+        "isEnabled",
+        "mode",
+        "requires",
+        "style",
+        "title",
+        "tooltip",
+        "type",
+        "url"
+      ],
+      "inherits": [
+        "#/definitions/Extendable.Action"
+      ]
+    },
+    "Extendable.Element": {
+      "version": null,
+      "properties": [
+        "fallback",
+        "height",
+        "id",
+        "isVisible",
+        "requires",
+        "separator",
+        "spacing"
+      ],
+      "inherits": []
+    },
+    "Extendable.Action": {
+      "version": null,
+      "properties": [
+        "fallback",
+        "iconUrl",
+        "id",
+        "isEnabled",
+        "mode",
+        "requires",
+        "style",
+        "title",
+        "tooltip"
+      ],
+      "inherits": []
+    },
+    "Extendable.ToggleableItem": {
+      "version": null,
+      "properties": [
+        "id",
+        "isVisible",
+        "requires"
+      ],
+      "inherits": []
+    }
+  },
+  "enums": {}
+}

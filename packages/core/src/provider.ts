@@ -24,6 +24,7 @@
  *    owns scheduling, backoff and coalescing so providers stay trivial.
  */
 
+import type { Card } from './card.js';
 import type { GraphSource, GraphSpace } from './graph.js';
 import type { Query } from './query.js';
 
@@ -206,6 +207,38 @@ export interface Document {
   readonly webUrl?: string;
   /** Thread/conversation identifier, for `thread` navigation. */
   readonly threadId?: string;
+  /**
+   * A structured description of the detail pane, when the provider has one.
+   *
+   * Optional, and it must stay that way. `headers` plus `body` is a complete document for
+   * a mail message, and a provider that has nothing richer to say should not be made to
+   * write a card to keep working — the frontend synthesises an equivalent card from the
+   * fields above, so every existing provider renders exactly as it did.
+   *
+   * Supply it when flattening the item into label/value pairs would lose something the
+   * reader wants: a pull request's labels are a list, its review verdicts are a table, and
+   * `"bug, needs-triage"` is what is left after the structure has been thrown away.
+   *
+   * The two are not alternatives. A provider that sets `card` should still populate
+   * `headers` and `body`, because `plain` and `tsv` output, search indexing and the
+   * snapshot all read those. The card decides presentation, not truth.
+   */
+  readonly card?: Card;
+  /**
+   * Plain-text guidance on how this item is best visualized, for a renderer that composes
+   * the pane itself rather than following a card verbatim.
+   *
+   * This is the seam for generated layouts. A provider knows things about its own content
+   * that are true but not structural — that a build status matters more than a description,
+   * that a long diff should be summarised rather than shown, that the newest comment is the
+   * one being looked for. None of that fits in a card, because a card is already a decision.
+   *
+   * Kept as prose, and deliberately not a schema. The consumer is a language model, and the
+   * moment this became an enum it would stop being able to say the useful thing. A
+   * renderer that does not generate layouts ignores it entirely, which is why it is safe
+   * for a provider to always set it.
+   */
+  readonly presentation?: string;
 }
 
 export interface ReadOptions {

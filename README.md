@@ -409,6 +409,8 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config key, every built-in provider's options |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | Writing a backend, in TypeScript or any other language |
 | [docs/PROJECTIONS.md](docs/PROJECTIONS.md) | Reorganizing your tree with a GraphQL query over every source |
+| [docs/RENDERING.md](docs/RENDERING.md) | How the detail pane renders an item, and why it is Adaptive Cards |
+| [docs/DESIGN.md](docs/DESIGN.md) | The design system for the detail pane, and the linter that enforces it |
 | [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md) | The reasoning behind the interface decisions |
 | [docs/PRIOR-ART.md](docs/PRIOR-ART.md) | What twenty-odd earlier projects got right and wrong |
 
@@ -419,7 +421,9 @@ relevance ranking), cross-source search, cache, the local Turso snapshot with ba
 sync, predictive prefetching and vector search, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1635 tests.
+The detail pane renders through the Adaptive Cards pipeline described in
+[docs/RENDERING.md](docs/RENDERING.md), with the design system enforced by the suite.
+1760 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been

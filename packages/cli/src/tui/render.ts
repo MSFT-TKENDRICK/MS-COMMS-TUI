@@ -173,10 +173,28 @@ function renderPreview(state: TuiState, width: number, body: number, options: Re
 
   const room = Math.max(0, body - rows.length);
   for (let i = state.previewOffset; i < Math.min(state.preview.length, state.previewOffset + room); i += 1) {
-    rows.push(fit(state.preview[i] ?? '', width));
+    // Fit the plain text first, then colour the fitted string whole. Doing it the other way
+    // measures the ANSI escape as content and prints it as text; see TuiState.previewStyles.
+    const line = fit(state.preview[i] ?? '', width);
+    const color = state.previewStyles[i];
+    rows.push(color === undefined ? line : paint(line, color, options.color));
   }
   while (rows.length < body) rows.push(' '.repeat(width));
   return rows;
+}
+
+/**
+ * The preview pane's width for a terminal of `columns` columns, assuming the split happens.
+ *
+ * Exported so the caller that *renders* a document lays it out at the width the pane will
+ * actually give it. The two used to be derived independently and disagreed, which cost a
+ * couple of columns of every document to truncation.
+ */
+export function previewWidth(columns: number): number {
+  const width = Math.max(24, columns);
+  if (width < 60) return 0;
+  const listWidth = Math.floor((width - 1) * 0.45);
+  return Math.max(0, width - listWidth - 1);
 }
 
 function inputLine(state: TuiState, width: number, options: RenderOptions): string {

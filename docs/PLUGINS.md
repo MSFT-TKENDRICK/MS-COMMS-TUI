@@ -99,6 +99,88 @@ deliberately contains a message named `CON`, a 200-character subject, an emoji, 
 messages with identical subjects, because those are the four things that break naive
 implementations.
 
+## Describing how an item should look
+
+`read()` returns a `Document`. Two optional fields on it decide how the detail pane renders
+your item, and both are additive — a provider that sets neither renders exactly as it always
+has, because the frontend synthesises an equivalent card from `headers` and `body`.
+
+Full detail in [docs/RENDERING.md](RENDERING.md); the rules are in [docs/DESIGN.md](DESIGN.md).
+
+### `card` — structure the renderer can use
+
+The problem it solves: `labels.join(', ')` is what is left after the structure has been
+thrown away, and the renderer cannot get it back. A pull request's labels are a *list*, its
+review verdicts are a *table*, and flattening both into `Label: value` lines throws away the
+only thing that would let the pane lay them out well.
+
+```ts
+import { badges, card, facts, heading, prose } from '@mscomms/core';
+
+return {
+  title: pull.title,
+  headers: [...],   // still required: plain, tsv, json and search read these
+  body: markdown,   // still required, and unchanged
+  card: card([
+    badges([{ text: 'open', tone: 'good' }, { text: 'bug', tone: 'attention' }]),
+    facts([
+      { title: 'Author', value: pull.user.login },
+      { title: 'Mergeable', value: 'no, conflicts', tone: 'attention' },
+    ]),
+    heading('Description'),
+    prose(pull.body),
+  ], { title: `#${pull.number} ${pull.title}` }),
+};
+```
+
+The vocabulary is a subset of Adaptive Cards 1.5: `TextBlock`, `FactSet`, `BadgeSet`,
+`Table`, `ColumnSet`, `Container`, `ActionSet`, `Prose`. Three rules matter more than the
+rest:
+
+- **Never write a colour.** You choose a `tone` — `good`, `warning`, `attention`, `accent`,
+  `subtle` — and the theme decides what that looks like, including deciding it is a text
+  mark rather than a colour. A card carrying an ANSI escape is rejected by the linter.
+- **A tone must mean what it says.** If you cannot finish the sentence "this is `attention`
+  because it has failed", it is not `attention`. A wrong tone is worse than no tone, because
+  a reader believes it.
+- **`card` decides presentation, not truth.** Keep `headers` and `body` populated. Other
+  output formats, the search index and the local snapshot all read them.
+
+Your card is validated. `lintCard` in `@mscomms/core` returns the same findings the test
+suite enforces, so you can assert on it in your own tests:
+
+```ts
+import { designErrors, formatFindings } from '@mscomms/core';
+
+const findings = designErrors(myCard);
+assert.equal(findings.length, 0, formatFindings(findings));
+```
+
+### `presentation` — what you know that structure cannot hold
+
+Plain-text guidance on how your content is best visualized, for a renderer that composes the
+pane itself rather than following a card verbatim:
+
+```ts
+presentation: `A pull request is read in a fixed order of questions: can it merge, who must
+act, what changed, and only then what the author said about it. A draft is not waiting on
+anyone, so do not lead with its reviewers.`
+```
+
+You know things about your own content that are true but not structural — that a build
+status outranks a description, that a long diff should be summarised rather than shown, that
+the newest comment is the one being looked for. None of that fits in a card, because a card
+is already a decision.
+
+It stays prose deliberately. The consumer is a language model, and the moment this became an
+enum it would stop being able to say the useful thing. A renderer that does not generate
+layouts ignores it entirely, which is why it is safe to always set it.
+
+You may also ship a `DESIGN.md` beside your provider recording what your content *means* —
+that a stale branch matters more than a description, that a draft is `subtle` rather than
+`warning` because nobody is being asked for anything yet. It does not override the global
+tokens; it records the judgement calls only you can make.
+
 ## The `exec` protocol
 
 One JSON object per line on stdin, one per line on stdout.

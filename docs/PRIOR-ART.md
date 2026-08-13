@@ -612,6 +612,98 @@ What they got wrong:
 Learning taken:
 `packages/provider-exec/src/provider.ts` defines an external JSON-lines plugin tier. Commands are arrays and are never passed through a shell; remote data reaches the plugin as JSON, not shell text. The engine re-filters queries from exec providers instead of trusting them to hide or show mail correctly.
 
+## Family 8: terminal UI toolkits and rendering
+
+This family is different from the seven above. Those are surveys of programs that solve the
+same problem as this one; this is a survey of libraries that would solve part of it for us,
+and the question is whether to adopt one rather than what to learn from it.
+
+The subject is the detail pane. See `docs/RENDERING.md` for the resulting architecture and
+`docs/DESIGN.md` for the rules it enforces.
+
+### Ink (React for terminals)
+
+React reconciler over a terminal backend, flexbox layout via Yoga (WASM), mature and widely
+used. Used by Gatsby, Prisma, Shopify's CLI and Claude Code.
+
+What it gets right:
+
+- Components, props and composition are a genuinely good fit for panes; Flexbox is a real
+  layout engine rather than a hand-rolled approximation; The ecosystem exists, so text
+  inputs, spinners and tables are solved.
+
+Why it was not adopted:
+
+Measured rather than assumed: `npm install ink --dry-run` adds **38 packages**. That is
+worth stating plainly, because arguments like this one usually get made with an invented
+number several orders of magnitude larger, and 38 is not a lot.
+
+The objection is what those packages are. The tree includes `ws`, a WebSocket client, and
+`yoga-layout`, a WASM binary. This process holds a broad-scope OAuth token for corporate
+mail, and zero runtime dependencies is recorded here as a security property rather than an
+aesthetic one. A WebSocket client and a WASM blob inside that process are a different kind
+of cost from 38 lines in a lockfile.
+
+The second argument would hold without the first. React's value is reconciling *stateful,
+interactive* trees — it earns its complexity when a keystroke mutates a component three
+levels down and only that subtree should repaint. The detail pane is a read-only projection
+with no state, no handlers and no partial updates; it is recomputed whenever the document
+changes. That is the full price of React for none of the benefit.
+
+### Ratatui (Rust), Textual (Python), Bubble Tea (Go), OpenTUI
+
+Immediate-mode and retained-mode terminal frameworks, all mature, none reachable from a
+zero-dependency Node process. Textual is the most ambitious: real CSS, a widget tree, a dev
+console.
+
+Learning taken:
+
+Ratatui's **constraint layout** was adopted outright and is the reason `Constraint` exists:
+`len`, `percent`, `fill(weight)`, resolved fixed-first then proportional then remainder.
+Full flexbox is a large amount of machinery for a pane that needs "this column is twelve
+wide, that one takes the rest", and the constraint model is about thirty lines.
+
+Textual's CSS is the thing not taken. A stylesheet is the right answer when a designer needs
+to restyle without touching code; here the styling vocabulary is six semantic tones, and a
+parser plus a cascade to express six tones is machinery that has to be maintained forever to
+save a lookup table.
+
+### Adaptive Cards
+
+Microsoft's JSON schema for portable UI. Not a TUI library at all, which is the point: it is
+a *description* format with renderers for browser, Teams, Outlook and mobile.
+
+Why it was adopted as the vocabulary:
+
+- **It is already in the data this program reads.** Teams bot messages carry
+  `application/vnd.microsoft.card.adaptive`, and Outlook actionable messages *are* Adaptive
+  Cards. A message arriving with a card in it can eventually be rendered as one instead of
+  flattened to text.
+- Published, versioned and MIT, so it does not drift and we do not maintain it.
+- Language models emit it correctly without being taught, which matters for
+  `Document.presentation` and for anything that generates a layout later.
+
+What was not taken: the layout model (flexbox, see above) and the npm package. `adaptivecards`
+3.0.6 is MIT and has zero runtime dependencies, and was evaluated as a dev-only schema oracle,
+but it ships extensionless imports that raw Node ESM cannot resolve — it is bundler-only.
+The schema is vendored as test data instead.
+
+No terminal renderer for Adaptive Cards exists in any language. That part is genuinely new;
+everything around it is borrowed.
+
+### thesys / generative UI
+
+The framing that prompted this work: a model emits a UI description, a renderer draws it,
+and the component set is the contract that keeps the output safe.
+
+Learning taken:
+
+The contract is the valuable half, and it is the half that is easy to skip. `Document.card`
+gives a generated layout a closed vocabulary to emit into, and `packages/core/src/design.ts`
+is the gate — unknown elements, unsafe action URLs, ragged tables and unspeakable cards are
+rejected before anything reaches a terminal. Nothing generates layouts today; the seam and
+its validator exist so that when something does, it cannot emit something harmful.
+
 ## Distilled learnings enforced in this codebase
 
 ### 1. Listing is always paged

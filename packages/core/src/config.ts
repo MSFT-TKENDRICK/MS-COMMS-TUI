@@ -64,6 +64,18 @@ export interface UiConfig {
   readonly dateStyle?: 'relative' | 'absolute' | 'iso';
   readonly prompt?: string;
   readonly showHiddenMeta?: boolean;
+  /**
+   * Which theme the detail pane renders cards with: `default`, `ascii`, `mono` or `compact`.
+   *
+   * A theme is the whole visual vocabulary — tone colours, marks, box-drawing glyphs,
+   * spacing — held as data so that changing how the pane looks does not mean changing what
+   * providers say. `ascii` and `mono` exist for terminals and readers that cannot rely on
+   * Unicode or colour respectively.
+   *
+   * An unknown name falls back to `default` rather than failing at startup. A misspelt
+   * theme should cost a user their preferred colours, not their mail.
+   */
+  readonly cardTheme?: string;
 }
 
 export interface NotificationConfig {

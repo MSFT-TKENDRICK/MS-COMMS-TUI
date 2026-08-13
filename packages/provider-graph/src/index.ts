@@ -24,6 +24,8 @@ export {
 export type { GraphSharedOptions, AuthenticatorIdentity, GraphTransport } from './shared.js';
 export { GraphMailProvider, graphMailPlugin } from './mail.js';
 export type { GraphMailOptions } from './mail.js';
+export { MESSAGE_PRESENTATION, messageCard } from './card.js';
+export type { MessageAttachmentSummary, MessageCardInput } from './card.js';
 export { GraphChatProvider, graphChatPlugin } from './chat.js';
 export type { GraphChatOptions } from './chat.js';
 export { GraphPeopleProvider, graphPeoplePlugin } from './people.js';

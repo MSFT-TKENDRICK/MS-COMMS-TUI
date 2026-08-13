@@ -34,6 +34,7 @@ import {
   type VNode,
 } from '@mscomms/core';
 import type { GraphApi, GraphPage } from './client.js';
+import { MESSAGE_PRESENTATION, messageCard } from './card.js';
 import {
   createClient,
   htmlToText,
@@ -303,6 +304,26 @@ export class GraphMailProvider implements Provider {
       ...(message.conversationId === null || message.conversationId === undefined
         ? {}
         : { threadId: message.conversationId }),
+      card: messageCard({
+        subject: message.subject ?? '(no subject)',
+        from: formatAddress(message.from?.emailAddress),
+        to: (message.toRecipients ?? []).map((r) => formatAddress(r.emailAddress)),
+        cc: (message.ccRecipients ?? []).map((r) => formatAddress(r.emailAddress)),
+        receivedAt: new Date(message.receivedDateTime).toISOString(),
+        isRead: message.isRead,
+        isDraft: message.isDraft,
+        importance: message.importance,
+        ...(message.flag?.flagStatus === undefined ? {} : { flagStatus: message.flag.flagStatus }),
+        attachments: attachments.map((a) => ({
+          name: a.name,
+          size: a.size,
+          contentType: a.contentType,
+          inline: a.isInline,
+        })),
+        body,
+        ...(message.webLink === null || message.webLink === undefined ? {} : { webUrl: message.webLink }),
+      }),
+      presentation: MESSAGE_PRESENTATION,
     };
   }
 

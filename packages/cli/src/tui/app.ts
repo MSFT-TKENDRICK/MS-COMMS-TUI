@@ -24,9 +24,11 @@
 import { emitKeypressEvents } from 'node:readline';
 import type { CommandTable } from '../commands/types.js';
 import { Dispatcher } from '../dispatch.js';
-import { formatDocument } from '../format.js';
+import { documentCard } from '../card/document.js';
+import { renderCardRows } from '../card/render.js';
+import { themeFor } from '../card/theme.js';
 import type { Session } from '../session.js';
-import { bodyRows, render } from './render.js';
+import { bodyRows, previewWidth, render } from './render.js';
 import type { RenderOptions } from './render.js';
 import {
   describeSelection,
@@ -305,9 +307,22 @@ export class Tui {
 
         case 'read': {
           const doc = await this.#session.vfs.read(effect.node);
-          const width = Math.max(20, Math.floor((this.#stdout.columns ?? 80) * 0.5) - 2);
-          const text = formatDocument(doc, { ...this.#session.format, width });
-          this.#state = withPreview(this.#state, effect.node.name, text.split('\n'));
+          // Lay the card out at the width the pane will actually give it, rather than an
+          // independent guess that disagreed by a couple of columns.
+          const width = Math.max(20, previewWidth(this.#stdout.columns ?? 80) || 40);
+          const rows = renderCardRows(documentCard(doc), {
+            width,
+            // Colour travels beside the text, not inside it, so the renderer emits none.
+            // The pane paints each row after fitting it. See TuiState.previewStyles.
+            color: false,
+            theme: themeFor(this.#session.config.ui ?? {}),
+          });
+          this.#state = withPreview(
+            this.#state,
+            effect.node.name,
+            rows.map((row) => row.text),
+            rows.map((row) => row.color),
+          );
           break;
         }
 

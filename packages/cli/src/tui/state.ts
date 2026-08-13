@@ -24,6 +24,7 @@
  */
 
 import type { VNode } from '@mscomms/core';
+import type { ColorName } from '../format.js';
 
 export type Pane = 'list' | 'preview';
 export type Mode = 'browse' | 'filter' | 'command' | 'help';
@@ -40,6 +41,19 @@ export interface TuiState {
   readonly filter: string;
   readonly command: string;
   readonly preview: readonly string[];
+  /**
+   * Per-row colour for {@link preview}, parallel to it and usually sparse.
+   *
+   * The preview holds *plain* text. Colour travels beside it rather than baked into it,
+   * because the pane fits every row to an exact column count before painting, and an ANSI
+   * escape is characters as far as fitting is concerned. A pre-coloured row would be
+   * measured wrong and, worse, `sanitizeForDisplay` strips the ESC while leaving `[36m`
+   * behind — so the escape would be printed as visible text.
+   *
+   * Fit first, paint last. This field is what makes that possible for content the pane did
+   * not compose itself.
+   */
+  readonly previewStyles: readonly (ColorName | undefined)[];
   readonly previewOffset: number;
   readonly previewTitle: string;
   readonly status: string;
@@ -135,6 +149,7 @@ export function initialState(cwd: string, rows = 20): TuiState {
     filter: '',
     command: '',
     preview: [],
+    previewStyles: [],
     previewOffset: 0,
     previewTitle: '',
     status: 'Loading…',
@@ -558,10 +573,22 @@ export function withFreshListing(state: TuiState, path: string, entries: readonl
   return clampSelection(candidate, found >= 0 ? found : state.selected);
 }
 
-export function withPreview(state: TuiState, title: string, lines: readonly string[]): TuiState {
+/**
+ * Show a document in the preview pane.
+ *
+ * `styles` is optional and parallel to `lines`. A caller with plain text omits it; a caller
+ * rendering a card passes the tone colours alongside, never inside, the text.
+ */
+export function withPreview(
+  state: TuiState,
+  title: string,
+  lines: readonly string[],
+  styles: readonly (ColorName | undefined)[] = [],
+): TuiState {
   return {
     ...settled(state),
     preview: lines,
+    previewStyles: styles,
     previewTitle: title,
     previewOffset: 0,
     pane: 'preview',
