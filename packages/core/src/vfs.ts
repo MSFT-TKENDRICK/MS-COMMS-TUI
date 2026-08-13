@@ -22,6 +22,7 @@ import {
   NavigationPredictor,
   PREFETCH_PRIORITY,
   PrefetchQueue,
+  rankWarmCandidates,
   type PredictorOptions,
   type PrefetchStats,
 } from './prefetch.js';
@@ -203,6 +204,19 @@ export interface PrefetchOptions extends PredictorOptions {
   readonly pageSize?: number;
 }
 
+/**
+ * A listing that has been superseded since it was served.
+ *
+ * Delivered to {@link Vfs.onListingChanged} subscribers when a stale answer served from the
+ * local snapshot has been corrected against the source.
+ */
+export interface ListingChanged {
+  readonly path: string;
+  /** The full merged listing, ready to display — not a delta. */
+  readonly entries: readonly VNode[];
+  readonly total?: number;
+}
+
 
 export interface VfsOptions {
   readonly ttlMs?: number;
@@ -225,6 +239,15 @@ export interface VfsOptions {
   readonly logger?: Logger;
 }
 
+/**
+ * Directories per mount root that {@link Vfs.warm} follows into at startup.
+ *
+ * Four rather than "all of them": the point is to cover the handful of places a user
+ * plausibly opens first, not to mirror the source. Warming is spending the user's rate
+ * limit on a guess, and the odds fall off a cliff past the first few entries.
+ */
+const WARM_CHILDREN = 4;
+
 export class Vfs {
   readonly #mounts = new Map<string, Mount>();
   readonly #dirCache: TtlCache<DirectoryIndex>;
@@ -233,6 +256,16 @@ export class Vfs {
   readonly #serveStaleOnError: boolean;
   readonly #now: () => number;
   readonly #logger: Logger;
+  /**
+   * Requests currently in flight, so that arriving mid-prefetch means waiting for the
+   * remainder rather than starting again. See {@link Vfs.#coalesce}.
+   */
+  readonly #inflight = new Map<
+    string,
+    { promise: Promise<ListPage>; controller: AbortController; callers: number }
+  >();
+  /** Subscribers to {@link Vfs.onListingChanged}. */
+  readonly #listingListeners = new Set<(event: ListingChanged) => void>();
 
   #snapshot: SnapshotStore | undefined;
   #prefetchQueue: PrefetchQueue | undefined;
@@ -330,6 +363,157 @@ export class Vfs {
   async flush(): Promise<void> {
     await this.#prefetchQueue?.idle();
     await this.#writes;
+  }
+
+  /**
+   * Give up on every speculative fetch, immediately.
+   *
+   * Prefetching is a bet that the user is about to want something. On the way out they
+   * demonstrably are not, so shutdown calls this before flushing. Without it, `flush()`
+   * waits for the prefetch queue to go *idle* — which means quitting blocks on guesses
+   * nobody will ever collect, each able to sit on a provider request until it times out.
+   * That is the same "quitting hangs" symptom as the MCP shutdown bug, arriving from a
+   * different direction, and it lands on one-shot commands too.
+   */
+  cancelSpeculative(): void {
+    this.#prefetchQueue?.cancel({ includeRunning: true });
+  }
+
+  /**
+   * Be told when a listing already handed out has been superseded.
+   *
+   * Reading is deliberately staged: an answer from the local snapshot arrives in
+   * milliseconds and may be minutes old, and the fresh one arrives when the network says
+   * so. Serving the stale page immediately is the right trade — but only if the correction
+   * eventually reaches the screen. Without this, {@link #refreshInBackground} quietly fixed
+   * the cache while the user carried on reading the old list, and only found out by
+   * pressing refresh, which is precisely the thing they should never have to do.
+   *
+   * Handlers are called with the *merged* entries, so a caller can redraw directly. They
+   * fire only for a genuine correction, never for a listing the caller just requested.
+   *
+   * Returns an unsubscribe function. Handlers are isolated from each other and from the
+   * refresh: one that throws is ignored, because a redraw failing must not abandon the
+   * cache update or the other subscribers.
+   */
+  onListingChanged(handler: (event: ListingChanged) => void): () => void {
+    this.#listingListeners.add(handler);
+    return () => {
+      this.#listingListeners.delete(handler);
+    };
+  }
+
+  #announce(path: string, entries: readonly VNode[], total: number | undefined): void {
+    if (this.#listingListeners.size === 0) return;
+    const event: ListingChanged = { path, entries, ...(total === undefined ? {} : { total }) };
+    for (const handler of [...this.#listingListeners]) {
+      try {
+        handler(event);
+      } catch {
+        // A subscriber's problem is not the cache's problem.
+      }
+    }
+  }
+
+  /**
+   * Get everything expensive out of the way before the user asks for anything.
+   *
+   * Two distinct costs, and they need different treatment:
+   *
+   * **Connecting.** A provider's first request can carry a large fixed setup cost — the
+   * Graph providers spend about seven seconds starting an MCP server, against a quarter of
+   * a second for the request itself. Paid lazily that lands on whichever command the user
+   * typed first, which is why the tool felt like it hung. These run in parallel and are
+   * awaited, because there is nothing to interleave them with and every mount pays its own
+   * cost concurrently.
+   *
+   * **Listing.** Mount roots go through the prefetch queue rather than being fetched here,
+   * so they inherit its bounds, its deduplication and — the important part — its
+   * cancellation. The moment the user navigates somewhere real, speculation about the roots
+   * is dropped rather than competing with them for the same rate limit.
+   *
+   * Never throws. Warming is an optimisation, and a session that refuses to start because
+   * a speculative listing failed would be a worse tool than one that is merely slower.
+   */
+  async warm(options: { signal?: AbortSignal } = {}): Promise<void> {
+    const mounts = [...this.#mounts.values()];
+
+    const connected = Promise.all(
+      mounts.map(async (mount) => {
+        try {
+          await mount.provider.warm?.(options.signal);
+        } catch (error) {
+          this.#logger.debug('Provider could not be warmed.', {
+            mount: mount.id,
+            error: String(error),
+          });
+        }
+      }),
+    );
+
+    // Stop *waiting* on abort rather than merely declining to continue afterwards.
+    //
+    // Connecting is the slow part — about seven seconds for the Graph transport — and a
+    // provider is under no obligation to honour the signal, so awaiting the handshake and
+    // checking the flag afterwards means shutdown still blocks for the full seven seconds.
+    // That is exactly what quitting during startup used to do. Whoever aborted is tearing
+    // the session down and will close the transport underneath this anyway.
+    if (options.signal !== undefined) {
+      const signal = options.signal;
+      let onAbort: (() => void) | undefined;
+      const abandoned = new Promise<'abandoned'>((resolve) => {
+        if (signal.aborted) {
+          resolve('abandoned');
+          return;
+        }
+        onAbort = () => resolve('abandoned');
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      // Neither branch rejects, so the loser is safe to leave unobserved.
+      const outcome = await Promise.race([connected.then(() => 'connected' as const), abandoned]);
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+      if (outcome === 'abandoned') return;
+    } else {
+      await connected;
+    }
+
+    if (options.signal?.aborted === true) return;
+
+    const queue = this.#prefetchQueue;
+    if (queue === undefined) return;
+    const pageSize = this.#prefetchOptions.pageSize ?? 25;
+
+    for (const mount of mounts) {
+      queue.schedule({
+        key: `warm:${mount.path}`,
+        priority: PREFETCH_PRIORITY.warm,
+        path: mount.path,
+        run: async (signal) => {
+          const result = await this.list(mount.path, { signal, limit: pageSize, speculative: true });
+          // One level further, because for most sources the root is a menu rather than a
+          // destination: `/mail` is a list of folders and nobody is reading it, they are on
+          // their way to Inbox. Stopping at the root would warm the one listing the user
+          // spends no time on and leave the one they actually want cold.
+          //
+          // Bounded to a handful, not `entries.length`, because warming is a bet placed
+          // with the user's rate limit and a mailbox with sixty folders would spend all of
+          // it here. Which handful is chosen matters as much as the bound — see
+          // `rankWarmCandidates`, which exists because listing order picked three empty
+          // folders and missed the Inbox.
+          for (const child of rankWarmCandidates(result.entries, WARM_CHILDREN)) {
+            const path = child.path ?? vpath.join(mount.path, child.name);
+            queue.schedule({
+              key: `warm:${path}`,
+              priority: PREFETCH_PRIORITY.warm,
+              path,
+              run: async (childSignal) => {
+                await this.list(path, { signal: childSignal, limit: pageSize, speculative: true });
+              },
+            });
+          }
+        },
+      });
+    }
   }
 
   /** Queue a snapshot write without making the caller wait for it. */
@@ -1456,54 +1640,156 @@ export class Vfs {
       }
     }
 
-    const providerOptions: ListOptions = {
-      ...options,
-      ...(options.cursor !== undefined && offset === undefined ? { cursor: options.cursor } : {}),
-    };
-    if (offset !== undefined) delete (providerOptions as { cursor?: string }).cursor;
+    return this.#coalesce(
+      // Everything that can change the answer belongs in the identity. Two callers only
+      // share a request if they would have made the same one.
+      [
+        path,
+        options.cursor ?? '',
+        offset ?? '',
+        options.limit ?? '',
+        // An absent query and an explicit match-all are the same request, and must key the
+        // same way or the common case never coalesces with itself.
+        options.query === undefined ? '*' : stringifyQuery(options.query),
+      ].join('\u0000'),
+      options.signal,
+      async (signal) => {
+        const providerOptions: ListOptions = {
+          ...options,
+          ...(options.cursor !== undefined && offset === undefined ? { cursor: options.cursor } : {}),
+          ...(signal === undefined ? {} : { signal }),
+        };
+        if (offset !== undefined) delete (providerOptions as { cursor?: string }).cursor;
+        if (signal === undefined) delete (providerOptions as { signal?: AbortSignal }).signal;
 
-    const page = await mount.provider.list(node, providerOptions);
-    const isFirstPage = options.cursor === undefined && offset === undefined;
-    const merged = this.#mergeIntoIndex(path, page, isFirstPage);
+        const page = await mount.provider.list(node, providerOptions);
+        const isFirstPage = options.cursor === undefined && offset === undefined;
+        const merged = this.#mergeIntoIndex(path, page, isFirstPage);
 
-    // Only un-narrowed pages are worth snapshotting: a filtered page is a fact about a
-    // query, not about the folder, and storing it as though it were the folder is how a
-    // cache starts lying.
-    //
-    // `merged`, not `page.entries`: the provider's raw names are backend text, not
-    // filenames, and storing those would give the cache paths the engine can never
-    // resolve — and would silently merge two items whose names only differ after
-    // deduplication.
-    if (isMatchAll(options.query) && page.appliedQuery === undefined) {
-      this.#record(async () => {
-        await (this.#snapshot as SnapshotStore).putListing({
-          mountId: mount.id,
-          path,
+        // Only un-narrowed pages are worth snapshotting: a filtered page is a fact about a
+        // query, not about the folder, and storing it as though it were the folder is how a
+        // cache starts lying.
+        //
+        // `merged`, not `page.entries`: the provider's raw names are backend text, not
+        // filenames, and storing those would give the cache paths the engine can never
+        // resolve — and would silently merge two items whose names only differ after
+        // deduplication.
+        if (isMatchAll(options.query) && page.appliedQuery === undefined) {
+          this.#record(async () => {
+            await (this.#snapshot as SnapshotStore).putListing({
+              mountId: mount.id,
+              path,
+              entries: merged,
+              page: {
+                ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+                ...(page.total === undefined ? {} : { total: page.total }),
+              },
+              isFirstPage,
+              complete: page.cursor === undefined,
+            });
+          });
+        }
+
+        return {
           entries: merged,
-          page: {
-            ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
-            ...(page.total === undefined ? {} : { total: page.total }),
-          },
-          isFirstPage,
-          complete: page.cursor === undefined,
-        });
+          ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+          ...(page.total === undefined ? {} : { total: page.total }),
+          ...(page.appliedQuery === undefined ? {} : { appliedQuery: page.appliedQuery }),
+        };
+      },
+    );
+  }
+
+  /**
+   * Run one request for however many callers ask for it at the same time.
+   *
+   * This is what makes prefetch pay off rather than merely cost. Speculation exists to be
+   * arrived at *mid-flight*: the whole design bets that the user reaches a folder while
+   * the guess about it is still in the air. Without coalescing that is the worst case
+   * instead of the best — the foreground issues a second, identical request, waits the
+   * full latency again, and doubles the load on a rate limit the prefetcher is already
+   * spending. With it, arriving early simply means waiting for the part that is left.
+   *
+   * Aborts are per-caller, not shared. A speculative caller being cancelled — which the
+   * queue does routinely, on every navigation — must not cancel the foreground caller
+   * that joined it, or prefetch would actively break the thing it is meant to accelerate.
+   * So each caller races the shared work against its own signal, and the underlying
+   * request is only abandoned once every caller has gone away.
+   */
+  async #coalesce(key: string, signal: AbortSignal | undefined, run: (signal?: AbortSignal) => Promise<ListPage>) {
+    let entry = this.#inflight.get(key);
+
+    if (entry === undefined) {
+      const controller = new AbortController();
+      const created = {
+        controller,
+        callers: 0,
+        promise: undefined as unknown as Promise<ListPage>,
+      };
+      created.promise = run(controller.signal).finally(() => {
+        if (this.#inflight.get(key) === created) this.#inflight.delete(key);
       });
+      // The shared work must always be observed, whatever its callers do. A caller whose
+      // signal is already aborted by the time it gets here — abort arriving during the
+      // walk to the provider, `invalidate()` cancelling running prefetches, a search
+      // deadline firing — returns below without ever attaching a handler, and then the
+      // abort a turn later rejects a promise nobody is listening to. Node treats that as
+      // fatal. This handler is the one that makes the promise observed no matter what;
+      // real callers still see the rejection through their own `.then` below.
+      created.promise.catch(() => undefined);
+      this.#inflight.set(key, created);
+      entry = created;
     }
 
-    return {
-      entries: merged,
-      ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
-      ...(page.total === undefined ? {} : { total: page.total }),
-      ...(page.appliedQuery === undefined ? {} : { appliedQuery: page.appliedQuery }),
-    };
+    const joined = entry;
+    joined.callers += 1;
+
+    // A caller with no signal can never leave, so there is nothing to race and nothing to
+    // clean up; awaiting directly also avoids leaving an unhandled rejection behind.
+    if (signal === undefined) return joined.promise;
+
+    try {
+      return await new Promise<ListPage>((resolve, reject) => {
+        const onAbort = () => {
+          reject(signal.reason instanceof Error ? signal.reason : new Error('Aborted.'));
+        };
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+        joined.promise.then(resolve, reject).finally(() => {
+          signal.removeEventListener('abort', onAbort);
+        });
+      });
+    } finally {
+      joined.callers -= 1;
+      // Last one out turns off the lights — but not instantly. A caller that is *about* to
+      // join is partway through its own awaits and has not been counted yet, so cancelling
+      // the moment the count hits zero would routinely kill a request someone still wants.
+      // Re-checking a turn later costs nothing and makes the common case — a speculative
+      // fetch being cancelled at the instant the user navigates into it — safe.
+      if (joined.callers <= 0) {
+        setImmediate(() => {
+          if (joined.callers <= 0) joined.controller.abort();
+        });
+      }
+    }
   }
 
   /**
    * Correct a stale snapshot listing after it has already been served.
    *
-   * Deliberately fire-and-forget and deliberately silent on failure: the user already has
-   * their answer, so the only thing an error here could do is interrupt them with news
-   * about work they never asked for.
+   * The last stage of a staged read: the snapshot answered in a millisecond with something
+   * that may be minutes old, and this is the part that goes and checks. Deliberately
+   * fire-and-forget and deliberately silent on failure — the user already has their answer,
+   * so the only thing an error here could do is interrupt them with news about work they
+   * never asked for.
+   *
+   * Success is *not* silent. It announces the corrected listing so a live view can catch up
+   * on its own; a correction that only reaches the cache leaves the user reading a stale
+   * screen with no way to know it, and pressing refresh — which is the one thing all of
+   * this exists to make unnecessary.
    */
   #refreshInBackground(mount: Mount, node: VNode | null, path: string, limit: number): void {
     const queue = this.#prefetchQueue;
@@ -1512,9 +1798,19 @@ export class Vfs {
       key: `refresh:${path}`,
       priority: PREFETCH_PRIORITY.nextPage,
       path,
-      run: async () => {
-        const page = await mount.provider.list(node, { limit });
+      run: async (signal) => {
+        const before = listingFingerprint(this.#currentEntries(path));
+        // The signal is what makes this task cancellable, and cancellable is what
+        // `cancelSpeculative()` needs it to be: `idle()` only settles once the task promise
+        // settles, so a refresh that ignores its abort keeps `flush()` — and therefore the
+        // whole of `dispose()` — waiting out a provider round-trip nobody is going to read.
+        const page = await mount.provider.list(node, { limit, signal });
+        if (signal.aborted) return;
         const merged = this.#mergeIntoIndex(path, page, true);
+        // Most refreshes find exactly what was already there. Announcing those would make
+        // the subscription almost pure noise — and every announcement costs a repaint,
+        // which the user sees as a flicker in a list they were reading.
+        if (listingFingerprint(merged) !== before) this.#announce(path, merged, page.total);
         this.#record(async () => {
           await (this.#snapshot as SnapshotStore).putListing({
             mountId: mount.id,
@@ -1530,6 +1826,18 @@ export class Vfs {
         });
       },
     });
+  }
+
+  /** The directory as it currently stands in the live index, in display order. */
+  #currentEntries(path: string): readonly VNode[] {
+    const index = this.#dirCache.get(path);
+    if (index === undefined) return [];
+    const entries: VNode[] = [];
+    for (const name of index.order) {
+      const node = index.byName.get(name);
+      if (node !== undefined) entries.push(node);
+    }
+    return entries;
   }
 
   /**
@@ -1754,6 +2062,32 @@ const OFFSET_PREFIX = 'vfs-offset:';
 
 function encodeOffsetCursor(offset: number): string {
   return `${OFFSET_PREFIX}${offset}`;
+}
+
+/**
+ * A listing reduced to what a reader would actually notice about it.
+ *
+ * Used to decide whether a background refresh found anything worth telling anyone about.
+ * Object identity is useless here — every refresh builds new objects — and deep equality
+ * over whole nodes would fire on fields nobody displays, so this covers exactly the things
+ * a list view renders. `flags` is in deliberately: a message going from unread to read is
+ * a change the user very much wants to see land.
+ */
+function listingFingerprint(entries: readonly VNode[]): string {
+  return entries
+    .map((entry) =>
+      [
+        entry.id,
+        entry.name,
+        entry.kind,
+        entry.title ?? '',
+        entry.author ?? '',
+        entry.summary ?? '',
+        entry.mtime === undefined ? '' : entry.mtime.getTime(),
+        (entry.flags ?? []).join(','),
+      ].join('\u0000'),
+    )
+    .join('\u0001');
 }
 
 function decodeOffsetCursor(cursor: string | undefined): number | undefined {

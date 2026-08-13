@@ -103,6 +103,10 @@ export class Session {
   /** Mounts that failed to start. Surfaced by `mounts` and `doctor` instead of at startup. */
   brokenMounts: readonly BuiltMount[] = [];
 
+  /** Background startup warm-up; awaited only by {@link dispose}. */
+  #warming: Promise<void> | undefined;
+  readonly #warmAbort = new AbortController();
+
   cwd = vpath.ROOT;
   lastListing: LastListing | undefined;
   /** Paths visited, most recent last. Powers `back` and history-aware completion. */
@@ -135,6 +139,17 @@ export class Session {
       ...(options.config.ttlMs === undefined ? {} : { ttlMs: options.config.ttlMs }),
       pageSize: this.pageSize,
       logger: options.logger,
+      // Prefetching is deliberately *not* conditional on the snapshot being enabled. It
+      // used to be, which meant a default install — no config file, no cache section —
+      // preloaded nothing whatsoever: every mount root and every folder was a cold round
+      // trip taken while the user waited. Speculative results land in the in-memory cache
+      // perfectly well; the snapshot only decides whether they outlive the process.
+      prefetch: {
+        enabled: options.config.cache.prefetch ?? true,
+        ...(options.config.cache.prefetchConcurrency === undefined
+          ? {}
+          : { concurrency: options.config.cache.prefetchConcurrency }),
+      },
     });
 
     this.notifier = new Notifier({
@@ -212,10 +227,30 @@ export class Session {
         });
       }
     }
+
+    // Deliberately not awaited. Warming spawns MCP servers and speculatively lists mount
+    // roots, which takes seconds — awaiting it here would move the delay from the user's
+    // first command to the banner, which is not an improvement. Started last so it competes
+    // with nothing that the session actually needs in order to be usable.
+    this.#warming = this.vfs.warm({ signal: this.#warmAbort.signal }).catch((error: unknown) => {
+      this.logger.debug('warm-up did not finish', { message: String(error) });
+    });
   }
 
   async dispose(): Promise<void> {
     this.watcher.stop();
+    // Warm-up first, and awaited: it spawns MCP servers and writes listings through the
+    // snapshot, so tearing down underneath it would close a database it is still using.
+    // The abort is what makes this quick — without it, quitting during startup would block
+    // on a seven-second handshake nobody is waiting for any more.
+    this.#warmAbort.abort();
+    await this.#warming?.catch(() => undefined);
+    // Speculative work goes next, and it has to go *before* the flush. `flush()` waits for
+    // the prefetch queue to drain, so leaving guesses running means quitting waits for
+    // answers nobody will ever look at — including on one-shot commands, which start a
+    // warm-up too. Aborting `#warmAbort` alone does not reach them: it covers connecting,
+    // while the listings it schedules run on the queue's own signals.
+    this.vfs.cancelSpeculative();
     // Order matters, and `stop()` must be awaited: it aborts the cycle *and waits for it
     // to unwind*. Dropping that promise would close the database under a sync still
     // writing to it, which is the same bug as not flushing, arriving from the other side.
@@ -460,6 +495,41 @@ export class Session {
       this.#errorSink = previousErrorSink;
     }
     return chunks.join('');
+  }
+
+  /**
+   * Run `fn`, calling `before` once, immediately ahead of the first byte it prints.
+   *
+   * Exists for the shell's progress indicator, which occupies a line that has to be erased
+   * before anything else is written to it. Doing that in a `finally` would be too late — the
+   * command's output has already moved the cursor by then, and the spinner is stranded in
+   * the scrollback. The only moment that works is the one just before the first write, and
+   * only the sink knows when that is.
+   *
+   * `before` is called at most once, and sinks are restored in a `finally` so a throwing
+   * command cannot leave the session writing through a filter that outlives it.
+   */
+  async beforeFirstWrite(before: () => void, fn: () => Promise<void>): Promise<void> {
+    const previousSink = this.#sink;
+    const previousErrorSink = this.#errorSink;
+    let fired = false;
+    const wrap =
+      (inner: (text: string) => void) =>
+      (text: string): void => {
+        if (!fired) {
+          fired = true;
+          before();
+        }
+        inner(text);
+      };
+    this.#sink = wrap(previousSink);
+    this.#errorSink = wrap(previousErrorSink);
+    try {
+      await fn();
+    } finally {
+      this.#sink = previousSink;
+      this.#errorSink = previousErrorSink;
+    }
   }
 }
 

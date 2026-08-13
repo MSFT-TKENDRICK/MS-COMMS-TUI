@@ -677,3 +677,172 @@ describe('BackgroundSync: the audit trail', () => {
   });
 });
 
+
+
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/**
+ * Stopping, when the thing being stopped will not stop.
+ *
+ * `stop()` has to wait for the cycle to unwind — closing the database under a sync still
+ * writing to it is a genuine corruption risk, and that is why it is awaited at all. But
+ * "wait for it to unwind" only terminates if the work can actually be left, and a provider
+ * is third-party code for which honouring an AbortSignal is a courtesy rather than a
+ * guarantee. When it is not honoured, the await never returns. Measured against a real
+ * mailbox, quitting took twenty-six seconds this way; this is the third time shutdown has
+ * hung and the first time the general case has a guard.
+ *
+ * The provider below is the distilled version: it ignores its signal completely, and can be
+ * released by the test so the disowned worker's behaviour *after* being abandoned is
+ * observable rather than merely asserted about.
+ */
+describe('BackgroundSync: stopping', () => {
+  /** A provider whose `list` hangs until the test lets it go. */
+  function heldProvider(): { provider: Provider; release: () => void; started: Promise<void> } {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+
+    const provider: Provider = {
+      id: 'held',
+      displayName: 'Held',
+      capabilities: new Set<Capability>(['list']),
+      async list() {
+        markStarted();
+        // No signal handling on purpose. That is the whole point.
+        await held;
+        return { entries: [file('a', '/mail')] } satisfies ListPage;
+      },
+    } as Provider;
+
+    return { provider, release, started };
+  }
+
+  it('returns promptly even when the provider ignores the abort', async () => {
+    const snapshot = await store();
+    const { provider, release, started } = heldProvider();
+    const sync = new BackgroundSync({ host: hostFor([{ id: 'mail', path: '/mail', provider }]), snapshot });
+
+    sync.start();
+    await started;
+
+    const at = Date.now();
+    await sync.stop();
+    const elapsed = Date.now() - at;
+    // The grace period is 250ms; the failure this guards against was 26_000ms.
+    assert.ok(elapsed < 2000, `stop() took ${String(elapsed)}ms`);
+
+    release();
+    await snapshot.close();
+  });
+
+  it('does not let work it walked away from carry on writing', async () => {
+    // The direct statement of what "disowned" has to mean. The snapshot is deliberately
+    // left *open* here — with it closed, a stray write merely fails and is indistinguishable
+    // from one that was correctly declined. Open, the difference is plain: an unguarded
+    // worker succeeds in writing a listing that shutdown already decided not to wait for.
+    const snapshot = await store();
+    const { provider, release, started } = heldProvider();
+    const sync = new BackgroundSync({ host: hostFor([{ id: 'mail', path: '/mail', provider }]), snapshot });
+
+    sync.start();
+    await started;
+    await sync.stop();
+
+    release();
+    // Long enough for the abandoned worker to run to completion if nothing stops it.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(await snapshot.listing('/mail'), undefined, 'a disowned worker must not write');
+    await snapshot.close();
+  });
+
+  it('reports no errors, because being told to stop is not a failure', async () => {
+    // What the user sees. `cache status` and `doctor` both surface these, and a clean quit
+    // that leaves "database is not open" behind reads like corruption rather than teardown.
+    const snapshot = await store();
+    const { provider, release, started } = heldProvider();
+    const sync = new BackgroundSync({ host: hostFor([{ id: 'mail', path: '/mail', provider }]), snapshot });
+
+    sync.start();
+    await started;
+    await sync.stop();
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.deepEqual(sync.status.errors, []);
+    await snapshot.close();
+  });
+
+  it('stays stopped, so a timer that already fired cannot restart it', async () => {
+    // `start()` schedules on an interval and `runOnce` joins whatever is running. A cycle
+    // that begins after stop() would reopen exactly the window shutdown just closed.
+    const snapshot = await store();
+    const { provider } = fakeProvider({ tree: { '/mail': [file('a', '/mail')] } });
+    const sync = new BackgroundSync({ host: hostFor([{ id: 'mail', path: '/mail', provider }]), snapshot });
+
+    await sync.stop();
+    await sync.runOnce();
+
+    assert.equal(await snapshot.listing('/mail'), undefined, 'a stopped sync must not write');
+    await snapshot.close();
+  });
+
+  it('does not write a poll cursor for work it walked away from', async () => {
+    // The `list` provider above cannot reach this: `poll` is a separate branch, and it is
+    // the *longer* of the two against a real account — it is the path the twenty-six second
+    // hang actually took. A guard before `putListing` says nothing about a `setPollCursor`
+    // written on the way back from a poll that ignored its abort. Snapshot left open, for
+    // the same reason as the test above.
+    const snapshot = await store();
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const provider: Provider = {
+      id: 'held-poll',
+      displayName: 'Held poll',
+      capabilities: new Set<Capability>(['list', 'poll']),
+      async list() {
+        return { entries: [file('a', '/mail')] } satisfies ListPage;
+      },
+      async poll() {
+        markStarted();
+        // Ignores the signal on purpose, exactly as a third-party provider may.
+        await held;
+        return { cursor: 'moved-on', changes: [] };
+      },
+    } as unknown as Provider;
+
+    // A cursor has to already exist, or the poll branch is skipped entirely.
+    await snapshot.setPollCursor('mail', '/mail', 'start-here');
+
+    const sync = new BackgroundSync({ host: hostFor([{ id: 'mail', path: '/mail', provider }]), snapshot });
+    sync.start();
+    await started;
+    await sync.stop();
+
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(
+      await snapshot.pollCursor('mail', '/mail'),
+      'start-here',
+      'a disowned worker advanced the cursor after shutdown',
+    );
+    assert.deepEqual(sync.status.errors, []);
+    await snapshot.close();
+  });
+});

@@ -13,7 +13,7 @@ import { describe, it } from 'node:test';
 import { SnapshotStore } from '../snapshot.js';
 import { BackgroundSync } from '../sync.js';
 import { openSqlDriver } from '../sql.js';
-import { Vfs, type Mount, type VfsOptions } from '../vfs.js';
+import { Vfs, type ListingChanged, type Mount, type VfsOptions } from '../vfs.js';
 import { parseQuery, evaluateQuery } from '../query.js';
 import type { Capability, Document, ListPage, Provider, VNode } from '../provider.js';
 
@@ -87,11 +87,37 @@ function buildProvider(items: readonly Item[], options: { searchable?: boolean; 
   return { provider, counts, nodes };
 }
 
-async function newSnapshot(options: { recent?: number } = {}): Promise<SnapshotStore> {
+async function newSnapshot(options: { recent?: number; ttlMs?: number; now?: () => number } = {}): Promise<SnapshotStore> {
   const driver = await openSqlDriver({ path: ':memory:' });
   return SnapshotStore.open({
     driver,
     ...(options.recent === undefined ? {} : { maxNodesPerDirectory: options.recent }),
+    ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  });
+}
+
+/**
+ * A snapshot whose stored listings are unambiguously old.
+ *
+ * Staleness is `age <= ttl`, so `ttlMs: 0` alone is a coin flip: a listing written and read
+ * inside the same millisecond has an age of exactly zero and counts as *fresh*, and the
+ * background refresh these tests are about never happens. That is a real 40%-failure flake,
+ * found by running the file in a loop rather than by reading it.
+ *
+ * Sleeping would fix it, and make the suite slower while still being probabilistic. Owning
+ * the clock fixes it outright. Every reading of the time is a minute after the last, which
+ * makes no assumption about *which* call is the write — only that a read comes after one.
+ */
+async function staleSnapshot(): Promise<SnapshotStore> {
+  const base = Date.now();
+  let tick = 0;
+  return newSnapshot({
+    ttlMs: 0,
+    now: () => {
+      tick += 1;
+      return base + tick * 60_000;
+    },
   });
 }
 
@@ -601,3 +627,180 @@ describe('prefetching is bounded', () => {
 
 
 
+
+// ---------------------------------------------------------------------------
+
+describe('Vfs with a snapshot: the correction that follows the stale answer', () => {
+  /** A vfs that will refresh behind the user: stale snapshot, prefetch queue available. */
+  function staleReader(provider: Provider, snapshot: SnapshotStore): Vfs {
+    return makeVfs(provider, { snapshot, prefetch: { enabled: true, concurrency: 1 } });
+  }
+
+  it('tells a subscriber when the listing it served turned out to be out of date', async () => {
+    const snapshot = await staleSnapshot();
+    const before = buildProvider([{ name: 'a' }, { name: 'b' }]);
+    const warm = makeVfs(before.provider, { snapshot, prefetch: { enabled: false } });
+    await warm.list('/mail');
+    await warm.flush();
+
+    // A later session. Two messages have arrived since; the snapshot does not know yet.
+    const after = buildProvider([{ name: 'a' }, { name: 'b' }, { name: 'c' }, { name: 'd' }]);
+    const vfs = staleReader(after.provider, snapshot);
+    const seen: ListingChanged[] = [];
+    vfs.onListingChanged((event) => seen.push(event));
+
+    const served = await vfs.list('/mail');
+    assert.deepEqual(
+      served.entries.map((entry) => entry.name),
+      ['a', 'b'],
+      'the stale page is still what gets served first — that is the whole point',
+    );
+
+    await vfs.flush();
+
+    // ...and this is the part that was missing: the correction has to reach the screen.
+    // Fixing the cache silently leaves the user reading a stale list with no way to know.
+    const corrections = seen.filter((event) => event.path === '/mail');
+    assert.equal(corrections.length, 1, 'the refresh finished without telling anyone');
+    assert.deepEqual(
+      corrections[0]?.entries.map((entry) => entry.name),
+      ['a', 'b', 'c', 'd'],
+      'a correction has to carry the whole listing, ready to display',
+    );
+    await snapshot.close();
+  });
+
+  it('says nothing when the listing came back the same', async () => {
+    const snapshot = await staleSnapshot();
+    const before = buildProvider([{ name: 'a' }, { name: 'b' }]);
+    const warm = makeVfs(before.provider, { snapshot, prefetch: { enabled: false } });
+    await warm.list('/mail');
+    await warm.flush();
+
+    const after = buildProvider([{ name: 'a' }, { name: 'b' }]);
+    const vfs = staleReader(after.provider, snapshot);
+    const seen: ListingChanged[] = [];
+    vfs.onListingChanged((event) => seen.push(event));
+
+    await vfs.list('/mail');
+    await vfs.flush();
+
+    // A repaint the user cannot distinguish from no repaint is still a flicker, and it
+    // still steals the selection. Announcing every refresh would announce almost nothing
+    // but noise, because most refreshes find exactly what was already there.
+    assert.deepEqual(
+      seen.filter((event) => event.path === '/mail'),
+      [],
+      'announced a change that was not a change',
+    );
+    await snapshot.close();
+  });
+
+  it('lets go of a refresh nobody is waiting for', { timeout: 20_000 }, async () => {
+    // `cancelSpeculative()` is what `dispose()` calls to stop waiting on guesses, and it
+    // works by aborting the signal the prefetch queue hands each task. A task that does not
+    // take that signal cannot be cancelled by it — and because `idle()` only settles once
+    // the task's promise settles, an uncancellable background refresh keeps `flush()`, and
+    // therefore the whole of shutdown, waiting out a full provider round-trip.
+    const snapshot = await staleSnapshot();
+    const before = buildProvider([{ name: 'a' }, { name: 'b' }]);
+    const warm = makeVfs(before.provider, { snapshot, prefetch: { enabled: false } });
+    await warm.list('/mail');
+    await warm.flush();
+
+    let sawSignal: AbortSignal | undefined;
+    const slow = buildProvider([{ name: 'a' }, { name: 'b' }, { name: 'c' }]);
+    const stalling: Provider = {
+      ...slow.provider,
+      async list(parent, options) {
+        sawSignal = options?.signal;
+        // Slow, but signal-honouring — as a real provider is. That combination is what
+        // makes this test about the engine rather than about the fake: the wait only ends
+        // early if the engine actually handed the abort down.
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, 3_000);
+          options?.signal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              reject(new Error('aborted'));
+            },
+            { once: true },
+          );
+        });
+        return slow.provider.list(parent, options ?? {});
+      },
+    } as Provider;
+
+    const vfs = staleReader(stalling, snapshot);
+    await vfs.list('/mail');
+
+    // Give the queue a moment to actually start the refresh, or this would pass by
+    // cancelling something that had not begun.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(sawSignal !== undefined, 'the background refresh never started');
+
+    const at = Date.now();
+    vfs.cancelSpeculative();
+    await vfs.flush();
+    const elapsed = Date.now() - at;
+
+    assert.equal(sawSignal.aborted, true, 'the refresh was never given a signal it could obey');
+    assert.ok(elapsed < 2_000, `flush() waited ${String(elapsed)}ms for a refresh nobody wanted`);
+    await snapshot.close();
+  });
+
+  it('finishes the refresh even when a subscriber throws', async () => {
+    const snapshot = await staleSnapshot();
+    const before = buildProvider([{ name: 'a' }]);
+    const warm = makeVfs(before.provider, { snapshot, prefetch: { enabled: false } });
+    await warm.list('/mail');
+    await warm.flush();
+
+    const after = buildProvider([{ name: 'a' }, { name: 'b' }]);
+    const vfs = staleReader(after.provider, snapshot);
+    const survivors: string[] = [];
+    vfs.onListingChanged(() => {
+      throw new Error('a redraw blew up');
+    });
+    vfs.onListingChanged((event) => survivors.push(event.path));
+
+    await vfs.list('/mail');
+    await vfs.flush();
+
+    // A subscriber is a view. Views crash. Letting one take down the cache update — or the
+    // other subscribers, which is the same bug wearing a different hat — would make
+    // subscribing more dangerous than staying stale.
+    assert.deepEqual(survivors, ['/mail'], 'one bad subscriber silenced the rest');
+
+    const stored = await snapshot.listing('/mail');
+    assert.deepEqual(
+      stored?.entries.map((entry) => entry.name),
+      ['a', 'b'],
+      'the cache update was abandoned because a redraw failed',
+    );
+    await snapshot.close();
+  });
+
+  it('stops talking to a subscriber that has unsubscribed', async () => {
+    const snapshot = await staleSnapshot();
+    const before = buildProvider([{ name: 'a' }]);
+    const warm = makeVfs(before.provider, { snapshot, prefetch: { enabled: false } });
+    await warm.list('/mail');
+    await warm.flush();
+
+    const after = buildProvider([{ name: 'a' }, { name: 'b' }]);
+    const vfs = staleReader(after.provider, snapshot);
+    const seen: string[] = [];
+    const unsubscribe = vfs.onListingChanged((event) => seen.push(event.path));
+    unsubscribe();
+
+    await vfs.list('/mail');
+    await vfs.flush();
+
+    // The TUI subscribes on start and unsubscribes on exit. If unsubscribe did not take,
+    // the handler would write to a terminal that has been handed back to the shell.
+    assert.deepEqual(seen, [], 'kept calling a handler that had let go');
+    await snapshot.close();
+  });
+});

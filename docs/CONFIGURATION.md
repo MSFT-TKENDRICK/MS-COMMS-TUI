@@ -480,9 +480,15 @@ there. Everything below has a working default.
 | `depth` | number | 2 | How far below each mount root to sync. |
 | `bodies` | number | 0 | Message bodies to pre-download per folder per cycle. 0 disables. |
 | `vectors` | boolean | `true` | Build embeddings so `find` can match on meaning. |
-| `prefetch` | boolean | `true` | Fetch what you are about to open, before you open it. |
+| `prefetch` | boolean | `true` | Fetch what you are about to open, before you open it. Applies whether or not `enabled` is set. |
 | `prefetchConcurrency` | number | 2 | Speculative fetches in flight at once. |
 | `audit` | boolean | `false` | Record every provider fetch in an AgentFS `tool_calls` log. |
+
+`prefetch` is the one key here that is *not* conditional on `enabled`. It used to be, which
+meant a default install — no config file, no `cache` section — preloaded nothing at all, and
+every folder was a cold round trip taken while you waited. Speculative results live happily
+in memory; the snapshot only decides whether they outlive the process. See
+[Loading, and not noticing it](#loading-and-not-noticing-it).
 
 ### What it buys you
 
@@ -587,6 +593,75 @@ The log deliberately holds paths and result *shapes* — a body's length, an ent
 and never message content. An audit trail that quietly became a second copy of your mail
 would be worse than the problem it solves. For the same reason it is off by default, it is
 never copied into an exported file, and a failure to write it can never interrupt syncing.
+
+## Loading, and not noticing it
+
+Almost everything below is automatic and has no configuration. It is documented because
+knowing what the tool is doing on your behalf makes its behaviour predictable.
+
+**Nothing blocks the prompt.** The shell and the TUI both come up in under a second and
+answer local commands (`pwd`, `help`, `config`) immediately, whatever the network is doing.
+
+**The slow part happens before you ask for it.** The single most expensive thing in a
+session is the first contact with a Microsoft Graph source — starting the MCP server and
+completing its handshake, measured here at seven to eleven seconds, against a quarter of a
+second for the actual fetch that follows. That cost is paid *once*, by whichever source is
+touched first, so at launch the tool touches them itself: it warms every mount root and the
+most promising folders below them while you are still reading the banner. Typing `ls /mail`
+immediately after launch used to take eleven seconds. It now takes about fifteen
+milliseconds.
+
+**"Most promising" is measured, not assumed.** Warm-up ranks candidate folders by unread
+count, then recency, then child count, and falls back to the order the provider listed
+them. This matters more than it sounds: mail lists folders alphabetically, so the Inbox is
+typically sixth, behind several folders that are completely empty. Warming the first four
+in listing order warmed nothing anybody wanted.
+
+**Guessing where you are going next.** Moving into a folder starts speculative fetches of
+the places people usually go from there. If you then ask for one of them, you join the
+request already in flight rather than starting a second one — without that, arriving while
+the guess was still in the air was the *worst* case rather than the best, costing a
+duplicate round trip. Speculative work is cancelled when you navigate away, but never when
+a real request has joined it.
+
+**When something genuinely is slow, it says so.** Any command still working after a short
+grace period shows a progress indicator, so a slow network looks like a slow network rather
+than a hung program. Fast commands show nothing at all and leave no residue in scrollback.
+
+**Quitting is immediate**, including mid-startup, when a background warm-up is still in
+flight. Anything outstanding is abandoned rather than waited for. Speculation is a bet that
+you are about to want something; on the way out you demonstrably are not, so guesses are
+cancelled rather than waited on. Without that, quitting could block on a speculative fetch
+nobody would ever collect, for as long as the provider's timeout allowed.
+
+### Three stages, in the order they can arrive
+
+A listing is answered as soon as anything can answer it, and corrected as better answers
+turn up. There are three stages and you may see any or all of them:
+
+1. **The local snapshot**, in about a millisecond. Whatever the last session stored. It may
+   be minutes old, and it is served anyway — blocking on the network to correct a listing
+   that is *probably* still right trades a certain delay for a possible change.
+2. **The pre-warmed copy**, if warm-up or a speculative fetch already fetched this folder.
+   Also instant, and current as of launch.
+3. **The live answer.** When the snapshot's copy is past its TTL, the folder is re-fetched
+   behind you. If it comes back different, the view updates in place.
+
+That third stage is the one worth knowing about, because it is the only one that changes
+something already on screen. In the full-screen pane, a folder you are looking at will
+quietly gain the mail that arrived while you were reading — no flicker, and **your selection
+stays on the row it was on**, tracked by item rather than by position, so a message arriving
+above the cursor does not move the cursor. If the refresh finds nothing changed — which is
+most of the time — nothing repaints at all.
+
+Corrections are only applied where they cannot interrupt you. A listing that changed while
+you are filtering, reading a message, or looking at a different folder updates the cache and
+waits; you get it when you come back. The line shell prints its answer once and returns to a
+prompt, so a correction there lands in the cache for the next `ls` rather than rewriting
+output you have already read.
+
+`cache.ttl` decides when stage three happens; setting it higher means more instant answers
+and staler ones. `refresh` and `r` skip straight to the live answer.
 
 ## `queries`
 

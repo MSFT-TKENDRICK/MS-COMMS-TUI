@@ -34,6 +34,7 @@ import {
   type GraphPage,
   type GraphRequestOptions,
 } from './client.js';
+import { raceAbort } from './abort.js';
 
 /** Where the MCP server comes from, and how patient to be with it. */
 export interface McpTransportOptions {
@@ -114,13 +115,67 @@ export class McpStdioClient {
   }
 
   async call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> {
-    await this.#start();
+    await this.#startOrGiveUp(signal);
     const result = await this.#request('tools/call', { name, arguments: args }, this.#requestTimeoutMs, signal);
     return result as McpToolResult;
   }
 
+  /**
+   * Wait for the server to come up, but no longer than the caller is willing to wait.
+   *
+   * `call()` used to `await this.#start()` with no signal at all, which made every request
+   * uncancellable for the whole handshake — measured here at up to twenty-four seconds on a
+   * cold `npx`. The signal was honoured only for the request *after* the server was ready,
+   * so the one period where cancellation actually mattered was the one period it did not
+   * work. Shutdown paid for that directly: background sync aborts its cycle and waits for
+   * the workers to unwind, and a worker parked inside the handshake does not unwind.
+   *
+   * {@link raceAbort} is what stops waiting, and deliberately does not cancel: the handshake
+   * is shared by every caller and cached in `#ready`, so tearing it down because one caller
+   * lost interest would break the others and throw away work that is nearly always about to
+   * be useful. `close()` is what actually shuts the server down.
+   */
+  async #startOrGiveUp(signal?: AbortSignal): Promise<void> {
+    await raceAbort(this.#start(), signal);
+  }
+
+  /**
+   * Start the server without asking it for anything.
+   *
+   * Worth a method of its own because the handshake is not a rounding error: spawning the
+   * server costs about seven seconds on a cold `npx`, against roughly a quarter of a second
+   * for the request that follows. Paid lazily, that is seven seconds of a frozen screen on
+   * whichever command the user happened to type first. Paid here — during startup, while
+   * they are still reading the banner — it is invisible.
+   *
+   * Failure is deliberately swallowed. This is speculative work nobody asked for, and the
+   * next real request will attempt the handshake again and report properly if it still
+   * fails. Warming must never be the reason a session refuses to start.
+   */
+  async warm(): Promise<boolean> {
+    try {
+      await this.#start();
+      return true;
+    } catch (error) {
+      this.#logger.debug(`Graph MCP transport could not be warmed: ${String(error)}`);
+      return false;
+    }
+  }
+
+  /** Whether the server is up, so callers can tell a warm path from a cold one. */
+  get started(): boolean {
+    return this.#ready !== undefined;
+  }
+
   #start(): Promise<void> {
-    this.#ready ??= this.#handshake();
+    if (this.#ready === undefined) {
+      this.#ready = this.#handshake();
+      // Every caller may give up before the handshake lands, which leaves this shared
+      // promise with no observer. Under Node's default `--unhandled-rejections=throw` a
+      // failing handshake would then take the whole process down, so it keeps one
+      // permanent no-op handler of its own. Callers still see the rejection.
+      this.#ready.catch(() => undefined);
+    }
     return this.#ready;
   }
 
@@ -246,7 +301,7 @@ export class McpStdioClient {
       const onAbort = (): void => {
         this.#pending.delete(id);
         settle(() => {
-          reject(new VfsError('ETIMEDOUT', 'The request was cancelled.'));
+          reject(new VfsError('ECANCELED', 'The request was cancelled.'));
         });
       };
 
@@ -269,7 +324,7 @@ export class McpStdioClient {
 
       if (signal?.aborted === true) {
         settle(() => {
-          reject(new VfsError('ETIMEDOUT', 'The request was cancelled.'));
+          reject(new VfsError('ECANCELED', 'The request was cancelled.'));
         });
         return;
       }
@@ -313,6 +368,15 @@ export class McpStdioClient {
    * server notices its own stdin reaching end-of-file and exits. The kill is only a
    * backstop for a server that ignores that, and its timer is unreferenced so waiting for
    * it cannot itself delay exit.
+   *
+   * The pipes are then unreferenced *again*, which is the part that makes quitting during
+   * startup instant. Ending a stream queues a shutdown request, and that request — along
+   * with the pipes it belongs to — is referenced, so the process waits for the far end to
+   * acknowledge. A server still being resolved by `npx` will not acknowledge anything for
+   * several seconds, which is precisely the moment a user is most likely to give up and
+   * quit. Measured: seven and a half seconds to exit, against twenty milliseconds once the
+   * server is up. Unreferencing lets the EOF still be delivered without anyone waiting on
+   * it.
    */
   close(): void {
     this.#closed = true;
@@ -326,10 +390,19 @@ export class McpStdioClient {
     if (child === undefined) return;
 
     try {
-      child.stdin?.end();
+      // `destroy`, not `end`. Both give the server the EOF it is watching for — closing the
+      // pipe *is* end-of-file — but `end` queues a graceful shutdown request that stays
+      // referenced until the far end acknowledges it, and a server still being resolved by
+      // `npx` acknowledges nothing for several seconds. Unreferencing the streams does not
+      // help, because the pending shutdown is a request rather than a handle.
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
     } catch {
       // Already gone; the kill below is enough.
     }
+    child.unref();
+
     const timer = setTimeout(() => {
       child.kill();
     }, 2_000);
@@ -348,6 +421,11 @@ export class McpGraphApi implements GraphApi {
 
   constructor(client: McpStdioClient) {
     this.#client = client;
+  }
+
+  /** Spawn the server and handshake now, so the first real request does not have to. */
+  async warm(): Promise<void> {
+    await this.#client.warm();
   }
 
   async get<T>(path: string, options: GraphRequestOptions = {}): Promise<T> {

@@ -90,12 +90,16 @@ interface Harness {
   readonly raw: () => string;
   /** The same, with escape codes removed — what a person would see. */
   readonly text: () => string;
+  /** Only the most recent paint, decoded. What is on screen *now*. */
+  readonly frame: () => string;
   readonly send: (keys: string, settleMs?: number) => Promise<void>;
   readonly done: Promise<number>;
   readonly rawModeHistory: readonly boolean[];
   /** Output written to the ordinary screen, i.e. what survives in the scrollback. */
   readonly scrollback: () => string;
 }
+
+const CURSOR_HOME = '\u001B[H';
 
 interface FakeTty extends PassThrough {
   isTTY: boolean;
@@ -105,7 +109,17 @@ interface FakeTty extends PassThrough {
 }
 
 async function harness(
-  options: { readonly announce?: boolean; readonly isTty?: boolean; readonly mounts?: boolean } = {},
+  options: {
+    readonly announce?: boolean;
+    readonly isTty?: boolean;
+    readonly mounts?: boolean;
+    /**
+     * Held in front of every listing, so a test can hold the pane in its loading state and
+     * ask what the user can do while it is there. The memory provider is instant, which is
+     * exactly wrong for testing behaviour that only exists because real sources are not.
+     */
+    readonly hold?: () => Promise<void>;
+  } = {},
 ): Promise<Harness> {
   const registry = new PluginRegistry(NULL_LOGGER);
   registry.register(memoryPlugin);
@@ -144,6 +158,15 @@ async function harness(
   });
   await session.start();
 
+  if (options.hold !== undefined) {
+    const { hold } = options;
+    const real = session.vfs.list.bind(session.vfs);
+    session.vfs.list = (async (target, listOptions) => {
+      await hold();
+      return real(target, listOptions);
+    }) as typeof session.vfs.list;
+  }
+
   const rawModeHistory: boolean[] = [];
   const stdin = new PassThrough() as FakeTty;
   stdin.isTTY = options.isTty ?? true;
@@ -179,6 +202,14 @@ async function harness(
     session,
     raw: () => painted,
     text: () => painted.replace(ANSI, ''),
+    frame: () => {
+      // Every paint starts by homing the cursor, so the last frame is everything after the
+      // last home. Tests that assert on `text()` see the whole history concatenated, which
+      // is right for "did this ever appear" but wrong for "what is on screen now".
+      const all = painted;
+      const start = all.lastIndexOf(CURSOR_HOME);
+      return (start === -1 ? all : all.slice(start)).replace(ANSI, '');
+    },
     scrollback: () => scrollback,
     rawModeHistory,
     done,
@@ -196,27 +227,43 @@ async function harness(
   };
 }
 
-/** Wait until the pane has painted something recognisable, or fail loudly. */
+/**
+ * Wait until the first listing has landed, or fail loudly.
+ *
+ * "The pane has painted" is no longer the same question as "the pane has data": the first
+ * frame is deliberately drawn before the fetch, so that a slow source shows a loading screen
+ * instead of a blank one. Tests that want data have to wait for the load to settle, which is
+ * what the absence of the working indicator means.
+ */
 async function ready(h: Harness): Promise<void> {
-  for (let i = 0; i < 100; i += 1) {
-    if (h.text().includes('/mail')) return;
+  for (let i = 0; i < 200; i += 1) {
+    const frame = h.frame();
+    if (frame.includes('/mail') && !frame.includes('working')) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.fail(`the pane never painted; saw: ${JSON.stringify(h.text().slice(0, 400))}`);
+  assert.fail(`the pane never settled; saw: ${JSON.stringify(h.frame().slice(0, 400))}`);
 }
 
 // ---------------------------------------------------------------------------
 
 describe('tui app: startup and shutdown', () => {
-  it('paints the current folder before waiting for a key', async () => {
+  it('shows a loading frame first, then the folder', async () => {
     const h = await harness();
     await ready(h);
     const text = h.text();
     assert.match(text, /\/mail/);
     assert.match(text, /Inbox/);
-    // The first frame is a full listing, not an empty shell that fills in afterwards — a
-    // two-stage paint is announced twice.
-    assert.ok(!text.includes('Loading…') || text.lastIndexOf('Inbox') > text.lastIndexOf('Loading…'));
+    // The loading frame comes *first* and the listing replaces it. This is the opposite of
+    // what this view used to do: it fetched before the first paint, which meant a source
+    // taking seven seconds to answer showed a blank alternate screen for seven seconds,
+    // with the "Loading…" frame fully computed and never drawn.
+    assert.ok(text.includes('Loading…'), 'should say what it is doing before it has an answer');
+    assert.ok(
+      text.indexOf('Loading…') < text.indexOf('Inbox'),
+      'the loading frame should precede the listing, not follow it',
+    );
+    // …and it must not still be claiming to load once the answer is in.
+    assert.ok(!h.frame().includes('working'), 'the settled frame should not show the working indicator');
     await h.send('q');
     assert.equal(await h.done, 0);
   });
@@ -476,5 +523,154 @@ describe('tui app: frames', () => {
     const after = h.raw().length;
     await h.send('jjjj');
     assert.equal(h.raw().length, after, 'must not write to a terminal it has handed back');
+  });
+});
+
+/**
+ * What the user can do while a source is being slow.
+ *
+ * This is the behaviour the whole loading-indicator change exists for, and none of it can
+ * be seen with an instant provider — so every test here holds the listing open by hand.
+ *
+ * The old contract was "every key is dropped until the fetch returns". For a source taking
+ * seven seconds that is a program which has, from the outside, crashed: nothing on screen
+ * changes and nothing you press does anything, including quit.
+ */
+describe('tui app: while a source is slow', () => {
+  /** A listing that does not return until the test says so. */
+  function gate(): { readonly hold: () => Promise<void>; readonly release: () => void } {
+    let open = false;
+    const waiters: Array<() => void> = [];
+    return {
+      hold: async () => {
+        if (open) return;
+        await new Promise<void>((resolve) => waiters.push(resolve));
+      },
+      release: () => {
+        open = true;
+        for (const resolve of waiters.splice(0)) resolve();
+      },
+    };
+  }
+
+  /** Wait for the pane to be visibly loading, rather than assuming a timing. */
+  async function loading(h: Harness): Promise<void> {
+    for (let i = 0; i < 200; i += 1) {
+      if (h.frame().includes('working')) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(`the pane never showed it was working; saw: ${JSON.stringify(h.frame().slice(0, 300))}`);
+  }
+
+  it('says it is loading instead of showing a blank screen', async () => {
+    const g = gate();
+    const h = await harness({ hold: g.hold });
+    await loading(h);
+
+    assert.match(h.frame(), /Loading…/);
+    assert.match(h.frame(), /working/);
+
+    g.release();
+    await ready(h);
+    await h.send('q');
+    await h.done;
+  });
+
+  it('keeps animating, because a caption that never changes reads as a hang', async () => {
+    const g = gate();
+    const h = await harness({ hold: g.hold });
+    await loading(h);
+
+    const first = h.frame();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const later = h.frame();
+    assert.notEqual(first, later, 'the indicator should have advanced on its own');
+    assert.match(later, /working/);
+
+    g.release();
+    await ready(h);
+    await h.send('q');
+    await h.done;
+  });
+
+  it('lets the user quit rather than trapping them until the fetch returns', async () => {
+    const g = gate();
+    const h = await harness({ hold: g.hold });
+    await loading(h);
+
+    await h.send('q');
+    // Bounded, so that the old behaviour — `q` dropped outright, leaving no way out of a
+    // slow load but killing the process — shows up as a failure rather than as a test run
+    // that never finishes.
+    const code = await Promise.race([
+      h.done,
+      new Promise<'stuck'>((resolve) => setTimeout(() => resolve('stuck'), 2000)),
+    ]);
+    assert.equal(code, 0, 'q should quit even while a fetch is outstanding');
+    g.release();
+  });
+
+  it('still scrolls, because moving the cursor costs nothing', async () => {
+    // The first listing has to land before there is anything to scroll, so the gate is
+    // released and then re-armed around a second, held, navigation.
+    const g = gate();
+    const h = await harness();
+    await ready(h);
+
+    const real = h.session.vfs.list.bind(h.session.vfs);
+    h.session.vfs.list = (async (target, listOptions) => {
+      await g.hold();
+      return real(target, listOptions);
+    }) as typeof h.session.vfs.list;
+
+    try {
+      await h.send('r'); // refresh — held open by the gate
+      await loading(h);
+
+      await h.send('\u001B[B'); // down
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.match(h.frame(), /2 of 2, Sent Items/, 'the selection should have moved during the load');
+      assert.match(h.frame(), /working/, 'and the load should still be running');
+    } finally {
+      // Always, or a failing assertion leaves a listing parked forever and the runner with
+      // a handle it cannot close.
+      g.release();
+    }
+
+    await h.send('q');
+    await h.done;
+  });
+
+  it('refuses a second fetch out loud rather than silently queueing it', async () => {
+    const g = gate();
+    const h = await harness();
+    await ready(h);
+
+    const real = h.session.vfs.list.bind(h.session.vfs);
+    let calls = 0;
+    h.session.vfs.list = (async (target, listOptions) => {
+      calls += 1;
+      await g.hold();
+      return real(target, listOptions);
+    }) as typeof h.session.vfs.list;
+
+    try {
+      await h.send('r');
+      await loading(h);
+      const during = calls;
+
+      // A held-down arrow used to be the reason keys were dropped: queueing these would
+      // fire a burst of requests that all land after the user has stopped moving.
+      await h.send('\r\r\r');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      assert.equal(calls, during, 'no extra request should have been started');
+      assert.match(h.frame(), /Still working/i, 'and the user should be told why nothing happened');
+    } finally {
+      g.release();
+    }
+
+    await h.send('q');
+    await h.done;
   });
 });

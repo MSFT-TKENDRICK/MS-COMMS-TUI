@@ -54,7 +54,66 @@ export const PREFETCH_PRIORITY = {
   learned: 30,
   /** Siblings of the current directory. `cd ../other` is common and cheap to cover. */
   sibling: 40,
+  /**
+   * Mount roots, at startup, before the user has done anything.
+   *
+   * Ranked last because it is the only prediction made with no evidence at all — there is
+   * no current directory to reason from, just a standing bet that somebody who mounted
+   * their mail will look at their mail. That makes it the first thing to drop the moment a
+   * real navigation gives the queue something better to do.
+   */
+  warm: 50,
 } as const;
+
+/**
+ * Choose which subdirectories of a freshly-warmed mount root are worth warming.
+ *
+ * This exists because the obvious implementation — take the first few in listing order —
+ * is wrong, and measurably so. A real mailbox lists its folders alphabetically, so
+ * "the first four" is `Archive, Conversation History, Deleted Items, Drafts`: three of
+ * them empty, none of them where anyone is going. The Inbox, which is where essentially
+ * every session goes, sorts sixth and was never warmed at all. Warming is a bet placed
+ * with the user's rate limit, and spending it on empty folders while the destination
+ * stays cold is the worst possible outcome.
+ *
+ * So rank by what the provider already tells us about each directory, in the order that
+ * a person would:
+ *
+ *   1. Unread items. This is the strongest available signal of "you have not looked at
+ *      this yet", and it is what the user is coming here to do. The Inbox wins on this
+ *      by three orders of magnitude on a real account.
+ *   2. Recent activity. Mail folders rarely carry an mtime, but chats and channels do,
+ *      and for those "most recently spoken in" is exactly the right guess.
+ *   3. Sheer size, as a weak proxy for importance when nothing above distinguishes.
+ *   4. Listing order, last, so a provider that *has* sorted meaningfully still gets its
+ *      way when it has given us nothing else to go on — and so the result is stable.
+ *
+ * Nothing here is provider-specific: it reads only fields any provider may populate, and
+ * degrades to "listing order" when none of them are.
+ */
+export function rankWarmCandidates(entries: readonly VNode[], limit: number): VNode[] {
+  if (limit <= 0) return [];
+
+  const dirs = entries
+    .map((node, index) => ({ node, index }))
+    .filter((entry) => entry.node.kind === 'dir');
+
+  dirs.sort((a, b) => {
+    const unread = (b.node.unreadCount ?? 0) - (a.node.unreadCount ?? 0);
+    if (unread !== 0) return unread;
+
+    const aTime = a.node.mtime?.getTime() ?? 0;
+    const bTime = b.node.mtime?.getTime() ?? 0;
+    if (aTime !== bTime) return bTime - aTime;
+
+    const size = (b.node.childCount ?? 0) - (a.node.childCount ?? 0);
+    if (size !== 0) return size;
+
+    return a.index - b.index;
+  });
+
+  return dirs.slice(0, limit).map((entry) => entry.node);
+}
 
 export interface PrefetchTask {
   /** Dedupe identity. Re-scheduling a key already queued or running is a no-op. */

@@ -75,6 +75,7 @@ import {
   type ReadOptions,
   type VNode,
 } from '@mscomms/core';
+import { raceAbort } from './abort.js';
 import type { GraphApi } from './client.js';
 import {
   createClient,
@@ -458,6 +459,21 @@ export class GraphPeopleProvider implements Provider {
 
   readonly #options: GraphPeopleOptions;
   readonly #context: ProviderContext;
+  /**
+   * The lifetime of this provider, as a signal shared work can safely be built with.
+   *
+   * The cached promises below (`#me`, `#signals`, `#chats`) are shared between every caller
+   * who wants them, so none of them may be built with a *caller's* signal: the first caller
+   * to arrive would silently become the owner, and their abort — which happens routinely,
+   * whenever someone navigates off a pane mid-list — would cancel the work out from under
+   * everyone else, who would then receive a cancellation for something they never
+   * cancelled. Callers observe their own signal through `raceAbort` and nowhere else.
+   *
+   * But shared work still needs *somebody* able to cancel it, or quitting would wait on a
+   * request nobody is going to read. That somebody is the provider itself, which is
+   * disposed on the way down.
+   */
+  readonly #lifetime = new AbortController();
   #client: GraphApi | undefined;
   #me: Promise<Person> | undefined;
   #signals: Promise<SignalIndex> | undefined;
@@ -474,6 +490,22 @@ export class GraphPeopleProvider implements Provider {
     this.#client ??= createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
+  /** Bring the transport up in the background. See `Provider.warm`. */
+  async warm(): Promise<void> {
+    await this.#client?.warm?.();
+  }
+
+  /**
+   * Let go of the shared work.
+   *
+   * Nothing else can: the cached promises are deliberately built with no caller's signal,
+   * so this is the only thing standing between a quit and a Graph round-trip nobody is
+   * waiting for.
+   */
+  async dispose(): Promise<void> {
+    this.#lifetime.abort();
+  }
+
   get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The people mount was not initialised.');
     return this.#client;
@@ -487,9 +519,9 @@ export class GraphPeopleProvider implements Provider {
   // Identity
   // -------------------------------------------------------------------------
 
-  async #self(): Promise<Person> {
+  async #self(signal?: AbortSignal): Promise<Person> {
     this.#me ??= (async () => {
-      const user = await this.#getUser('/me');
+      const user = await this.#getUser('/me', this.#lifetime.signal);
       const person = personFromUser(user, new Set());
       const home = domainOf(person.address);
       return home === '' ? person : { ...person, external: false };
@@ -497,11 +529,11 @@ export class GraphPeopleProvider implements Provider {
       this.#me = undefined;
       throw error;
     });
-    return this.#me;
+    return raceAbort(this.#me, signal);
   }
 
-  async #homeDomains(): Promise<ReadonlySet<string>> {
-    const me = await this.#self();
+  async #homeDomains(signal?: AbortSignal): Promise<ReadonlySet<string>> {
+    const me = await this.#self(signal);
     const domain = domainOf(me.address);
     return domain === '' ? new Set<string>() : new Set([domain]);
   }
@@ -569,15 +601,16 @@ export class GraphPeopleProvider implements Provider {
     const ttl = this.#options.signalTtlMs ?? 60_000;
     const pending = this.#signals;
     if (pending !== undefined) {
-      const resolved = await pending.catch(() => undefined);
+      const resolved = await raceAbort(pending, signal).catch(() => undefined);
       if (resolved !== undefined && Date.now() - resolved.at < ttl) return resolved;
+      if (signal?.aborted === true) throw new VfsError('ECANCELED', 'The request was cancelled.');
     }
 
-    this.#signals = this.#buildSignals(signal).catch((error: unknown) => {
+    this.#signals = this.#buildSignals(this.#lifetime.signal).catch((error: unknown) => {
       this.#signals = undefined;
       throw error;
     });
-    return this.#signals;
+    return raceAbort(this.#signals, signal);
   }
 
   async #buildSignals(signal?: AbortSignal): Promise<SignalIndex> {
@@ -654,7 +687,7 @@ export class GraphPeopleProvider implements Provider {
     }
 
     if (this.#options.chats !== false) {
-      const me = await this.#self();
+      const me = await this.#self(signal);
       for (const chat of await this.#chatRoster(signal)) {
         const others = (chat.members ?? []).filter(
           (member) => nullable(member.userId) !== undefined && member.userId !== me.userId,
@@ -696,10 +729,9 @@ export class GraphPeopleProvider implements Provider {
     this.#chats ??= (async () => {
       const page = await this.#degrade(
         () =>
-          this.#api.getPage<Chat>(
-            '/me/chats?$expand=members&$top=50',
-            signal === undefined ? {} : { signal },
-          ),
+          this.#api.getPage<Chat>('/me/chats?$expand=members&$top=50', {
+            signal: this.#lifetime.signal,
+          }),
         'the chat roster',
       );
       return page?.value ?? [];
@@ -707,7 +739,7 @@ export class GraphPeopleProvider implements Provider {
       this.#chats = undefined;
       throw error;
     });
-    return this.#chats;
+    return raceAbort(this.#chats, signal);
   }
 
   // -------------------------------------------------------------------------
@@ -755,16 +787,16 @@ export class GraphPeopleProvider implements Provider {
       case 'me': {
         // `Me` is the person, not a folder containing them: `cd /people/Me` should put you
         // on your own card, next to your own manager and reports.
-        return this.#listPerson(await this.#personNode(await this.#self()), options);
+        return this.#listPerson(await this.#personNode(await this.#self(options.signal)), options);
       }
       case 'org':
         return this.#peoplePage(await this.#chain(options.signal), { ordered: true });
       case 'reports': {
-        const me = await this.#self();
+        const me = await this.#self(options.signal);
         return this.#peoplePage(await this.#directReports(me, options.signal));
       }
       case 'colleagues':
-        return this.#peoplePage(await this.#peers(await this.#self(), options.signal));
+        return this.#peoplePage(await this.#peers(await this.#self(options.signal), options.signal));
       case 'recent':
         return this.#peoplePage(await this.#relevant(options.signal));
       case 'external':
@@ -792,7 +824,7 @@ export class GraphPeopleProvider implements Provider {
       );
     }
 
-    const me = await this.#self();
+    const me = await this.#self(options.signal);
     if (person.key === me.key) {
       // Your own "conversation with yourself" is not a thing; the hierarchy views are.
       return { entries };
@@ -845,7 +877,7 @@ export class GraphPeopleProvider implements Provider {
       options.cursor ?? path,
       options.signal === undefined ? {} : { signal: options.signal },
     );
-    const homeDomains = await this.#homeDomains();
+    const homeDomains = await this.#homeDomains(options.signal);
     const people = page.value.map((user) => this.#remember(personFromUser(user, homeDomains)));
     const built = await this.#peoplePage(people, { parentPath: 'Directory' });
     // `appliedQuery` is deliberately never set. `startswith` is a prefix match and the
@@ -918,7 +950,7 @@ export class GraphPeopleProvider implements Provider {
 
   async #manager(person: Person, signal?: AbortSignal): Promise<Person | undefined> {
     if (person.userId === undefined) return undefined;
-    const homeDomains = await this.#homeDomains();
+    const homeDomains = await this.#homeDomains(signal);
     const user = await this.#degrade(
       () => this.#getUser(`/users/${encodeURIComponent(person.userId as string)}/manager`, signal),
       `the manager of ${person.displayName}`,
@@ -930,7 +962,7 @@ export class GraphPeopleProvider implements Provider {
 
   async #directReports(person: Person, signal?: AbortSignal): Promise<readonly Person[]> {
     if (person.userId === undefined) return [];
-    const homeDomains = await this.#homeDomains();
+    const homeDomains = await this.#homeDomains(signal);
     const page = await this.#degrade(
       () =>
         this.#api.getPage<GraphUser>(
@@ -955,7 +987,7 @@ export class GraphPeopleProvider implements Provider {
   /** The climb from the top of the organisation down to the signed-in user. */
   async #chain(signal?: AbortSignal): Promise<readonly Person[]> {
     const maxDepth = Math.max(1, Math.min(this.#options.maxChainDepth ?? 12, 30));
-    const me = await this.#self();
+    const me = await this.#self(signal);
     const chain: Person[] = [me];
     const seen = new Set<string>([me.key]);
 
@@ -975,8 +1007,8 @@ export class GraphPeopleProvider implements Provider {
 
   /** People worth listing: whoever Graph considers relevant, plus anyone with unread mail. */
   async #relevant(signal?: AbortSignal): Promise<readonly Person[]> {
-    const homeDomains = await this.#homeDomains();
-    const me = await this.#self();
+    const homeDomains = await this.#homeDomains(signal);
+    const me = await this.#self(signal);
     const people = new Map<string, Person>();
 
     const page = await this.#degrade(
@@ -1030,7 +1062,7 @@ export class GraphPeopleProvider implements Provider {
   // -------------------------------------------------------------------------
 
   async #commsWith(person: Person, signal?: AbortSignal): Promise<readonly Comm[]> {
-    const me = await this.#self();
+    const me = await this.#self(signal);
     const [mail, chat] = await Promise.all([
       this.#mailWith(person, me, signal),
       this.#options.chats === false ? Promise.resolve([]) : this.#chatWith(person, me, signal),

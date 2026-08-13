@@ -104,7 +104,17 @@ export interface CacheConfig {
   readonly bodies?: number;
   /** Build lexical embeddings for vector search. */
   readonly vectors?: boolean;
-  /** Predictive cache-ahead on navigation. */
+  /**
+   * Predictive cache-ahead: warming mount roots at startup and likely next steps on
+   * navigation.
+   *
+   * On by default, and *independent of {@link enabled}* — the snapshot decides whether
+   * warmed results survive the process, not whether warming happens. Gating one on the
+   * other meant a default install preloaded nothing at all, so every folder was a cold
+   * round trip and the program appeared to stall on each keystroke.
+   *
+   * Costs bandwidth on a guess, so it remains switchable for a metered connection.
+   */
   readonly prefetch?: boolean;
   /** Speculative fetches in flight at once. */
   readonly prefetchConcurrency?: number;

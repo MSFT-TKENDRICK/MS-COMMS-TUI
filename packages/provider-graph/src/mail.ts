@@ -113,6 +113,11 @@ export class GraphMailProvider implements Provider {
     this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
+  /** Bring the transport up in the background. See `Provider.warm`. */
+  async warm(): Promise<void> {
+    await this.#client?.warm?.();
+  }
+
   get #api(): GraphApi {
     if (this.#client === undefined) throw VfsError.config('The mail mount was not initialised.');
     return this.#client;

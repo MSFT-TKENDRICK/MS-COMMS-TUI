@@ -355,6 +355,36 @@ hole in your scrollback.
 prompt, but the pane has no prompt until it has drawn itself, so on an unconfigured machine
 it would otherwise open onto an empty tree.
 
+## Waiting for things, and mostly not
+
+Opening a folder is answered by whatever can answer first, then corrected:
+
+- **The local snapshot** replies in about a millisecond, and is allowed to be slightly out
+  of date. A cold start stops being a cold start.
+- **Warm-up** pays the expensive part before you ask. First contact with a Microsoft Graph
+  source costs seven to eleven seconds — starting an MCP server — against a quarter of a
+  second for the fetch itself. Launch spends that in the background while you read the
+  banner, so `ls /mail` a second later takes about fifteen milliseconds rather than eleven
+  seconds.
+- **The live answer** arrives when the network says so. If the folder changed, the view
+  updates in place, keeping your selection on the row it was on. If it didn't — which is
+  most of the time — nothing repaints.
+
+Nothing about this blocks the prompt: local commands answer immediately whatever the network
+is doing, anything genuinely slow shows a progress indicator after a grace period, and
+quitting is immediate even mid-startup. In the pane, `[` and `]` (or `Alt+Left` and
+`Alt+Right`) move back and forward through where you have been, and returning to a folder
+puts you back on the item you left. `docs/CONFIGURATION.md` has the details.
+
+Quitting deserves a word, because it is where "in the background" usually stops being free.
+Shutdown asks the background sync to stop and waits a quarter of a second for it to notice —
+which is ample, since work that honours the request unwinds in about a millisecond. Anything
+still running after that is abandoned rather than waited for, and cannot write to the cache
+afterwards. A sync cut short this way is not an error and is not reported as one; the next
+launch simply picks the directory up again. The alternative is a program that will not close
+because something it started is not answering, which is how quitting came to take twenty-six
+seconds before this existed.
+
 ## Scripting
 
 ```sh

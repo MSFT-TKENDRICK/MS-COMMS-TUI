@@ -28,12 +28,23 @@
  * retried next cycle rather than aborting the run.
  */
 
+import { VfsError } from './errors.js';
 import { NULL_LOGGER } from './logging.js';
 import type { Document, ListPage, Logger, Provider, VNode } from './provider.js';
 import { DEFAULT_RECENT } from './snapshot.js';
 import type { ToolCallsLike } from './agentfs.js';
 import type { SnapshotStore } from './snapshot.js';
 import * as vpath from './vpath.js';
+
+/**
+ * How long {@link BackgroundSync.stop} waits for a cycle to notice it has been aborted.
+ *
+ * A provider that honours its signal unwinds in about a millisecond, so this is three
+ * orders of magnitude of headroom for the well-behaved case. It is not a timeout on the
+ * sync itself — the work is left running, not cancelled — it is a bound on how long
+ * quitting is allowed to feel slow.
+ */
+const GRACE_MS = 250;
 
 /** The part of {@link ./vfs.js Vfs} the sync needs. Declared structurally to keep the
  * dependency one-way: the engine owns the sync, not the other way round. */
@@ -118,6 +129,12 @@ export class BackgroundSync {
   #timer: NodeJS.Timeout | undefined;
   #inFlight: Promise<SyncStatus> | undefined;
   #controller: AbortController | undefined;
+  /**
+   * Set by {@link stop} and never cleared. Distinct from the abort signal, which a provider
+   * is free to ignore — this is the flag *we* check, so that work we have given up waiting
+   * for cannot touch a database that is about to close.
+   */
+  #stopped = false;
   #cycles = 0;
   #lastStartedAt: number | undefined;
   #lastFinishedAt: number | undefined;
@@ -219,13 +236,56 @@ export class BackgroundSync {
     this.#timer.unref?.();
   }
 
+  /**
+   * Stop cycling, and do not wait forever to be sure of it.
+   *
+   * This method has to satisfy two demands that pull against each other. It must wait for
+   * the cycle to unwind, because closing the database under a sync still writing to it is a
+   * real corruption risk and the reason this is awaited at all. And it must return quickly,
+   * because it runs when the user pressed `q` and they are not asking a question about our
+   * internals.
+   *
+   * Aborting and awaiting satisfies the first and *assumes* the second. The assumption is
+   * that aborting ends the work — but a provider is third-party code, and honouring an
+   * AbortSignal is a courtesy, not a guarantee. When it does not, the await never returns.
+   * Measured against a real mailbox, quitting took twenty-six seconds this way.
+   *
+   * So: ask, wait briefly, then leave. {@link GRACE_MS} is enormous for a provider that
+   * honours the signal — those unwind in about a millisecond — and short enough that one
+   * that does not is invisible. Whatever is still running is then *disowned* rather than
+   * cancelled: {@link #stopped} makes its remaining snapshot writes throw, so a worker that
+   * wakes up after the database has closed ends where it stands instead of writing into a
+   * closed handle. Those throws are swallowed by the cycle rather than recorded, because
+   * being told to stop is not a fault worth reporting to anyone.
+   */
   async stop(): Promise<void> {
+    this.#stopped = true;
     if (this.#timer !== undefined) {
       clearInterval(this.#timer);
       this.#timer = undefined;
     }
     this.#controller?.abort();
-    await this.#inFlight?.catch(() => undefined);
+
+    const inFlight = this.#inFlight;
+    if (inFlight === undefined) return;
+    // The loser of this race is left unobserved, so the catch has to be attached here
+    // rather than relied upon from the race: an unhandled rejection is fatal by default.
+    //
+    // This timer is deliberately *not* unref'd, unlike the interval above. It is the only
+    // way the race can settle when the disowned cycle is stuck, and everything else in this
+    // process is unref'd on purpose so one-shot commands can exit — so an unref'd timer here
+    // lets Node drain the loop and exit while `stop()` is still pending, abandoning the rest
+    // of `dispose()`: the snapshot is never flushed and the database is closed by process
+    // teardown instead of by us. It is bounded at 250ms, so it cannot meaningfully delay an
+    // exit that was going to happen anyway.
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      inFlight.catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, GRACE_MS);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
   }
 
   /**
@@ -244,6 +304,19 @@ export class BackgroundSync {
       this.#controller = undefined;
     });
     return this.#inFlight;
+  }
+
+  /**
+   * Refuse to touch the snapshot once {@link stop} has given up waiting.
+   *
+   * Throwing rather than returning quietly is deliberate. A worker that has been disowned
+   * is partway through a directory it will never finish, and returning quietly would let it
+   * carry on to the next page and the next write, declining each one individually. Throwing
+   * ends it at the first checkpoint, and the cycle's catch drops it without recording an
+   * error, because a sync that was told to stop did not fail at anything.
+   */
+  #guard(): void {
+    if (this.#stopped) throw new VfsError('ECANCELED', 'Sync stopped.');
   }
 
   async #cycle(signal: AbortSignal): Promise<SyncStatus> {
@@ -277,6 +350,11 @@ export class BackgroundSync {
             }
           }
         } catch (error) {
+          // Being told to stop is not a failure, and must not be reported as one. Without
+          // this, a perfectly clean quit leaves "database is not open" sitting in `cache
+          // status` — which reads like corruption, describes only our own teardown, and
+          // would send someone looking for a bug that is not there.
+          if (this.#stopped) return;
           // One unreadable folder must not cost the other nine, exactly as in the search
           // walk. It is recorded and retried next cycle.
           const message = `${job.path}: ${error instanceof Error ? error.message : String(error)}`;
@@ -289,6 +367,9 @@ export class BackgroundSync {
     for (let i = 0; i < this.#concurrency; i += 1) workers.push(next());
     await Promise.all(workers);
 
+    // Eviction is housekeeping, and housekeeping on a database we have been told to let go
+    // of is not worth the risk of writing into a closed handle.
+    if (this.#stopped) return this.status;
     this.#evicted += await this.#snapshot.prune().catch(() => 0);
 
     this.#cycles += 1;
@@ -312,12 +393,19 @@ export class BackgroundSync {
    * re-list that a change warrants.
    */
   async #syncDirectory(mount: SyncMount, path: string, signal: AbortSignal): Promise<readonly string[]> {
+    this.#guard();
     const { node } = await this.#host.resolve(path, { signal });
 
     if (mount.provider.capabilities.has('poll') && mount.provider.poll !== undefined) {
       const cursor = await this.#snapshot.pollCursor(mount.id, path);
       if (cursor !== undefined) {
         const result = await mount.provider.poll(node, cursor, { signal });
+        // Guarded on the way out of `poll`, not just on the way in. `poll` is the *longest*
+        // await in this method against a real account — it is where the twenty-six second
+        // hang actually sat — and honouring the signal is a courtesy from provider code,
+        // not a guarantee. Without this, a provider that ignores its abort writes a cursor
+        // into a database `dispose()` has already closed.
+        this.#guard();
         await this.#snapshot.setPollCursor(mount.id, path, result.cursor ?? cursor);
         if (result.changes.length === 0) {
           const existing = await this.#snapshot.listing(path, { limit: this.#recent });
@@ -348,6 +436,7 @@ export class BackgroundSync {
         (result) => ({ entries: result.entries.length, more: result.cursor !== undefined }),
       );
       const withPaths = this.#host.canonicalize(path, page.entries);
+      this.#guard();
       await this.#snapshot.putListing({
         mountId: mount.id,
         path,
@@ -400,7 +489,7 @@ export class BackgroundSync {
       .slice(0, this.#bodies);
 
     for (const entry of newest) {
-      if (signal.aborted) return;
+      if (signal.aborted || this.#stopped) return;
       if (entry.path === undefined) continue;
       const existing = await this.#snapshot.document(entry.path);
       if (existing !== undefined) continue;
@@ -412,6 +501,7 @@ export class BackgroundSync {
           // Length, not text. The point is that a body was fetched, not what it said.
           (result) => ({ format: result.format, bytes: result.body.length }),
         );
+        this.#guard();
         await this.#snapshot.putDocument(mount.id, entry, doc);
         this.#bodyCount += 1;
       } catch (error) {

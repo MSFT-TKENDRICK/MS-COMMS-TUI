@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { NULL_LOGGER, isVfsError } from '@mscomms/core';
 
@@ -182,13 +183,22 @@ function handle(message) {
 }
 `;
 
+const DEAF_SERVER = `
+// Never answers, never exits: the shape of \`npx\` still resolving a package.
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`;
+
 let dir: string;
 let serverPath: string;
+let deafServerPath: string;
 
 before(() => {
   dir = mkdtempSync(join(tmpdir(), 'mscomms-mcp-test-'));
   serverPath = join(dir, 'fake-server.mjs');
   writeFileSync(serverPath, FAKE_SERVER, 'utf8');
+  deafServerPath = join(dir, 'deaf-server.mjs');
+  writeFileSync(deafServerPath, DEAF_SERVER, 'utf8');
 });
 
 after(() => {
@@ -202,6 +212,34 @@ function connect(): { client: McpStdioClient; api: McpGraphApi } {
   );
   return { client, api: new McpGraphApi(client) };
 }
+
+// ---------------------------------------------------------------------------
+
+describe('mcp transport: letting go of a server that is still starting', () => {
+  it('leaves nothing holding the process open', async () => {
+    const client = new McpStdioClient(
+      { command: process.execPath, args: [deafServerPath], requestTimeoutMs: 30_000, startupTimeoutMs: 30_000 },
+      NULL_LOGGER,
+    );
+    // Start the handshake so a child really is spawned, then walk away from it mid-flight,
+    // which is what a user quitting a few seconds after launch does.
+    const pending = client.warm().catch(() => false);
+    await delay(300);
+    client.close();
+    await pending;
+
+    // The regression this guards. Ending the child's stdin queues a *graceful* shutdown,
+    // which stays referenced until the far end acknowledges it — and a server still being
+    // resolved by `npx` acknowledges nothing for several seconds. The CLI would sit there
+    // with all of its own work finished, waiting on a process it had already abandoned:
+    // seven and a half seconds to quit, against twenty milliseconds once the server was up.
+    // Destroying the pipe delivers the same end-of-file without anyone waiting for a reply.
+    assert.ok(
+      !process.getActiveResourcesInfo().includes('SimpleShutdownWrap'),
+      'closing the transport should not leave a pending stream shutdown holding the process open',
+    );
+  });
+});
 
 // ---------------------------------------------------------------------------
 

@@ -14,6 +14,7 @@
  */
 
 import { VfsError } from '@mscomms/core';
+import { raceAbort } from './abort.js';
 
 export interface GraphClientOptions {
   readonly getToken: () => Promise<string>;
@@ -48,6 +49,15 @@ export interface GraphApi {
   getBytes(path: string, options?: GraphRequestOptions): Promise<Uint8Array>;
   post<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
   patch<T>(path: string, body: unknown, options?: GraphRequestOptions): Promise<T>;
+  /**
+   * Establish the connection without asking for anything.
+   *
+   * Only the MCP transport implements this, and only because it has a genuinely expensive
+   * setup — spawning a server and completing a handshake takes seconds, against
+   * milliseconds for the request that follows. Direct HTTP has nothing to prepare and
+   * omits it.
+   */
+  warm?(): Promise<void>;
 }
 
 /**
@@ -101,12 +111,21 @@ export class GraphClient implements GraphApi {
     let attempt = 0;
 
     for (;;) {
+      // Re-checked each pass: the listener below is registered fresh per attempt, and a
+      // signal that fired between two attempts would never reach it.
+      if (options.signal?.aborted === true) throw new VfsError('ECANCELED', 'Request cancelled.');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
-      options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+      // Named, because this is a retry loop and the caller's signal usually outlives the
+      // whole loop: an anonymous listener per attempt is a leak that grows with every
+      // retry and every request made under the same warm-up signal.
+      const relayAbort = (): void => {
+        controller.abort();
+      };
+      options.signal?.addEventListener('abort', relayAbort, { once: true });
 
       try {
-        const token = await this.#getToken();
+        const token = await raceAbort(this.#getToken(), options.signal);
         const response = await fetch(url, {
           headers: {
             authorization: `Bearer ${token}`,
@@ -128,7 +147,7 @@ export class GraphClient implements GraphApi {
             });
           }
           attempt += 1;
-          await sleep(Math.max(1, retryAfter) * 1000);
+          await sleep(Math.max(1, retryAfter) * 1000, options.signal);
           continue;
         }
 
@@ -142,12 +161,13 @@ export class GraphClient implements GraphApi {
         }
         if (attempt < this.#maxRetries) {
           attempt += 1;
-          await sleep(500 * attempt);
+          await sleep(500 * attempt, options.signal);
           continue;
         }
         throw new VfsError('ENETWORK', `Could not reach Microsoft Graph: ${String(error)}`);
       } finally {
         clearTimeout(timer);
+        options.signal?.removeEventListener('abort', relayAbort);
       }
     }
   }
@@ -183,12 +203,21 @@ export class GraphClient implements GraphApi {
     let attempt = 0;
 
     for (;;) {
+      // Re-checked each pass: the listener below is registered fresh per attempt, and a
+      // signal that fired between two attempts would never reach it.
+      if (options.signal?.aborted === true) throw new VfsError('ECANCELED', 'Request cancelled.');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
-      options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+      // Named, because this is a retry loop and the caller's signal usually outlives the
+      // whole loop: an anonymous listener per attempt is a leak that grows with every
+      // retry and every request made under the same warm-up signal.
+      const relayAbort = (): void => {
+        controller.abort();
+      };
+      options.signal?.addEventListener('abort', relayAbort, { once: true });
 
       try {
-        const token = await this.#getToken();
+        const token = await raceAbort(this.#getToken(), options.signal);
         const response = await fetch(url, {
           method,
           headers: {
@@ -220,13 +249,14 @@ export class GraphClient implements GraphApi {
         throw new VfsError('ENETWORK', `Could not reach Microsoft Graph: ${String(error)}`);
       } finally {
         clearTimeout(timer);
+        options.signal?.removeEventListener('abort', relayAbort);
       }
     }
   }
 
   async getBytes(path: string, options: GraphRequestOptions = {}): Promise<Uint8Array> {
     const url = path.startsWith('http') ? path : `${this.#baseUrl}${path.startsWith('/') ? '' : '/'}${path}`;
-    const token = await this.#getToken();
+    const token = await raceAbort(this.#getToken(), options.signal);
     const response = await fetch(url, {
       headers: { authorization: `Bearer ${token}` },
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -296,6 +326,26 @@ export function graphFailure(status: number, url: string, detail = '', code = ''
   return new VfsError('ENETWORK', `Microsoft Graph returned HTTP ${String(status)}${detail === '' ? '' : `: ${detail}`}`);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Sleep, unless the caller gives up first.
+ *
+ * A throttled Graph request can be told to come back in thirty seconds, and until now that
+ * number was also how long a quit could take: the back-off was a bare timer with nothing
+ * watching the signal. Rejecting rather than resolving early matters, because the caller is
+ * a retry loop — waking it up quietly would just send it round again to issue a fetch on
+ * behalf of someone who has already left.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) return Promise.reject(new VfsError('ECANCELED', 'Request cancelled.'));
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new VfsError('ECANCELED', 'Request cancelled.'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
