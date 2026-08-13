@@ -119,21 +119,57 @@ No credentials, no vendor API, and nobody can turn it off.
 | `timeoutMs` | number | 15000 | Per-request timeout. |
 | `userAgent` | string | `mscomms/0.1 (+repo URL)` | Sent on every request. |
 
-### `github` — issues, pull requests and notifications
+### `github` — issues, pull requests, discussions, projects and notifications
 
 | Option | Type | Default | Meaning |
 |---|---|---|---|
 | `repos` | string[] | — | `owner/name` entries, each a folder. |
+| `owners` | string[] | — | Bare logins, for an org or user whose boards you want without naming a repository. |
 | `token` | string | — | A PAT. Use `${env:GITHUB_TOKEN}`; omit it to fall back to the environment or `gh`. |
 | `baseUrl` | string | api.github.com | Set for GitHub Enterprise Server. |
+| `graphqlUrl` | string | derived from `baseUrl` | Override only if your Enterprise GraphQL endpoint is somewhere unusual. |
 | `includePulls` | boolean | `true` | Show pull requests alongside issues. |
+| `includeDiscussions` | boolean | `true` | Show a `discussions/` folder. |
+| `includeProjects` | boolean | `true` | Show `projects/` folders. |
 | `includeComments` | boolean | `true` | Append the comment thread when reading. |
 | `includeNotifications` | boolean | `false` | Add a `notifications/` folder. |
-| `state` | `"open"` \| `"closed"` \| `"all"` | `"open"` | Which issues to list. |
+| `state` | `"open"` \| `"closed"` \| `"all"` | `"open"` | Which issues and pull requests to list. |
 | `timeoutMs` | number | 20000 | Per-request timeout. |
+
+The tree is:
+
+```
+gh/
+  notifications/            with includeNotifications
+  <owner>/
+    projects/               boards owned by the org or user
+      #3 Company roadmap/
+    <repo>/
+      issues/
+      pulls/
+      discussions/
+      projects/             boards linked to this repository
+```
+
+A project's cards are a flat list, one file each. Whatever columns the board defines —
+`Status`, `Priority`, an iteration, a number — come back as metadata on the card, so
+`ls meta:Status=Done` works without the shell or the config knowing any board's vocabulary.
+A card is identified by its position on the board, not by the issue behind it, because the
+same issue can sit on several boards with different field values on each.
 
 Without a token you get public data at a much lower rate limit. `cache` in the shell shows
 how close you are to it.
+
+**Discussions and projects need a token.** They exist only on GitHub's GraphQL API, which
+has no anonymous access at all, so without a token those folders are hidden rather than
+shown and always failing. Projects additionally need the `read:project` scope: a token
+without it can see the repository but not its boards. `gh auth refresh -s read:project`
+adds it, and the provider says so in the error if you hit this.
+
+If a token can see some boards and not others, GitHub answers with the ones it can and an
+error for the rest. The provider shows what came back and logs the rest rather than failing
+the whole listing, since a partial answer is the normal state of affairs on an org with
+private boards in it.
 
 The token is looked for in three places, in order: the `token` option, then `GITHUB_TOKEN`
 or `GH_TOKEN` in the environment, then the credential belonging to `gh auth login`. The

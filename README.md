@@ -1,8 +1,8 @@
 # MS-COMMS-TUI
 
-Browse Outlook mail, Microsoft Teams chats, your org chart, GitHub issues, Azure DevOps
-boards, RSS feeds and anything else you can write forty lines of script for — as folders and
-files, from the keyboard.
+Browse Outlook mail, Microsoft Teams chats, your org chart, GitHub issues, pull requests,
+discussions and project boards, Azure DevOps boards, RSS feeds and anything else you can
+write forty lines of script for — as folders and files, from the keyboard.
 
 ```
 /> cd /demo-mail/Inbox
@@ -262,7 +262,10 @@ Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Credentials never live in the config. GitHub takes an explicit `token`, then `GH_TOKEN` or
 `GITHUB_TOKEN`, and failing both it borrows the credential from `gh auth login` — so on a
-machine with the GitHub CLI signed in, the `token` line above is unnecessary.
+machine with the GitHub CLI signed in, the `token` line above is unnecessary. A repository
+gets `issues/`, `pulls/`, `discussions/` and `projects/`; the last two come from GitHub's
+GraphQL API, which has no anonymous access, so they are hidden rather than broken when
+there is no token.
 
 The Microsoft sources work the same way. If a Microsoft 365 MCP server is configured on the
 machine, they go through it and **you are never asked to sign in**, because the server
@@ -416,7 +419,7 @@ relevance ranking), cross-source search, cache, the local Turso snapshot with ba
 sync, predictive prefetching and vector search, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1395 tests.
+1607 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been
