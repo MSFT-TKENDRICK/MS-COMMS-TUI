@@ -261,7 +261,11 @@ export function describeSelection(state: TuiState): string {
   // The pane shows this as a bare `(3)` for want of columns; the sentence is where the
   // number gets told what it counts.
   if (node.kind === 'dir' && node.unreadCount !== undefined && node.unreadCount > 0) {
-    parts.push(`${String(node.unreadCount)} unread`);
+    parts.push(
+      node.unreadPartial === true
+        ? `at least ${String(node.unreadCount)} unread`
+        : `${String(node.unreadCount)} unread`,
+    );
   }
   if (node.author !== undefined && node.author !== '') parts.push(`from ${node.author}`);
   if (node.flags !== undefined && node.flags.length > 0) parts.push(node.flags.join(', '));

@@ -116,7 +116,14 @@ export interface CacheConfig {
    * Costs bandwidth on a guess, so it remains switchable for a metered connection.
    */
   readonly prefetch?: boolean;
-  /** Speculative fetches in flight at once. */
+  /**
+   * Speculative fetches in flight at once. Defaults to 1.
+   *
+   * This is less a throughput setting than a latency one: work already handed to a
+   * provider cannot be recalled, so on a transport that serialises requests — MCP, which
+   * is how the Graph mounts usually run — a foreground request waits behind everything
+   * in flight. The worst case is this number multiplied by the provider's round trip.
+   */
   readonly prefetchConcurrency?: number;
   /**
    * Record every provider fetch in an AgentFS `tool_calls` log. Off by default: it is a

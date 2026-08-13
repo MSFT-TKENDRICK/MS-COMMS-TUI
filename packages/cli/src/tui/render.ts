@@ -234,7 +234,11 @@ function unreadOf(node: VNode): number {
  */
 function unreadBadge(node: VNode): string {
   const count = unreadOf(node);
-  return count > 0 ? `(${String(count)})` : '';
+  if (count <= 0) return '';
+  // `+` means the engine could only see part of the folder — a mount root is warmed one
+  // page deep, so this is the common case, not the exotic one. `describeSelection` says
+  // "at least" in words for whoever is listening rather than looking.
+  return `(${String(count)}${node.unreadPartial === true ? '+' : ''})`;
 }
 
 function renderPreview(state: TuiState, width: number, body: number, options: RenderOptions): string[] {

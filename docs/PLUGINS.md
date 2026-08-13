@@ -88,10 +88,16 @@ here.
 
 Where you report nothing, the engine may fill a number in from directories it has *already*
 listed and cached, purely so a parent isn't blank while its children are visibly counted. It
-never fetches to do this, it stops a few levels down, and it stays silent rather than guess:
-a partially-paged directory yields no number at all, because a floor presented as a total is
-worse than no total. It also counts each `id` once however many folders lead to it, so a
-source whose tree is really a graph is not inflated by its own cross-references.
+never fetches to do this and it stops a few levels down. It also counts each `id` once
+however many folders lead to it, so a source whose tree is really a graph is not inflated by
+its own cross-references — which is worth knowing when you choose ids: an id that encodes the
+route taken to an item rather than the item itself will be counted once per route.
+
+When it has only seen part of a folder it reports a floor — `26+` — rather than a total, and
+sets `unreadPartial` on the node to say so. **That field is the engine's, not yours.** Do not
+set it; a count you report is taken as final and exact, and if it is really a floor the thing
+to do is leave `unreadCount` undefined and let the engine derive one, or report the number
+you are willing to stand behind.
 
 ### `unreadTotal()` — for the row standing for your whole mount
 
@@ -103,6 +109,15 @@ correct. For anything shaped like a graph it is not: in a people directory the s
 under `Org`, under `Recent`, under `Colleagues` and in the `Directory` they are defined in,
 and the totals of those sections overlap in a way nothing outside your provider can see. The
 demo org chart's six unread messages were being reported as thirty-three.
+
+The engine's per-`id` deduplication does not rescue this, and the reason is worth stating
+because it also tells you where to put your counts. It only dedupes over nodes it actually
+visits, and it stops descending the moment a node reports a count of its own — that count is
+final, so there is nothing below it left to inspect. Sections that each state a total are
+therefore summed as if they were disjoint. Report the count on the *person* instead, with an
+id that identifies the person rather than the path to them, and the engine descends, sees the
+same id four times and counts it once. Where the shape makes that impossible, `unreadTotal()`
+is the way out.
 
 ```ts
 unreadTotal(): number | undefined {

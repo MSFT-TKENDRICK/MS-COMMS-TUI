@@ -311,7 +311,7 @@ export const treeCommand: Command = {
         const label = `${sanitizeForDisplay(entry.name)}${entry.kind === 'dir' ? '/' : ''}`;
         const count =
           entry.unreadCount !== undefined && entry.unreadCount > 0
-            ? ` (${String(entry.unreadCount)} unread)`
+            ? ` (${String(entry.unreadCount)}${entry.unreadPartial === true ? '+' : ''} unread)`
             : '';
         // The path is printed in full in announce and plain modes, because indentation
         // conveys nothing at all through speech.

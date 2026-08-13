@@ -127,9 +127,16 @@ export interface PrefetchQueueOptions {
   /**
    * How many speculative fetches may be in flight.
    *
-   * Two, not eight. This shares a rate limit with the foreground, and the goal is to use
-   * the idle time between commands rather than to saturate the link — a burst of eight
-   * speculative requests is how a prefetcher turns into the reason `ls` got throttled.
+   * One, and the reason is latency rather than rate limits. Whatever is already in flight
+   * when the user asks for something cannot be recalled — an MCP request that has been
+   * written to the pipe is gone, and the transport behind `/mail`, `/teams` and `/people`
+   * serialises everything through a single one. So the foreground's worst case is exactly
+   * this number multiplied by however long the source takes to answer. At two, against a
+   * provider answering in 900ms, pressing Enter cost 2.5 seconds of which 1.6 was spent
+   * waiting for guesses; at one it is bounded by a single request.
+   *
+   * {@link PrefetchQueue.hold} covers everything not yet started. This covers the rest, and
+   * one is the floor: going lower would mean not speculating at all.
    */
   readonly concurrency?: number;
   readonly logger?: Logger;
@@ -171,10 +178,11 @@ export class PrefetchQueue {
   #canceled = 0;
   #disposed = false;
   #pumpScheduled = false;
+  #holds = 0;
   #idleWaiters: Array<() => void> = [];
 
   constructor(options: PrefetchQueueOptions = {}) {
-    this.#concurrency = Math.max(1, options.concurrency ?? 2);
+    this.#concurrency = Math.max(1, options.concurrency ?? 1);
     this.#maxQueued = Math.max(1, options.maxQueued ?? 64);
     this.#logger = options.logger ?? NULL_LOGGER;
   }
@@ -261,6 +269,40 @@ export class PrefetchQueue {
     return removed;
   }
 
+  /**
+   * Stop *starting* speculative work until the returned function is called.
+   *
+   * Priority orders this queue; it does not make the queue yield. That distinction was
+   * invisible until a real source put every request through one connection: a user pressing
+   * Enter would then wait behind whatever warm-up had already been handed to the transport,
+   * and navigation that needed 900ms took 2.6 seconds. Priority could not help, because the
+   * speculative work was no longer in this queue at all — it was in flight.
+   *
+   * So a foreground fetch takes a hold for as long as it is outstanding. What is already
+   * running still finishes, since a request that has been sent cannot be un-sent and its
+   * result is usually worth having, but nothing new joins the queue in front of the person
+   * waiting. This is what the comment in `Vfs` claiming warm "runs only when there is
+   * nothing a user is waiting for" always meant, and now describes.
+   *
+   * Reference-counted, because several foreground requests overlap routinely — a listing
+   * and the document preview beside it. The release is idempotent: leaking one would stall
+   * speculation for the rest of the session and hang `idle()`.
+   */
+  hold(): () => void {
+    this.#holds += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#holds -= 1;
+      if (this.#holds <= 0) {
+        this.#holds = 0;
+        this.#schedulePump();
+      }
+      this.#settleIfIdle();
+    };
+  }
+
   /** Resolves when nothing is queued or running. For tests and for orderly shutdown. */
   async idle(): Promise<void> {
     if (this.#queue.length === 0 && this.#running.size === 0) return;
@@ -273,6 +315,12 @@ export class PrefetchQueue {
   }
 
   #pump(): void {
+    // Held: somebody is waiting on a request of their own, and adding to the queue behind
+    // it would be spending their latency on a guess.
+    if (this.#holds > 0) {
+      this.#settleIfIdle();
+      return;
+    }
     while (this.#running.size < this.#concurrency && this.#queue.length > 0) {
       const entry = this.#queue.shift() as QueuedTask;
       const controller = new AbortController();

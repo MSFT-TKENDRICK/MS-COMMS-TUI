@@ -506,6 +506,19 @@ with what an arrow key does and every row after it is announced in two pieces. A
 version of this program floored the name column at twenty characters and let everything to
 the right of it run past the edge, which at 40 columns produced exactly that.
 
+A later version produced the same wrap from a subtler cause, and it is worth naming because
+the fix is counter-intuitive. Row widths are allocated from a table of how many columns each
+character occupies, and that table undercounted nine of the emoji that turn up most in
+corporate subject lines — `✅`, `❌`, `⚠️`, `🚀`, `🟢` among them — by one column each. A
+row containing two of them was built two columns too wide and *measured* two columns too
+narrow, so every check agreed it fitted while the terminal wrapped it. Undercounting is
+therefore the dangerous direction and overcounting is merely untidy: a character wrongly
+called wide leaves a blank column, one wrongly called narrow costs the row. Where the table
+is imprecise it now errs high on purpose. The reason it survived so long is that every
+fixture in the suite was pure ASCII — and so, at first, was every check written to catch it,
+which is why the width checks are now measured against a second, independently written ruler
+rather than against the table they are testing.
+
 **A blank means "not counted", not "nothing new".** Some sources have no read state to
 report at all — GitHub issues are the plain example — so their rows carry no counter, and the
 shell will not invent a `0` to fill the gap. This matters most to someone reading the column
@@ -513,6 +526,15 @@ aloud one row at a time, where a fabricated zero is indistinguishable from a rea
 would say "you have seen all of this" about a source that has never been able to tell.
 A count nobody reported and a count of zero are different claims, and neither prints
 anything, but only one of them is silence about a question that was never asked.
+
+**A count that is still arriving says so.** A mailbox is handed over a page at a time, so for
+the first moments — and on a large mount, for as long as the session lasts — the shell has
+seen part of a folder and not the rest. It reports what it knows as a floor rather than
+rounding it into a total: `ls` writes `26+ unread`, the pane writes `(26+)`, and the status
+line says "At least 26 unread." The alternative was to withhold the number until it could be
+exact, which sounds more honest and in practice meant a real mailbox, a real Teams roster and
+a real people directory showed no counter at all, for the whole session. "At least 26" is a
+fact; the silence was not more truthful, only less useful.
 
 **It leaves a trace.** On exit it restores the terminal, then prints the working directory to
 stdout and the selection to stderr. An alternate-screen session normally vanishes without a

@@ -118,6 +118,115 @@ async function counterOn(vfs: Vfs, dir: string, name: string): Promise<number | 
   return row.unreadCount;
 }
 
+/** Whether that counter is a floor — `26+` — rather than a total. */
+async function partialOn(vfs: Vfs, dir: string, name: string): Promise<boolean | undefined> {
+  const page = await vfs.list(dir);
+  const row = page.entries.find((entry) => entry.name === name);
+  assert.ok(row !== undefined, `no row called ${name} in ${dir}`);
+  return row.unreadPartial;
+}
+
+/**
+ * A mount root is handed over one page at a time and warmed exactly one page deep, so it
+ * keeps a cursor for the whole session. The first rule written here was that a directory
+ * with a cursor cannot be totalled — which is true, and which meant that on a real mailbox,
+ * a real Teams roster and a real people directory the counter never appeared at all. Not
+ * slowly: never, because nothing was ever going to make that root complete.
+ *
+ * A floor is the honest answer to a question that has no exact one yet. `26+` says what is
+ * known and admits what is not, and the row it decorates is the reason someone is looking
+ * at the screen. Withholding it to avoid implying precision traded a small ambiguity for
+ * total silence.
+ */
+describe('unread counters: a folder the source has not finished handing over', () => {
+  it('offers a floor rather than nothing at all', async () => {
+    const { vfs } = mount({
+      '': { dirs: ['Inbox'] },
+      Inbox: { paged: true, files: { 'a.md': true, 'b.md': true, 'c.md': false } },
+    });
+
+    await vfs.list('/src/Inbox');
+
+    assert.equal(await counterOn(vfs, '/src', 'Inbox'), 2, 'what is known so far');
+    assert.equal(await partialOn(vfs, '/src', 'Inbox'), true, 'and marked as a floor, not a total');
+  });
+
+  it('does not mark a folder it has seen all of', async () => {
+    const { vfs } = mount({
+      '': { dirs: ['Inbox'] },
+      Inbox: { files: { 'a.md': true, 'b.md': true } },
+    });
+
+    await vfs.list('/src/Inbox');
+
+    assert.equal(await counterOn(vfs, '/src', 'Inbox'), 2);
+    assert.notEqual(await partialOn(vfs, '/src', 'Inbox'), true, 'a complete folder states a total');
+  });
+
+  it('carries the floor up through a parent that is itself complete', async () => {
+    // The mount row is the one that matters, and it is usually a level above the paging.
+    const { vfs } = mount({
+      '': { dirs: ['Chats'] },
+      Chats: { dirs: ['Alice'] },
+      'Chats/Alice': { paged: true, files: { 'a.md': true } },
+    });
+
+    await vfs.list('/src/Chats');
+    await vfs.list('/src/Chats/Alice');
+
+    assert.equal(await counterOn(vfs, '/src', 'Chats'), 1);
+    assert.equal(await partialOn(vfs, '/src', 'Chats'), true, 'uncertainty below does not stop at the parent');
+  });
+
+  it('marks a total as a floor when a branch has not been looked at yet', async () => {
+    // Nothing is known about `Bob`, so the sum is missing whatever is in it. Reporting 2
+    // flat would be a wrong number; reporting `2+` is a true one.
+    const { vfs } = mount({
+      '': { dirs: ['Chats'] },
+      Chats: { dirs: ['Alice', 'Bob'] },
+      'Chats/Alice': { files: { 'a.md': true, 'b.md': true } },
+      'Chats/Bob': { files: { 'c.md': true } },
+    });
+
+    await vfs.list('/src/Chats');
+    await vfs.list('/src/Chats/Alice');
+
+    assert.equal(await counterOn(vfs, '/src', 'Chats'), 2);
+    assert.equal(await partialOn(vfs, '/src', 'Chats'), true);
+  });
+
+  it('settles to an exact number once the rest arrives', async () => {
+    const { vfs } = mount({
+      '': { dirs: ['Chats'] },
+      Chats: { dirs: ['Alice', 'Bob'] },
+      'Chats/Alice': { files: { 'a.md': true, 'b.md': true } },
+      'Chats/Bob': { files: { 'c.md': true } },
+    });
+
+    await vfs.list('/src/Chats');
+    await vfs.list('/src/Chats/Alice');
+    assert.equal(await partialOn(vfs, '/src', 'Chats'), true);
+
+    await vfs.list('/src/Chats/Bob');
+
+    assert.equal(await counterOn(vfs, '/src', 'Chats'), 3);
+    assert.notEqual(await partialOn(vfs, '/src', 'Chats'), true, 'the `+` goes away when it stops being true');
+  });
+
+  it('still says nothing when the source has no notion of read state', async () => {
+    // A floor of zero is not a floor, it is a claim that someone counted. GitHub issues have
+    // no read state at all, and an incomplete listing of them must stay silent.
+    const { vfs } = mount({
+      '': { dirs: ['Issues'] },
+      Issues: { paged: true, files: { 'one.md': false, 'two.md': false } },
+    });
+
+    await vfs.list('/src/Issues');
+
+    assert.equal(await counterOn(vfs, '/src', 'Issues'), undefined);
+  });
+});
+
 describe('unread counters: what the number on a folder means', () => {
   it('counts what is inside a folder, not just what is loose in it', async () => {
     // The shape that started this: a folder whose own children are all folders. Counting
@@ -234,8 +343,9 @@ describe('unread counters: what the number on a folder means', () => {
   });
 
   it('refuses to total a folder it has only seen part of', async () => {
-    // A half-paged directory can only yield a floor, and a number that silently means "at
-    // least" is worse than no number: it is indistinguishable from an exact one.
+    // The provider counted, so its number stands exactly as given — the walk stops rather
+    // than adding cached children to it. (A folder the *engine* has to total for itself, and
+    // has only part of, yields a marked floor instead; that is the group above.)
     const { vfs } = mount({
       '': { dirs: ['Huge'] },
       Huge: { unreadCount: 3, paged: true, dirs: ['Sub'] },

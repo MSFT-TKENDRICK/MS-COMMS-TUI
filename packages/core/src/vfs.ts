@@ -267,6 +267,23 @@ const UNREAD_ROLLUP_DEPTH = 4;
  */
 const MAX_UNREAD_MEMORY = 1024;
 
+/**
+ * What a walk of the cache found beneath a directory.
+ *
+ * `exact` is the whole point: a mount root is warmed one page deep, so most real answers
+ * are floors, and a floor presented as a total is a number the user cannot act on.
+ */
+interface UnreadTally {
+  readonly total: number;
+  readonly exact: boolean;
+}
+
+/** What a directory already visited by this walk contributed, so a second route repeats it. */
+interface UnreadSeen {
+  readonly counted: boolean;
+  readonly exact: boolean;
+}
+
 export class Vfs {
   readonly #mounts = new Map<string, Mount>();
   readonly #dirCache: TtlCache<DirectoryIndex>;
@@ -832,6 +849,30 @@ export class Vfs {
     target: VfsTarget,
     options: ListOptions & { refresh?: boolean; speculative?: boolean } = {},
   ): Promise<VfsListResult> {
+    const release = this.#holdSpeculation(options.speculative === true);
+    try {
+      return await this.#listNow(target, options);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Keep speculation out of the way for as long as a real request is outstanding.
+   *
+   * Returns a no-op for speculative callers: prefetch tasks run *inside* the queue, so
+   * holding it from there would stop the queue starting anything else until the current
+   * task finished, quietly reducing it to one at a time.
+   */
+  #holdSpeculation(speculative: boolean): () => void {
+    if (speculative) return () => undefined;
+    return this.#prefetchQueue?.hold() ?? ((): void => undefined);
+  }
+
+  async #listNow(
+    target: VfsTarget,
+    options: ListOptions & { refresh?: boolean; speculative?: boolean } = {},
+  ): Promise<VfsListResult> {
     const { mount, node, synthetic, path: normalized } = await this.#locate(target, options);
 
     if (mount === undefined && synthetic) {
@@ -952,8 +993,9 @@ export class Vfs {
       // bet: it is the one thing that puts an unread counter on a mount the user has not
       // opened yet, and those rows — the root listing — are the first thing anyone sees.
       // Dropping it here is why `ls /` came up blank however long the session had been
-      // running. Keeping it costs nothing in contention: warm is the worst-ranked work in
-      // the queue, so it still runs only when there is nothing a user is waiting for.
+      // running. Keeping it costs nothing in contention, now that a foreground request
+      // holds the queue for as long as it is outstanding: warm is the worst-ranked work
+      // there is, and it no longer gets to start while somebody is waiting.
       queue.cancel({ minPriority: PREFETCH_PRIORITY.document, keep: (task) => task.key.startsWith('warm:') });
       this.#persistNavigation();
     }
@@ -971,7 +1013,7 @@ export class Vfs {
         run: async (signal) => {
           const pageSize = this.#prefetchOptions.pageSize ?? 25;
           if (target.kind === 'document') {
-            await this.read(target.path, { signal });
+            await this.read(target.path, { signal, speculative: true });
             return;
           }
           await this.list(target.path, {
@@ -1009,7 +1051,16 @@ export class Vfs {
   // Reading
   // -------------------------------------------------------------------------
 
-  async read(target: VfsTarget, options: ReadOptions = {}): Promise<Document> {
+  async read(target: VfsTarget, options: ReadOptions & { speculative?: boolean } = {}): Promise<Document> {
+    const release = this.#holdSpeculation(options.speculative === true);
+    try {
+      return await this.#readNow(target, options);
+    } finally {
+      release();
+    }
+  }
+
+  async #readNow(target: VfsTarget, options: ReadOptions = {}): Promise<Document> {
     const { mount, node, path: normalized } = await this.#locate(target, options);
     const cached = this.#docCache.get(normalized);
     if (cached !== undefined) return cached;
@@ -1540,6 +1591,14 @@ export class Vfs {
    * `undefined`. Zero is a different claim — it says someone counted and found nothing — and
    * a source with no notion of read state at all, like GitHub issues, must not be made to
    * appear to have made it.
+   *
+   * **A floor is offered as a floor.** What the cache holds is often part of the story: a
+   * mount root is warmed one page deep, and a mailbox with more folders than fit in a page
+   * comes back with a cursor. Refusing to count until every page has landed sounds careful
+   * and is in fact the worst of the three options, because the wait has no end — nothing
+   * ever fetches the rest, so `/mail`, `/teams` and `/people` simply had no counter, for the
+   * whole session, which is the complaint this feature exists to answer. Counting what is
+   * there and marking it `unreadPartial` says the true thing instead: at least this many.
    */
   #withRolledUpUnread(entries: readonly VNode[]): readonly VNode[] {
     let changed = false;
@@ -1547,10 +1606,17 @@ export class Vfs {
       if (entry.kind !== 'dir') return entry;
       const path = entry.path;
       if (path === undefined) return entry;
-      const total = this.#unreadBeneath(path, entry.unreadCount, 0, new Map());
-      if (total === undefined || total === entry.unreadCount) return entry;
+      const found = this.#unreadBeneath(path, entry.unreadCount, 0, new Map());
+      if (found === undefined) return entry;
+      if (found.total === entry.unreadCount && found.exact === (entry.unreadPartial !== true)) {
+        return entry;
+      }
       changed = true;
-      return { ...entry, unreadCount: total };
+      return {
+        ...entry,
+        unreadCount: found.total,
+        ...(found.exact ? {} : { unreadPartial: true }),
+      };
     });
     return changed ? filled : entries;
   }
@@ -1575,30 +1641,38 @@ export class Vfs {
    * visited, because the second occurrence still has to distinguish "already counted" from
    * "nobody down there counts": a source with no read state must stay silent even when it
    * appears twice.
+   *
+   * `exact` is false when anything was left out — a directory still holding a cursor, or a
+   * subtree deeper than the depth cap. The caller turns that into `26+` rather than `26`,
+   * because "at least twenty-six" is a fact and "twenty-six" would not be.
    */
   #unreadBeneath(
     path: string,
     own: number | undefined,
     depth: number,
-    seen: Map<string, boolean>,
-  ): number | undefined {
+    seen: Map<string, UnreadSeen>,
+  ): UnreadTally | undefined {
     // The source counted. Whatever it said stands, and the walk stops here — this is what
     // keeps a number from drifting upward as the cache below it fills in.
-    if (own !== undefined) return own;
+    if (own !== undefined) return { total: own, exact: true };
+    // Deeper than this cannot be reached in one glance anyway, and the part left out is
+    // exactly what `exact: false` is for.
     if (depth >= UNREAD_ROLLUP_DEPTH) return undefined;
 
     // Stale is deliberately good enough. This is a decoration on a row, and the whole tool
     // already prefers a slightly old answer to a spinner.
     const index = this.#dirCache.get(path) ?? this.#dirCache.getStale(path)?.value;
-    // A half-paged directory can only produce a floor, and a number that silently means "at
-    // least" is worse than no number at all: nothing distinguishes it from an exact one.
-    if (index === undefined || !index.complete) return undefined;
+    if (index === undefined) return undefined;
 
     let total = 0;
     // Whether anything down here gave a basis for a number at all. A folder from a source
     // with no notion of read state — GitHub issues, a channel's threads — must stay silent
     // rather than report `0`, which would claim someone counted and found nothing.
     let counted = false;
+    // A directory the provider has not finished handing over can only produce a floor. It
+    // is still worth having: a mount root is warmed exactly one page deep, so insisting on
+    // completeness left every real mailbox with no counter at all rather than a cautious one.
+    let exact = index.complete;
     for (const name of index.order) {
       const child = index.byName.get(name);
       if (child === undefined) continue;
@@ -1609,15 +1683,26 @@ export class Vfs {
         if (already !== undefined) {
           // Reached a second way. Its total is already in `total`; all that is left to
           // carry over is whether it constituted an answer at all.
-          if (already) counted = true;
+          if (already.counted) counted = true;
+          if (!already.exact) exact = false;
           continue;
         }
-        const below = this.#unreadBeneath(child.path ?? vpath.join(path, name), child.unreadCount, depth + 1, seen);
-        seen.set(child.id, below !== undefined);
-        if (below !== undefined) {
-          total += below;
-          counted = true;
+        const below = this.#unreadBeneath(
+          child.path ?? vpath.join(path, name),
+          child.unreadCount,
+          depth + 1,
+          seen,
+        );
+        seen.set(child.id, { counted: below !== undefined, exact: below?.exact ?? false });
+        if (below === undefined) {
+          // Nothing known about this branch at all, so whatever is in it is missing from
+          // the sum. Saying so is the difference between a floor and a wrong number.
+          exact = false;
+          continue;
         }
+        total += below.total;
+        counted = true;
+        if (!below.exact) exact = false;
       } else if (child.flags?.includes('unread') === true) {
         // Only unread files are remembered. A read one contributes nothing by either route,
         // so recording it would cost memory to answer a question nobody asks.
@@ -1625,13 +1710,13 @@ export class Vfs {
           counted = true;
           continue;
         }
-        seen.set(child.id, true);
+        seen.set(child.id, { counted: true, exact: true });
         total += 1;
         counted = true;
       }
     }
 
-    return counted ? total : undefined;
+    return counted ? { total, exact } : undefined;
   }
 
   /**
@@ -2360,7 +2445,9 @@ function encodeOffsetCursor(offset: number): string {
  * somebody is reading in order to say nothing.
  */
 function unreadVector(entries: readonly VNode[]): string {
-  return entries.map((entry) => `${entry.name}\u0000${entry.unreadCount ?? ''}`).join('\u0001');
+  return entries
+    .map((entry) => `${entry.name}\u0000${entry.unreadCount ?? ''}${entry.unreadPartial === true ? '+' : ''}`)
+    .join('\u0001');
 }
 
 /**
@@ -2386,8 +2473,10 @@ function listingFingerprint(entries: readonly VNode[]): string {
         (entry.flags ?? []).join(','),
         // A folder whose counter moved has changed as far as anyone reading the list is
         // concerned, even though every other field is identical. Leaving this out meant a
-        // corrected count was computed, compared, found "unchanged" and dropped.
+        // corrected count was computed, compared, found "unchanged" and dropped. The floor
+        // marker counts too: `26+` settling to `26` is the row becoming trustworthy.
         entry.unreadCount ?? '',
+        entry.unreadPartial === true ? '+' : '',
       ].join('\u0000'),
     )
     .join('\u0001');

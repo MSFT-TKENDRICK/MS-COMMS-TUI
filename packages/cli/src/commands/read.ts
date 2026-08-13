@@ -106,7 +106,14 @@ export const statCommand: Command = {
     if (node.size !== undefined) pairs.push(['Size', formatBytes(node.size)]);
     if ((node.flags ?? []).length > 0) pairs.push(['Flags', (node.flags ?? []).join(', ')]);
     if (node.childCount !== undefined) pairs.push(['Items', String(node.childCount)]);
-    if (node.unreadCount !== undefined) pairs.push(['Unread', String(node.unreadCount)]);
+    if (node.unreadCount !== undefined) {
+      pairs.push([
+        'Unread',
+        node.unreadPartial === true
+          ? `${String(node.unreadCount)} or more (only part of this folder has been read from the source)`
+          : String(node.unreadCount),
+      ]);
+    }
     if (node.summary !== undefined) pairs.push(['Summary', node.summary]);
 
     for (const [key, value] of Object.entries(node.meta ?? {})) {

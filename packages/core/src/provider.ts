@@ -117,6 +117,15 @@ export interface VNode {
   readonly childCount?: number;
   /** Number of unread children, when the backend reports it cheaply. */
   readonly unreadCount?: number;
+  /**
+   * Set by the engine, never by a provider: `unreadCount` is a floor rather than a total.
+   *
+   * The engine derives a count for a directory whose provider gave none by walking what the
+   * cache holds, and what it holds is frequently part of the story — a mount root is warmed
+   * a single page deep. The row then reads `26+`. A provider that knows its own number
+   * states it in `unreadCount` and leaves this alone.
+   */
+  readonly unreadPartial?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -167,17 +167,29 @@ from directories already listed and cached, so a parent is not blank while its c
 visibly counted. That derivation never fetches — it runs with a user waiting on a listing,
 and turning one `ls` of eight mounts into eight round trips for a decoration is not a trade
 worth making — and it is bounded to a few levels because the people graph is genuinely
-cyclic. It also refuses to guess: a partially-paged directory contributes nothing, since a
-floor presented as a total is worse than no total.
+cyclic.
+
+Where it has only seen part of a folder, it offers a floor rather than a total: `26+`, not
+`26`. The first rule written here was the opposite — a partly-paged directory contributed
+nothing, on the grounds that a floor presented as a total is worse than no total. That
+reasoning was right about the risk and wrong about the remedy, and the cost was severe. A
+mount root is handed over one page at a time and warmed one page deep, so on a real mailbox,
+a real Teams roster and a real people directory the root keeps a cursor for the entire
+session; under the old rule those rows were never going to show a number. Not slowly —
+never. Marking the floor keeps the honesty and drops the silence: `26+` says what is known
+and admits what is not. `unreadPartial` on the node carries it, the engine sets it and
+providers do not, and it clears itself when the rest of the listing arrives.
 
 Silence is preserved throughout. `undefined` means "nobody could count", `0` means "somebody
 counted and found nothing", and the engine will not convert the first into the second.
 GitHub is the case that forces this: its API has no notion of whether you have seen an issue,
-so those rows wear no counter rather than claiming everything is read.
+so those rows wear no counter rather than claiming everything is read. A floor of zero is not
+a floor either — an incomplete listing of a source with no read state stays silent.
 
 For the counter to be there on the *first* listing, the derivation needs warm prefetch work
 to survive navigation, which it now does — warm tasks are the lowest-ranked work in the
-queue, so keeping them costs nothing in contention.
+queue, and a foreground request holds the queue for as long as it is outstanding, so keeping
+them costs nothing in contention.
 
 That still leaves a window, and it is the one the user is actually in. The synthetic root
 paints instantly; the sources behind it have not answered yet; a count derived from an empty
@@ -289,6 +301,27 @@ Invalidation cancels in-flight work, so a refresh cannot be undone from behind b
 that started before it. And the model learns only from unfiltered navigation: a filtered
 `ls` is someone interrogating a folder, not moving to it, and counting it would poison the
 model with places nobody went.
+
+A fourth rule was missing, and it was the one people actually felt. Priority orders the
+queue; it does not make the queue get out of the way. Once a speculative fetch has been
+handed to a transport that serialises everything down a single pipe — which is what MCP is,
+and what `/mail`, `/teams` and `/people` all run over — the user's own request queues behind
+it, priority no longer applies because the work has already left, and cancelling does not
+help because a request that has been sent cannot be unsent. Navigating into a folder took
+2.6 seconds against a provider that answers in 0.9.
+
+So speculation yields twice. Every non-speculative `list` and `read` takes a
+`PrefetchQueue.hold()` for as long as it is outstanding, which stops anything new from
+starting; and speculation runs one request at a time, which bounds what can already be in
+flight. That second number is not a tuning constant — it *is* the foreground's worst-case
+wait, measured in whole provider round trips, and at two it was putting 1.6 seconds of
+guesswork in front of a keypress. Together they take the same navigation to 1.65 seconds, of
+which 0.9 is the request the user actually asked for. On a serialised transport that is the
+floor.
+
+Holds are reference-counted and speculative callers do not take one — a prefetch task runs
+*inside* the queue, so a hold taken from there would stop the queue from starting anything
+else until that task finished, quietly reducing concurrency to nothing.
 
 ### AgentFS, and why the gap was the driver
 
@@ -491,11 +524,16 @@ tree. Here the same person is under `Org`, `Recent`, `Colleagues` and the `Direc
 are defined in, and the demo org chart's six unread messages were being reported as
 thirty-three on the row standing for the whole mount. Inside a subtree the engine can fix
 this itself, and does: the walk in `#unreadBeneath` counts each `id` once however many routes
-reach it. Between the top-level sections it cannot — each has handed over an opaque total and
-nothing in it says which of them overlap — so `Provider.unreadTotal()` exists for a source to
-state its own, and the engine takes it in preference to its own arithmetic. Providers that do
-not implement it keep the derived number, which is every provider until one has a reason not
-to.
+reach it. There is a condition on that, and it is a condition on the provider rather than the
+engine: the walk stops at any node that states a count of its own, because that count is
+final, so it only dedupes over nodes it actually reaches. Sections that each state a total
+are summed as if disjoint. Putting the count on the person, under an id naming the person
+rather than the route to them, is what makes the walk work — which is what `graph-people`
+does. Between the top-level sections the engine cannot fix it at all — each has handed over
+an opaque total and nothing in it says which of them overlap — so `Provider.unreadTotal()`
+exists for a source to state its own, and the engine takes it in preference to its own
+arithmetic. Providers that do not implement it keep the derived number, which is every
+provider until one has a reason not to.
 
 ## Two ways into Microsoft 365
 

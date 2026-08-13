@@ -135,6 +135,16 @@ async function harness(
      * number appears have to model the second kind or they test nothing.
      */
     readonly cannotTotal?: boolean;
+    /**
+     * Hand the mount root over one page at a time, which is what a real mailbox does and
+     * what the fixture, sized to fit in a single page, never did.
+     *
+     * This is the shape that produced no counters at all on a live tenant: warm fetches one
+     * page of the root and stops, so the root index keeps a cursor for the whole session and
+     * a rule of "only count a directory once it is complete" never fires. A test that pages
+     * is the only kind that can tell the difference.
+     */
+    readonly pageSize?: number;
   } = {},
 ): Promise<Harness> {
   const registry = new PluginRegistry(NULL_LOGGER);
@@ -150,7 +160,12 @@ async function harness(
               id: 'mail',
               path: '/mail',
               type: 'memory',
-              options: { items: options.items ?? TREE, displayName: 'Test mail', now: () => NOW },
+              options: {
+                items: options.items ?? TREE,
+                displayName: 'Test mail',
+                now: () => NOW,
+                ...(options.pageSize === undefined ? {} : { pageSize: options.pageSize }),
+              },
             },
             ...(options.second === undefined
               ? []
@@ -1011,6 +1026,45 @@ describe('tui app: the counter that arrives after the first frame', () => {
     await waitFor(h, (frame) => frame.includes('mail/') && frame.includes('chat/'), 'both sources listed');
     open();
     await waitFor(h, (frame) => /mail\/\s*\(3\)/.test(frame), 'the count');
+    await h.send('q');
+    await h.done;
+  });
+
+  /**
+   * The shape that had no counter at all on a live tenant.
+   *
+   * A real mailbox, a real Teams roster and a real people directory hold far more than one
+   * screen, and warm fetches a bounded prefix of each. The engine's rule was that a
+   * directory still holding a cursor could not be totalled, so those roots were never going
+   * to produce a number — not late, never.
+   *
+   * Note what it takes to reproduce: a fixture bigger than the prefix that gets fetched. A
+   * small one is drained on the first listing and comes back complete, which is why every
+   * fixture in this file — all of them a couple of items wide — said nothing about it.
+   */
+  it('puts a floor on a root the source is still handing over, without a keypress', async () => {
+    const wide: readonly MemoryItem[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `f${String(i)}`,
+      title: `Folder ${String(i).padStart(2, '0')}`,
+      subtype: 'folder',
+      children: [
+        { id: `f${String(i)}-m`, title: 'a message', agoMinutes: i + 1, body: 'ping', flags: ['unread'] },
+      ],
+    }));
+
+    const h = await harness({ items: wide, second: NESTED, cannotTotal: true, pageSize: 5 });
+
+    await waitFor(
+      h,
+      (frame) => /mail\/\s*\(\d+\+\)/.test(frame),
+      'a floor on a root that still has a cursor',
+    );
+
+    // The floor has to be a floor, not the whole truth dressed up as one.
+    const shown = /mail\/\s*\((\d+)\+\)/.exec(h.frame())?.[1];
+    assert.ok(shown !== undefined && Number(shown) > 0, `expected a positive floor, got ${String(shown)}`);
+    assert.ok(Number(shown) < 60, `a floor of ${String(shown)} is the whole total, so nothing was left out`);
+
     await h.send('q');
     await h.done;
   });

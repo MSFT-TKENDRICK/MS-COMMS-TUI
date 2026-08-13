@@ -78,21 +78,127 @@ export function paint(text: string, color: ColorName, enabled = true): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Display width, counting East Asian wide characters as two columns and combining marks
- * as zero. Without this, a listing containing CJK subjects or emoji misaligns, and the
- * misalignment is far worse than no alignment at all.
+ * Display width, counting East Asian wide characters and emoji as two columns and
+ * combining marks as zero. Without this, a listing containing CJK subjects or emoji
+ * misaligns, and the misalignment is far worse than no alignment at all.
+ *
+ * Undercounting is the dangerous direction, and it is not a cosmetic bug. Every column
+ * this returns is a column the layout hands out; report a subject as narrower than it
+ * really is and the row runs past the right edge, the terminal wraps it, one listing row
+ * becomes two, and the list a screen reader is stepping through no longer agrees with the
+ * arrow keys. An earlier table knew about CJK and about two emoji blocks and missed the
+ * rest — including `✅`, `❌`, `⚠`, `🚀` and `🟢`, which is to say most of what actually
+ * turns up in a corporate subject line. Sample data is pure ASCII, so nothing caught it.
  */
 export function displayWidth(text: string): number {
   let width = 0;
-  for (const char of text) {
-    const code = char.codePointAt(0) ?? 0;
-    if (code === 0x200d || (code >= 0xfe00 && code <= 0xfe0f)) continue;
-    if (code >= 0x0300 && code <= 0x036f) continue;
-    width += isWide(code) ? 2 : 1;
-  }
+  for (const cluster of clusters(text)) width += cluster.width;
   return width;
 }
 
+/**
+ * Walk the string in units that are drawn as a single glyph, reporting the columns each
+ * one occupies.
+ *
+ * Measuring and truncating both go through here, and that is the point: they used to be
+ * separate loops, one over the whole string and one code point at a time, and they
+ * disagreed. `displayWidth('⚠️')` counted the warning sign and then added nothing for the
+ * variation selector that follows it, while the truncation loop asked for the width of
+ * each code point on its own and got 1 + 0. Any pair of loops like that drifts apart at
+ * exactly the characters that matter.
+ *
+ * A variation selector is the interesting case. U+26A0 on its own is a narrow text symbol;
+ * followed by U+FE0F it is an emoji, and a terminal draws it in two columns. The
+ * difference is invisible in a subject line and worth a wrapped row.
+ */
+function* clusters(text: string): Generator<{ text: string; width: number }> {
+  let current = '';
+  let width = 0;
+  let joining = false;
+  let base = -1;
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    const zero = isZeroWidth(code);
+    if (current !== '' && !zero && !joining) {
+      yield { text: current, width };
+      current = '';
+      width = 0;
+    }
+    current += char;
+    if (code === 0x200d) {
+      // A joiner promises another codepoint belonging to the same glyph.
+      joining = true;
+      continue;
+    }
+    joining = false;
+    if (code === 0xfe0f) {
+      if (width === 1 && hasEmojiPresentation(base)) width = 2;
+      continue;
+    }
+    if (zero) continue;
+    base = code;
+    width += isWide(code) ? 2 : 1;
+  }
+  if (current !== '') yield { text: current, width };
+}
+
+/**
+ * Whether U+FE0F after this codepoint means anything.
+ *
+ * Only the symbol blocks have both a text and an emoji form, and only those get widened.
+ * The selector is meaningless after a letter — `a\uFE0F` is one column, not two — so the
+ * promotion has to be restricted rather than applied to whatever came last.
+ */
+function hasEmojiPresentation(code: number): boolean {
+  return (
+    code === 0x00a9 ||
+    code === 0x00ae ||
+    code === 0x203c ||
+    code === 0x2049 ||
+    code === 0x2122 ||
+    code === 0x2139 ||
+    (code >= 0x2190 && code <= 0x21ff) ||
+    (code >= 0x2300 && code <= 0x23ff) ||
+    code === 0x24c2 ||
+    (code >= 0x25aa && code <= 0x25ff) ||
+    (code >= 0x2600 && code <= 0x27bf) ||
+    (code >= 0x2900 && code <= 0x297f) ||
+    (code >= 0x2b00 && code <= 0x2bff) ||
+    code === 0x3030 ||
+    code === 0x303d ||
+    code === 0x3297 ||
+    code === 0x3299
+  );
+}
+
+/**
+ * Characters that take no room of their own because they modify the one before them.
+ *
+ * Getting these wrong is the *other* direction, and it costs a gap rather than a wrapped
+ * row, so the list is deliberately the common cases rather than the whole Unicode
+ * combining-mark database: a full table is the sort of thing one takes a dependency for,
+ * and this program does not take dependencies.
+ */
+function isZeroWidth(code: number): boolean {
+  return (
+    code === 0x200d || // zero-width joiner, holding an emoji sequence together
+    (code >= 0xfe00 && code <= 0xfe0f) || // variation selectors, incl. the emoji one
+    (code >= 0x0300 && code <= 0x036f) || // combining diacritics
+    (code >= 0x1ab0 && code <= 0x1aff) ||
+    (code >= 0x20d0 && code <= 0x20ff) ||
+    (code >= 0x1f3fb && code <= 0x1f3ff) // skin-tone modifiers, part of the glyph before
+  );
+}
+
+/**
+ * Two columns wide: East Asian Wide and Fullwidth, plus the codepoints that terminals
+ * render as emoji at double width.
+ *
+ * The emoji ranges are the ones with Emoji_Presentation, which is what a terminal keys
+ * off. The scattered singletons in the 0x2000 block are there because that is where the
+ * everyday ones live — a tick, a cross, a warning sign — and they are wide despite sitting
+ * among narrow symbols.
+ */
 function isWide(code: number): boolean {
   return (
     (code >= 0x1100 && code <= 0x115f) ||
@@ -102,9 +208,67 @@ function isWide(code: number): boolean {
     (code >= 0xfe30 && code <= 0xfe6f) ||
     (code >= 0xff00 && code <= 0xff60) ||
     (code >= 0xffe0 && code <= 0xffe6) ||
-    (code >= 0x1f300 && code <= 0x1f64f) ||
-    (code >= 0x1f900 && code <= 0x1f9ff) ||
+    isWideSymbol(code) ||
+    isWideEmoji(code) ||
     (code >= 0x20000 && code <= 0x3fffd)
+  );
+}
+
+/**
+ * The emoji planes, minus the parts of them terminals draw narrow.
+ *
+ * The blocks below 0x1f300 are mostly playing cards and mahjong tiles, which are narrow
+ * apart from a couple of famous exceptions, so they are listed rather than swept up. Where
+ * this is imprecise it errs high — a codepoint wrongly called wide leaves a blank column,
+ * which is untidy, while one wrongly called narrow wraps the row, which is the bug.
+ */
+function isWideEmoji(code: number): boolean {
+  return (
+    code === 0x1f004 ||
+    code === 0x1f0cf ||
+    code === 0x1f18e ||
+    (code >= 0x1f191 && code <= 0x1f19a) ||
+    (code >= 0x1f1e6 && code <= 0x1f1ff) || // regional indicators: flags
+    (code >= 0x1f200 && code <= 0x1f251) || // enclosed CJK
+    (code >= 0x1f300 && code <= 0x1faff) || // the emoji proper, through the newest blocks
+    (code >= 0x1fc00 && code <= 0x1fffd)
+  );
+}
+
+function isWideSymbol(code: number): boolean {
+  return (
+    (code >= 0x231a && code <= 0x231b) || // ⌚⌛
+    (code >= 0x23e9 && code <= 0x23ec) ||
+    code === 0x23f0 ||
+    code === 0x23f3 ||
+    (code >= 0x25fd && code <= 0x25fe) ||
+    (code >= 0x2614 && code <= 0x2615) ||
+    (code >= 0x2648 && code <= 0x2653) ||
+    code === 0x267f ||
+    code === 0x2693 ||
+    code === 0x26a1 || // ⚡
+    (code >= 0x26aa && code <= 0x26ab) ||
+    (code >= 0x26bd && code <= 0x26be) ||
+    (code >= 0x26c4 && code <= 0x26c5) ||
+    code === 0x26ce ||
+    code === 0x26d4 ||
+    code === 0x26ea ||
+    (code >= 0x26f2 && code <= 0x26f3) ||
+    code === 0x26f5 ||
+    code === 0x26fa ||
+    code === 0x26fd ||
+    code === 0x2705 || // ✅
+    (code >= 0x270a && code <= 0x270b) ||
+    code === 0x2728 || // ✨
+    (code >= 0x274c && code <= 0x274e) || // ❌
+    (code >= 0x2753 && code <= 0x2755) ||
+    code === 0x2757 ||
+    (code >= 0x2795 && code <= 0x2797) ||
+    code === 0x27b0 ||
+    code === 0x27bf ||
+    (code >= 0x2b1b && code <= 0x2b1c) ||
+    code === 0x2b50 || // ⭐
+    code === 0x2b55
   );
 }
 
@@ -118,11 +282,10 @@ export function truncateWidth(text: string, max: number): string {
   if (displayWidth(text) <= max) return text;
   let out = '';
   let width = 0;
-  for (const char of text) {
-    const charWidth = displayWidth(char);
-    if (width + charWidth > max - 1) break;
-    out += char;
-    width += charWidth;
+  for (const cluster of clusters(text)) {
+    if (width + cluster.width > max - 1) break;
+    out += cluster.text;
+    width += cluster.width;
   }
   return `${out}…`;
 }
@@ -276,7 +439,12 @@ function announceNode(node: VNode, index: number, options: ListingOptions): stri
   if (when !== '') parts.push(`${when.charAt(0).toUpperCase()}${when.slice(1)}.`);
 
   if (node.kind === 'dir' && node.unreadCount !== undefined && node.unreadCount > 0) {
-    parts.push(`${String(node.unreadCount)} unread.`);
+    // Spoken, "at least" beats a `+` a screen reader would either skip or read as "plus".
+    parts.push(
+      node.unreadPartial === true
+        ? `At least ${String(node.unreadCount)} unread.`
+        : `${String(node.unreadCount)} unread.`,
+    );
   } else if (node.kind === 'dir' && node.childCount !== undefined) {
     parts.push(`${String(node.childCount)} items.`);
   }
@@ -305,6 +473,7 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
       marker,
       name,
       count,
+      partial: unreadIsPartial(node),
       when: formatDate(node.mtime, options.dateStyle),
       who: sanitizeForDisplay(node.author ?? ''),
       extra: options.long === true ? extraColumn(node) : '',
@@ -314,8 +483,11 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
   });
 
   const indexWidth = Math.max(...rows.map((row) => row.index.length));
-  const naturalBadge = Math.max(0, ...rows.map((row) => displayWidth(unreadBadge(row.count))));
-  const compactBadgeWidth = Math.max(0, ...rows.map((row) => displayWidth(compactUnreadBadge(row.count))));
+  const naturalBadge = Math.max(0, ...rows.map((row) => displayWidth(unreadBadge(row.count, row.partial))));
+  const compactBadgeWidth = Math.max(
+    0,
+    ...rows.map((row) => displayWidth(compactUnreadBadge(row.count, row.partial))),
+  );
 
   // Every column but the name has a width it wants; the name takes what is left. When what
   // is left is not enough, columns are given up in order of what a narrow terminal can most
@@ -366,7 +538,9 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
         : name;
       const pieces = [row.index.padStart(indexWidth), row.marker, painted];
       if (badgeWidth > 0) {
-        const badge = compact ? compactUnreadBadge(row.count) : unreadBadge(row.count);
+        const badge = compact
+          ? compactUnreadBadge(row.count, row.partial)
+          : unreadBadge(row.count, row.partial);
         // Right-aligned within its own column: it is a number, so the digits line up by
         // magnitude, and padding on the left keeps `unread` in a column of its own instead
         // of stepping sideways one place with every extra digit.
@@ -390,6 +564,11 @@ function unreadOf(node: VNode): number {
   return node.kind === 'dir' ? (node.unreadCount ?? 0) : 0;
 }
 
+/** Whether that number is a floor rather than a total. Only the engine ever sets this. */
+function unreadIsPartial(node: VNode): boolean {
+  return node.kind === 'dir' && node.unreadPartial === true && unreadOf(node) > 0;
+}
+
 /**
  * The unread counter a directory carries into a listing.
  *
@@ -398,9 +577,15 @@ function unreadOf(node: VNode): number {
  * it is. It gets a column of its own rather than a suffix on the name for the same
  * reason the date does: appended to the name, the one row where the name is long is
  * exactly the row where the count is truncated away.
+ *
+ * `26+ unread` is the honest form for a count derived from a directory the source has not
+ * finished handing over. It reads correctly aloud — "twenty-six plus unread" — and it is
+ * the difference between a number the user can act on and one that quietly means something
+ * else than it says.
  */
-function unreadBadge(count: number): string {
-  return count > 0 ? `${String(count)} unread` : '';
+function unreadBadge(count: number, partial = false): string {
+  if (count <= 0) return '';
+  return `${String(count)}${partial ? '+' : ''} unread`;
 }
 
 /**
@@ -411,8 +596,9 @@ function unreadBadge(count: number): string {
  * deal more use than nothing. This is the form the TUI pane uses at every width, for the
  * same reason, so it is not a new vocabulary either.
  */
-function compactUnreadBadge(count: number): string {
-  return count > 0 ? `(${String(count)})` : '';
+function compactUnreadBadge(count: number, partial = false): string {
+  if (count <= 0) return '';
+  return `(${String(count)}${partial ? '+' : ''})`;
 }
 
 function extraColumn(node: VNode): string {
