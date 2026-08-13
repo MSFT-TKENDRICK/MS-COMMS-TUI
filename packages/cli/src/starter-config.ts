@@ -89,16 +89,21 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
     //   },
     // },
 
-    // --- GitHub issues and pull requests --------------------------------------
+    // --- GitHub issues, pull requests, discussions and projects ---------------
     // Uses GH_TOKEN or GITHUB_TOKEN if either is set, and otherwise borrows the
     // credential from \`gh auth login\`. Without any of the three it still works on
-    // public repositories, just at 60 requests an hour.
+    // public repositories, just at 60 requests an hour — though discussions and
+    // project boards need a token either way, because GitHub's GraphQL API has no
+    // anonymous access at all. Boards additionally need the \`read:project\` scope.
     //
     // {
     //   "path": "/github",
     //   "type": "github",
     //   "options": {
     //     "repos": ["octocat/hello-world"],
+    //     // Boards that span repositories belong to the org, not to any one repo,
+    //     // so an owner can be listed on its own to reach them.
+    //     // "owners": ["octocat"],
     //     // Or, instead of repos, your notification inbox — everything across
     //     // every repository that is actually waiting on you. Needs a token.
     //     // "includeNotifications": true,
