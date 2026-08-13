@@ -101,6 +101,7 @@ export const statCommand: Command = {
       ['Id', node.id],
     ];
     if (node.mtime !== undefined) pairs.push(['Date', node.mtime.toISOString()]);
+    if (node.unavailable !== undefined) pairs.push(['Unavailable', node.unavailable]);
     if (node.author !== undefined) pairs.push(['Author', node.author]);
     if (node.authorId !== undefined) pairs.push(['Author id', node.authorId]);
     if (node.size !== undefined) pairs.push(['Size', formatBytes(node.size)]);

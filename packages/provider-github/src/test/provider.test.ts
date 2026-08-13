@@ -11,7 +11,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isVfsError, parseQuery, type ListPage, type VNode } from '@mscomms/core';
+import { evaluateQuery, isVfsError, parseQuery, type ListPage, type VNode } from '@mscomms/core';
 
 import { GitHubProvider, type GitHubProviderOptions } from '../provider.js';
 import { GitHubClient } from '../client.js';
@@ -781,5 +781,283 @@ describe('actions', () => {
     const draft = items.entries.find((entry) => entry.title === 'Write the migration note');
 
     assert.deepEqual(await provider.actions(draft as VNode), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Warning before the wall
+// ---------------------------------------------------------------------------
+
+describe('unavailable folders', () => {
+  const NO_PROJECT_SCOPE = 'gist, read:org, repo, workflow';
+  const REFUSAL = { type: 'INSUFFICIENT_SCOPES', message: 'Your token has not been granted the required scopes to execute this query' };
+
+  /** Find the `projects` entry under an owner, which is where the label has to show up. */
+  async function projectsFolder(provider: GitHubProvider): Promise<VNode> {
+    const page = await provider.list(await cd(provider, OWNER), {});
+    const found = page.entries.find((entry) => entry.name === 'projects');
+    assert.ok(found !== undefined, 'the projects folder disappeared');
+    return found;
+  }
+
+  it('says a token cannot read projects before the user opens the folder', async () => {
+    // The whole point. Without this the first sign of trouble is an error, after a
+    // navigation, in a folder that looked exactly like the ones that work.
+    const { provider } = await makeProvider({}, { scopes: NO_PROJECT_SCOPE });
+
+    assert.equal((await projectsFolder(provider)).unavailable, 'needs the read:project scope');
+  });
+
+  it('labels the repository board folder too, not just the owner one', async () => {
+    const { provider } = await makeProvider({}, { scopes: NO_PROJECT_SCOPE });
+    const page = await provider.list(await cd(provider, OWNER, REPO), {});
+
+    assert.equal(page.entries.find((entry) => entry.name === 'projects')?.unavailable, 'needs the read:project scope');
+  });
+
+  it('leaves the folder alone when the token does carry the scope', async () => {
+    const { provider } = await makeProvider({}, { scopes: 'repo, read:project' });
+
+    assert.equal((await projectsFolder(provider)).unavailable, undefined);
+  });
+
+  it('treats a missing scope header as unknown rather than as no scopes', async () => {
+    // Fine-grained tokens and App installations send no `x-oauth-scopes` at all. Reading
+    // that silence as "no scopes" would grey out a folder that works perfectly, for every
+    // user on a modern token — a worse failure than the one being fixed.
+    const { provider } = await makeProvider({}, {});
+
+    assert.equal((await projectsFolder(provider)).unavailable, undefined);
+  });
+
+  it('still throws when an unavailable folder is opened', async () => {
+    // The label is a warning, not a replacement for the error. Anything else would leave
+    // scripts and pipes to infer failure from an empty listing.
+    const { provider } = await makeProvider({}, { scopes: NO_PROJECT_SCOPE, graphqlError: REFUSAL });
+    const folder = await projectsFolder(provider);
+
+    await assert.rejects(
+      () => provider.list(folder, {}),
+      (error: unknown) => isVfsError(error) && error.code === 'EACCES',
+    );
+  });
+
+  it('remembers a refusal it was not warned about', async () => {
+    // No scope header, so the probe learns nothing and the first listing is a normal
+    // failure. What must not happen is the second listing looking just as inviting.
+    const { provider } = await makeProvider({}, { graphqlError: REFUSAL });
+    const folder = await projectsFolder(provider);
+    assert.equal(folder.unavailable, undefined);
+
+    await assert.rejects(() => provider.list(folder, {}));
+
+    assert.equal((await projectsFolder(provider)).unavailable, 'needs the read:project scope');
+  });
+
+  it('names SSO enforcement rather than blaming the scope', async () => {
+    // Same 403, unrelated fix: `gh auth refresh` does nothing here, and sending the user
+    // to it wastes the one piece of guidance the row has room for.
+    const { provider } = await makeProvider(
+      {},
+      { graphqlError: { type: 'FORBIDDEN', message: 'Resource protected by organization SAML enforcement.' } },
+    );
+    await assert.rejects(async () => provider.list(await projectsFolder(provider), {}));
+
+    assert.equal((await projectsFolder(provider)).unavailable, 'this token is not SSO-authorized for this organization');
+  });
+
+  it('forgets the warning once a listing succeeds', async () => {
+    // A token can be refreshed without restarting the shell, and the scope probe is a
+    // heuristic. A label the user cannot clear by fixing the problem is just wrong.
+    const fake = createFakeGitHub({ scopes: NO_PROJECT_SCOPE });
+    const provider = new GitHubProvider(
+      { repos: [`${OWNER}/${REPO}`], token: 'fake-token', transport: fake.transport },
+      testContext(),
+    );
+    await provider.init();
+    assert.equal((await projectsFolder(provider)).unavailable, 'needs the read:project scope');
+
+    await provider.list(await projectsFolder(provider), {});
+
+    assert.equal((await projectsFolder(provider)).unavailable, undefined);
+  });
+
+  it('does not mark the folder over a rate limit or an outage', async () => {
+    // A blip says nothing about whether the folder is readable. Latching on one would
+    // leave a permanent warning about a problem that fixed itself.
+    const { provider } = await makeProvider({}, { failing: '/graphql' });
+    await assert.rejects(async () => provider.list(await projectsFolder(provider), {}));
+
+    assert.equal((await projectsFolder(provider)).unavailable, undefined);
+  });
+
+  it('matches is:unavailable so a warning can be searched for', async () => {
+    const { provider } = await makeProvider({}, { scopes: NO_PROJECT_SCOPE });
+    const query = parseQuery('is:unavailable');
+    const page = await provider.list(await cd(provider, OWNER), {});
+
+    assert.deepEqual(
+      page.entries.filter((entry) => evaluateQuery(query, entry) === true).map((entry) => entry.name),
+      ['projects'],
+    );
+  });
+
+  it('does not hold up startup waiting for the answer', async () => {
+    // Mounts are built one after another, so a request awaited in `init` delays the shell
+    // for this mount *and* every one behind it. A warning does not get to cost that. The
+    // probe is collected where it is used instead, which is why the label still arrives.
+    const fake = createFakeGitHub({ scopes: NO_PROJECT_SCOPE });
+    let release = (): void => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const provider = new GitHubProvider(
+      {
+        repos: [`${OWNER}/${REPO}`],
+        token: 'fake-token',
+        transport: async (url, init) => {
+          if (new URL(url).pathname === '/rate_limit') await held;
+          return fake.transport(url, init);
+        },
+      },
+      testContext(),
+    );
+
+    await provider.init();
+    assert.equal(fake.matching('/rate_limit').length, 0, 'init waited for the probe');
+
+    release();
+    assert.equal((await projectsFolder(provider)).unavailable, 'needs the read:project scope');
+  });
+});
+
+describe('unavailable folders, keyed to what the reason covers', () => {
+  const SAML = 'Resource protected by organization SAML enforcement.';
+
+  /** A mount over two owners, where GraphQL refuses exactly one of them. */
+  function twoOwners(refuse: string): { provider: GitHubProvider; fake: FakeGitHub } {
+    const fake = createFakeGitHub();
+    const provider = new GitHubProvider(
+      {
+        owners: ['orga', 'orgb'],
+        token: 'fake-token',
+        transport: async (url, init) => {
+          if (new URL(url).pathname === '/graphql') {
+            const body = JSON.parse(String(init.body)) as { variables?: Record<string, unknown> };
+            if (body.variables?.['login'] === refuse) {
+              return new Response(JSON.stringify({ data: null, errors: [{ type: 'FORBIDDEN', message: SAML }] }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+            return new Response(
+              JSON.stringify({
+                data: { repositoryOwner: { projectsV2: { totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } },
+              }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+          return fake.transport(url, init);
+        },
+      },
+      testContext(),
+    );
+    return { provider, fake };
+  }
+
+  async function labelFor(provider: GitHubProvider, owner: string): Promise<string | undefined> {
+    const page = await provider.list(await cd(provider, owner), {});
+    return page.entries.find((entry) => entry.name === 'projects')?.unavailable;
+  }
+
+  it('does not let one organization speak for another', async () => {
+    // SAML enforcement, OAuth-app restrictions and board visibility are all decided per
+    // organization. A single mount-wide flag would grey out a folder that works perfectly.
+    const { provider } = twoOwners('orga');
+    await provider.init();
+
+    await assert.rejects(async () => provider.list(await cd(provider, 'orga', 'projects'), {}));
+
+    assert.equal(await labelFor(provider, 'orga'), 'this token is not SSO-authorized for this organization');
+    assert.equal(await labelFor(provider, 'orgb'), undefined, 'orgb was blamed for orga');
+  });
+
+  it('does not let one organization clear another', async () => {
+    // The same bug in the other direction, and the worse half: a success elsewhere silently
+    // deleting a true warning leaves the user walking back into the error it was for.
+    const { provider } = twoOwners('orga');
+    await provider.init();
+    await assert.rejects(async () => provider.list(await cd(provider, 'orga', 'projects'), {}));
+
+    await provider.list(await cd(provider, 'orgb', 'projects'), {});
+
+    assert.equal(await labelFor(provider, 'orga'), 'this token is not SSO-authorized for this organization');
+  });
+
+  it('does not treat a half-refused answer as proof of access', async () => {
+    // GraphQL answers a partly-forbidden query with data *and* errors, and the client does
+    // not throw on that, so the boards the token cannot see arrive as an empty connection.
+    // Reading that as success deletes the warning and shows an empty folder instead: a
+    // listing that looks fine and is wrong, which is worse than the error it replaced.
+    const fake = createFakeGitHub({ scopes: 'repo' });
+    const provider = new GitHubProvider(
+      {
+        repos: [`${OWNER}/${REPO}`],
+        token: 'fake-token',
+        transport: async (url, init) => {
+          if (new URL(url).pathname === '/graphql') {
+            return new Response(
+              JSON.stringify({
+                data: { repositoryOwner: { projectsV2: null } },
+                errors: [{ type: 'FORBIDDEN', message: SAML }],
+              }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+          return fake.transport(url, init);
+        },
+      },
+      testContext(),
+    );
+    await provider.init();
+
+    const page = await provider.list(await cd(provider, OWNER, 'projects'), {});
+    assert.deepEqual(page.entries, [], 'the fixture changed');
+
+    const label = (await provider.list(await cd(provider, OWNER), {})).entries.find((e) => e.name === 'projects');
+    assert.equal(label?.unavailable, 'needs the read:project scope');
+  });
+
+  it('does not latch a secondary rate limit as a permission problem', async () => {
+    // The secondary limit fires on burst rather than quota, so it arrives as a 403 with a
+    // healthy `x-ratelimit-remaining` and is otherwise indistinguishable from a refusal.
+    // Latching it would assert something about the token that the scope probe disproved.
+    const fake = createFakeGitHub({ scopes: 'repo, read:project' });
+    const provider = new GitHubProvider(
+      {
+        repos: [`${OWNER}/${REPO}`],
+        token: 'fake-token',
+        transport: async (url, init) => {
+          if (new URL(url).pathname === '/graphql') {
+            return new Response(JSON.stringify({ message: 'You have exceeded a secondary rate limit' }), {
+              status: 403,
+              headers: { 'content-type': 'application/json', 'retry-after': '60', 'x-ratelimit-remaining': '4831' },
+            });
+          }
+          return fake.transport(url, init);
+        },
+      },
+      testContext(),
+    );
+    await provider.init();
+
+    await assert.rejects(
+      async () => provider.list(await cd(provider, OWNER, 'projects'), {}),
+      (error: unknown) => isVfsError(error) && error.code === 'ERATELIMIT',
+    );
+
+    const label = (await provider.list(await cd(provider, OWNER), {})).entries.find((e) => e.name === 'projects');
+    assert.equal(label?.unavailable, undefined, 'a passing blip became a permanent warning');
   });
 });

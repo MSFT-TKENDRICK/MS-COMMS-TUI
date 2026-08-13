@@ -211,6 +211,27 @@ export class GitHubProvider implements Provider {
    * and lose folders between two `ls` calls depending on which code path asked.
    */
   #graphqlAvailable = false;
+  /**
+   * Why `projects/` cannot be opened, keyed by what the reason actually covers.
+   *
+   * Keyed, not a single flag, because a mount can hold several owners and almost none of
+   * the reasons are token-wide. SAML enforcement, OAuth-app restrictions and board
+   * visibility are all decided per organization, so one refusal from `acme` says nothing
+   * about `initech` — and letting it speak for both would mean greying out a folder that
+   * works and, worse, wiping a true warning the moment the other one succeeded.
+   *
+   * The one genuinely token-wide reason is a missing scope, which lives under `ALL_OWNERS`.
+   */
+  readonly #projectFailures = new Map<string, string>();
+  /**
+   * The in-flight scope probe, started at init and awaited at the point of use.
+   *
+   * Mounts are built one after another, so anything awaited in `init` is added directly to
+   * how long the shell takes to start — for every mount behind this one as well. A warning
+   * is not worth that. Starting the request and collecting it later costs nothing, because
+   * by the time a listing needs the answer the round trip has almost always finished.
+   */
+  #scopeProbe: Promise<void> | undefined;
 
   constructor(options: GitHubProviderOptions, context: ProviderContext) {
     this.#options = options;
@@ -269,6 +290,60 @@ export class GitHubProvider implements Provider {
         'Discussions and projects are hidden: GitHub serves them only over GraphQL, which has no anonymous access.',
       );
     }
+
+    if (this.#showProjects()) {
+      // Deliberately not awaited. `scopes` swallows its own failures, and the `catch` is
+      // belt and braces so a logger that throws cannot become an unhandled rejection.
+      this.#scopeProbe = this.#checkProjectScope().catch(() => undefined);
+    }
+  }
+
+  /**
+   * Find out before the user does whether this token can read projects.
+   *
+   * Projects v2 needs `read:project`, which is unusual: nothing else in this tool wants it,
+   * `repo` does not imply it, and `gh auth login` does not ask for it. So the overwhelmingly
+   * common way to meet this feature is a folder that throws the moment you open it, having
+   * given no warning that it would.
+   *
+   * The cost of checking is one request to an endpoint that does not count against the rate
+   * limit, made once per mount. Silence is treated as permission: a token whose scopes
+   * GitHub does not report is left alone rather than greyed out on a guess.
+   */
+  async #checkProjectScope(): Promise<void> {
+    const scopes = await this.#api.scopes();
+    if (scopes === undefined) return;
+    if (scopes.some((scope) => scope === 'read:project' || scope === 'project')) return;
+
+    // The one reason that really is token-wide: no scope means no boards anywhere.
+    this.#projectFailures.set(ALL_OWNERS, 'needs the read:project scope');
+    this.#context.logger.info(
+      'GitHub projects are shown but not readable: this token has no read:project scope. Run `gh auth refresh -s read:project`.',
+      { scopes: scopes.join(', ') },
+    );
+  }
+
+  /**
+   * Remember a refusal so the next listing can warn instead of repeating it.
+   *
+   * Only permission failures are recorded, and only against the owner or repository that
+   * produced them. A timeout, an outage or a rate limit says nothing about whether the
+   * folder is readable, and latching a permanent warning over a passing blip would be its
+   * own kind of lie. `retryAfter` is the giveaway for the secondary rate limit, which
+   * arrives as a 403 and is otherwise indistinguishable from a real refusal.
+   */
+  #noteProjectFailure(key: string, error: unknown): void {
+    if (!(error instanceof VfsError)) return;
+    if (error.code !== 'EACCES' && error.code !== 'EAUTH') return;
+    if (error.retryAfter !== undefined) return;
+    if (!this.#projectFailures.has(key)) this.#projectFailures.set(key, describeRefusal(error.message));
+  }
+
+  /** Label a projects folder with why it will fail, when that is already known. */
+  async #markProjects(node: VNode): Promise<VNode> {
+    await this.#scopeProbe;
+    const reason = this.#projectFailures.get(ALL_OWNERS) ?? this.#projectFailures.get(projectKey(node.meta ?? {}));
+    return reason === undefined ? node : { ...node, unavailable: reason };
   }
 
   get #api(): GitHubClient {
@@ -312,7 +387,11 @@ export class GitHubProvider implements Provider {
           // Emitted first so that an owner who also has a repository called "projects"
           // gives the plain name to the folder that is always there, and the engine's
           // deduplication renames the repository rather than the other way round.
-          entries.unshift(dir('projects', `${owner} projects`, 'folder', { level: 'projects', scope: 'owner', owner }));
+          entries.unshift(
+            await this.#markProjects(
+              dir('projects', `${owner} projects`, 'folder', { level: 'projects', scope: 'owner', owner }),
+            ),
+          );
         }
         return paginate(entries, options);
       }
@@ -328,7 +407,11 @@ export class GitHubProvider implements Provider {
           entries.push(dir('discussions', 'Discussions', 'folder', { level: 'discussions', owner, repo }));
         }
         if (this.#showProjects()) {
-          entries.push(dir('projects', 'Projects', 'folder', { level: 'projects', scope: 'repo', owner, repo }));
+          entries.push(
+            await this.#markProjects(
+              dir('projects', 'Projects', 'folder', { level: 'projects', scope: 'repo', owner, repo }),
+            ),
+          );
         }
         return paginate(entries, options);
       }
@@ -566,6 +649,40 @@ export class GitHubProvider implements Provider {
   }
 
   async #listProjects(parent: VNode, options: ListOptions): Promise<ListPage> {
+    return this.#trackProjects(parent, () => this.#fetchProjects(parent, options));
+  }
+
+  /**
+   * Run a projects request and learn from how it goes.
+   *
+   * Both directions matter. A refusal is remembered so the folder can carry the reason next
+   * time it is listed, and a clean answer clears it, because a token can be refreshed
+   * without restarting the shell and scope detection is only a heuristic. Clearing is what
+   * keeps the label a warning rather than a verdict the user cannot argue with.
+   *
+   * "Clean" is doing real work in that sentence. GraphQL answers a half-refused query with
+   * data *and* errors, and the client deliberately does not throw on that, so the boards the
+   * token may not see come back as an empty connection. Treating that as proof of access
+   * would delete a true warning and leave an empty folder in its place — the listing would
+   * look fine and be wrong, which is the one outcome worse than the error.
+   */
+  async #trackProjects(parent: VNode, run: () => Promise<ProjectFetch>): Promise<ListPage> {
+    const key = projectKey(parent.meta ?? {});
+    try {
+      const { page, clean } = await run();
+      if (clean) {
+        this.#projectFailures.delete(key);
+        // A board that really loaded disproves the scope probe as well, whoever owns it.
+        this.#projectFailures.delete(ALL_OWNERS);
+      }
+      return page;
+    } catch (error) {
+      this.#noteProjectFailure(key, error);
+      throw error;
+    }
+  }
+
+  async #fetchProjects(parent: VNode, options: ListOptions): Promise<ProjectFetch> {
     const owner = String(parent.meta?.['owner'] ?? '');
     const repo = String(parent.meta?.['repo'] ?? '');
     const scope = String(parent.meta?.['scope'] ?? 'owner');
@@ -580,9 +697,12 @@ export class GitHubProvider implements Provider {
       this.#logPartial('projects', errors);
       const connection = data.repository?.projectsV2 ?? null;
       return {
-        entries: nodesOf(connection).map((item) => this.#toProjectNode(item, owner, repo)),
-        ...(nextCursor(connection) === undefined ? {} : { cursor: nextCursor(connection) as string }),
-        ...(connection?.totalCount === undefined ? {} : { total: connection.totalCount }),
+        clean: isClean(errors, connection),
+        page: {
+          entries: nodesOf(connection).map((item) => this.#toProjectNode(item, owner, repo)),
+          ...(nextCursor(connection) === undefined ? {} : { cursor: nextCursor(connection) as string }),
+          ...(connection?.totalCount === undefined ? {} : { total: connection.totalCount }),
+        },
       };
     }
 
@@ -595,13 +715,20 @@ export class GitHubProvider implements Provider {
 
     const connection = data.repositoryOwner?.projectsV2 ?? null;
     return {
-      entries: nodesOf(connection).map((item) => this.#toProjectNode(item, owner)),
-      ...(nextCursor(connection) === undefined ? {} : { cursor: nextCursor(connection) as string }),
-      ...(connection?.totalCount === undefined ? {} : { total: connection.totalCount }),
+      clean: isClean(errors, connection),
+      page: {
+        entries: nodesOf(connection).map((item) => this.#toProjectNode(item, owner)),
+        ...(nextCursor(connection) === undefined ? {} : { cursor: nextCursor(connection) as string }),
+        ...(connection?.totalCount === undefined ? {} : { total: connection.totalCount }),
+      },
     };
   }
 
   async #listProjectItems(parent: VNode, options: ListOptions): Promise<ListPage> {
+    return this.#trackProjects(parent, () => this.#fetchProjectItems(parent, options));
+  }
+
+  async #fetchProjectItems(parent: VNode, options: ListOptions): Promise<ProjectFetch> {
     const projectId = String(parent.meta?.['projectId'] ?? '');
     if (projectId === '') throw VfsError.notFound(parent.path ?? parent.name);
 
@@ -622,9 +749,12 @@ export class GitHubProvider implements Provider {
     const connection = data.node.items ?? null;
     const project = String(parent.meta?.['project'] ?? parent.title);
     return {
-      entries: nodesOf(connection).map((item) => this.#toProjectItemNode(item, projectId, project)),
-      ...(nextCursor(connection) === undefined ? {} : { cursor: nextCursor(connection) as string }),
-      ...(connection?.totalCount === undefined ? {} : { total: connection.totalCount }),
+      clean: isClean(errors, connection),
+      page: {
+        entries: nodesOf(connection).map((item) => this.#toProjectItemNode(item, projectId, project)),
+        ...(nextCursor(connection) === undefined ? {} : { cursor: nextCursor(connection) as string }),
+        ...(connection?.totalCount === undefined ? {} : { total: connection.totalCount }),
+      },
     };
   }
 
@@ -1273,6 +1403,55 @@ export class GitHubProvider implements Provider {
 
 function dir(name: string, title: string, subtype: string, meta: Record<string, MetaValue>): VNode {
   return { name, kind: 'dir', subtype, title, id: `${subtype}:${name}:${JSON.stringify(meta)}`, meta };
+}
+
+/**
+ * Boil a refusal down to something that fits on one line next to a folder name.
+ *
+ * The label has to say what to *do*, not what happened, because it is read in a listing
+ * where there is no room to explain. The two causes worth telling apart are the missing
+ * scope and SAML enforcement: both arrive as a 403, and the fixes have nothing in common —
+ * one is `gh auth refresh`, the other is a button on the organization's settings page.
+ * Anything else stays vague on purpose rather than guessing wrong in a confident voice.
+ */
+function describeRefusal(message: string): string {
+  if (/saml|\bsso\b|single sign/i.test(message)) return 'this token is not SSO-authorized for this organization';
+  if (/scope/i.test(message)) return 'needs the read:project scope';
+  return 'this token cannot read projects';
+}
+
+/** The key for a reason that holds no matter whose boards you ask for. */
+const ALL_OWNERS = '*';
+
+/**
+ * Which boards a projects reason covers, derived from the node's own metadata.
+ *
+ * Owner-scope and repo-scope boards are separate permissions on GitHub's side and have to
+ * stay separate here, or one org's refusal starts speaking for another's. Project items
+ * inherit the key of the board they belong to, since a card is unreachable for exactly the
+ * reasons its board is.
+ */
+function projectKey(meta: Readonly<Record<string, MetaValue>>): string {
+  const owner = String(meta['owner'] ?? '');
+  const repo = String(meta['repo'] ?? '');
+  return repo === '' ? `owner:${owner}` : `repo:${owner}/${repo}`;
+}
+
+/** A page, plus whether GitHub answered it in full. */
+interface ProjectFetch {
+  readonly page: ListPage;
+  readonly clean: boolean;
+}
+
+/**
+ * Did that answer actually prove the boards are readable?
+ *
+ * Only if GitHub raised nothing *and* returned a connection. A partial success — data with
+ * an errors array, or a nulled connection — is the shape of "you may not see these", which
+ * is the opposite of proof, however much it looks like an ordinary empty folder.
+ */
+function isClean(errors: readonly unknown[] | undefined, connection: unknown): boolean {
+  return (errors === undefined || errors.length === 0) && connection !== null && connection !== undefined;
 }
 
 /**

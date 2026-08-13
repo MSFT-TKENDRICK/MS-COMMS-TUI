@@ -117,6 +117,23 @@ export interface VNode {
   readonly childCount?: number;
   /** Number of unread children, when the backend reports it cheaply. */
   readonly unreadCount?: number;
+  /**
+   * Set when the entry exists but opening it is already known to fail, and why.
+   *
+   * The alternative is letting the user find out by walking into it, which is the worst
+   * moment to be told: they have already committed to the trip, and in a screen reader the
+   * error arrives after a listing they cannot easily scroll back through. A provider that
+   * knows a folder is unreachable — a missing token scope, a feature switched off for the
+   * repository — should say so on the row itself.
+   *
+   * The value is a short human sentence, shown next to the entry. Hiding the entry instead
+   * would be worse: "projects is missing" and "projects needs a scope you do not have" send
+   * the reader to completely different places, and only one of them is true.
+   *
+   * Listing it must still throw. This is a label, not a substitute for the error, so a
+   * caller that ignores it is merely uninformed rather than wrong.
+   */
+  readonly unavailable?: string;
 }
 
 // ---------------------------------------------------------------------------

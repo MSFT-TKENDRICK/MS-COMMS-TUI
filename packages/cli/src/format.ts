@@ -232,6 +232,7 @@ export function formatListing(nodes: readonly VNode[], options: ListingOptions):
             node.author ?? '',
             (node.flags ?? []).join(','),
             node.id,
+            node.unavailable ?? '',
           ].join('\t'),
         )
         .join('\n');
@@ -248,6 +249,7 @@ export function formatListing(nodes: readonly VNode[], options: ListingOptions):
             formatDate(node.mtime, options.dateStyle),
             node.author ?? '',
             flags,
+            node.unavailable === undefined ? '' : `unavailable: ${sanitizeForDisplay(node.unavailable)}`,
           ]
             .filter((part) => part !== '')
             .join('\t');
@@ -263,6 +265,9 @@ function announceNode(node: VNode, index: number, options: ListingOptions): stri
   const parts: string[] = [`${String(index)}.`];
 
   const flags = node.flags ?? [];
+  // Before anything else, because this is the one fact that changes what the listener
+  // does next: there is no point hearing the title of something they cannot open.
+  if (node.unavailable !== undefined) parts.push('Unavailable.');
   if (flags.includes('unread')) parts.push('unread');
   if (flags.includes('mention')) parts.push('mentions you');
   if (flags.includes('important')) parts.push('important');
@@ -281,7 +286,11 @@ function announceNode(node: VNode, index: number, options: ListingOptions): stri
   }
 
   if (flags.includes('attachment')) parts.push('Has an attachment.');
-  if (node.summary !== undefined && node.summary !== '') {
+  if (node.unavailable !== undefined) {
+    // The reason last as well as the state first: the listener knows immediately whether
+    // to care, and hears the explanation without having to run a second command.
+    parts.push(`${sanitizeForDisplay(node.unavailable).replace(/\.?$/, '')}.`);
+  } else if (node.summary !== undefined && node.summary !== '') {
     parts.push(truncateWidth(sanitizeForDisplay(node.summary), 100));
   }
 
@@ -294,7 +303,14 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
     // A leading marker column, always in the same place, so it is scannable. The word
     // form is still present in `stat` and in announce mode, so no information is
     // colour- or glyph-only.
-    const marker = flags.includes('unread') ? '*' : flags.includes('mention') ? '@' : ' ';
+    const marker =
+      node.unavailable !== undefined
+        ? '!'
+        : flags.includes('unread')
+          ? '*'
+          : flags.includes('mention')
+            ? '@'
+            : ' ';
     const name = `${sanitizeForDisplay(node.name)}${node.kind === 'dir' ? '/' : ''}`;
     return {
       index: `${String(start + i)}.`,
@@ -302,16 +318,29 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
       name,
       when: formatDate(node.mtime, options.dateStyle),
       who: sanitizeForDisplay(node.author ?? ''),
-      extra: options.long === true ? extraColumn(node) : '',
+      // Shown at any verbosity, unlike the rest of the extra column: the whole point is
+      // that the user learns this without having asked a second question.
+      extra:
+        node.unavailable === undefined
+          ? options.long === true
+            ? extraColumn(node)
+            : ''
+          : sanitizeForDisplay(node.unavailable),
       dir: node.kind === 'dir',
       unread: flags.includes('unread'),
+      unavailable: node.unavailable !== undefined,
     };
   });
 
   const indexWidth = Math.max(...rows.map((row) => row.index.length));
   const whenWidth = Math.min(20, Math.max(0, ...rows.map((row) => displayWidth(row.when))));
   const whoWidth = Math.min(22, Math.max(0, ...rows.map((row) => displayWidth(row.who))));
-  const extraWidth = Math.max(0, ...rows.map((row) => displayWidth(row.extra)));
+  // Capped like its neighbours, and for the same reason. This column used to appear only
+  // under `--long`, where a wide value is what was asked for; now a single unreachable
+  // folder can put a sentence in it during an ordinary `ls`, and without a cap that one row
+  // squeezes every name in the listing down to the 20-column floor. The names are what the
+  // user types, so they win. The untruncated reason is still in `stat` and announce mode.
+  const extraWidth = Math.min(30, Math.max(0, ...rows.map((row) => displayWidth(row.extra))));
 
   const fixed = indexWidth + 1 + 1 + 1 + whenWidth + 2 + whoWidth + 2 + extraWidth + (extraWidth > 0 ? 2 : 0);
   const nameWidth = Math.max(20, options.width - fixed - 1);
@@ -320,7 +349,7 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
     .map((row) => {
       const name = padTo(truncateWidth(row.name, nameWidth), nameWidth);
       const painted = options.color
-        ? paint(name, row.dir ? 'blue' : row.unread ? 'bold' : 'reset')
+        ? paint(name, row.unavailable ? 'dim' : row.dir ? 'blue' : row.unread ? 'bold' : 'reset')
         : name;
       const pieces = [
         row.index.padStart(indexWidth),
@@ -329,7 +358,11 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
         padTo(truncateWidth(row.when, whenWidth), whenWidth),
         padTo(truncateWidth(row.who, whoWidth), whoWidth),
       ];
-      if (extraWidth > 0) pieces.push(row.extra);
+      if (extraWidth > 0) {
+        // Truncated before painting, so the escape codes are neither measured nor cut in half.
+        const extra = truncateWidth(row.extra, extraWidth);
+        pieces.push(row.unavailable && options.color ? paint(extra, 'yellow') : extra);
+      }
       return pieces.join(' ').trimEnd();
     })
     .join('\n');

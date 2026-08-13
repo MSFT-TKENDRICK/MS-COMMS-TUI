@@ -164,7 +164,32 @@ how close you are to it.
 has no anonymous access at all, so without a token those folders are hidden rather than
 shown and always failing. Projects additionally need the `read:project` scope: a token
 without it can see the repository but not its boards. `gh auth refresh -s read:project`
-adds it, and the provider says so in the error if you hit this.
+adds it.
+
+You should not have to discover that by walking into it. On startup the provider asks
+GitHub what the token's scopes are, and if `read:project` is missing it marks the
+`projects` folders up front: a `!` in the marker column, the name dimmed, and the reason
+in yellow beside it. Opening the folder still fails, with the same error as before -- the
+label is a warning, not a substitute for one. Two things are worth knowing about how it
+behaves:
+
+- Fine-grained tokens and GitHub App installations do not report their scopes at all. That
+  silence is treated as permission rather than as a refusal, so those tokens see no warning
+  even though the check learned nothing. The alternative would grey out a working folder
+  for everyone on a modern token.
+- Not every refusal is a missing scope, and the scope check cannot see the others. An
+  organization that enforces SAML will refuse a token that is not SSO-authorized, whatever
+  its scopes say. So a refusal that does happen is remembered against the owner or
+  repository that produced it -- never mount-wide, since one org's answer says nothing about
+  another's -- and the folder carries the reason from then on. A clean listing clears it
+  again, which means refreshing a token mid-session takes effect without restarting the
+  shell.
+- Only outright refusals count. A rate limit, an outage or a timeout is a passing blip, and
+  a half-refused answer (GitHub returns the boards it will show you plus an error for the
+  rest) is not proof of access either, so neither sets nor clears the warning.
+
+`ls -q is:unavailable` lists everything currently carrying such a warning. The listing
+truncates long reasons to keep the names readable; `stat` shows the full text.
 
 If a token can see some boards and not others, GitHub answers with the ones it can and an
 error for the rest. The provider shows what came back and logs the rest rather than failing

@@ -320,6 +320,14 @@ export interface FakeOptions {
   /** Answer `node(id:)` queries with a null node and no errors, as GitHub does for a
    * board that has been deleted since the folder was listed. */
   readonly missingNode?: boolean;
+  /**
+   * What `/rate_limit` reports in `x-oauth-scopes`.
+   *
+   * Three states, all real and all different: a list, an empty string for a token with no
+   * scopes at all, and `undefined` for the header being absent — which is what fine-grained
+   * PATs and App tokens do, and must not be read as "no scopes".
+   */
+  readonly scopes?: string;
 }
 
 export function createFakeGitHub(options: FakeOptions = {}): FakeGitHub {
@@ -357,9 +365,13 @@ export function createFakeGitHub(options: FakeOptions = {}): FakeGitHub {
   };
 }
 
-function rest(url: URL, _options: FakeOptions): Response {
+function rest(url: URL, options: FakeOptions): Response {
   const path = url.pathname;
   const repo = `/repos/${OWNER}/${REPO}`;
+
+  if (path === '/rate_limit') {
+    return json({ rate: { limit: 5000, remaining: 4999 } }, 200, options.scopes === undefined ? {} : { 'x-oauth-scopes': options.scopes });
+  }
 
   if (path === '/notifications') {
     const perPage = Number(url.searchParams.get('per_page') ?? '50');

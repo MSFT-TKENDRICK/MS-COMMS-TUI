@@ -12,12 +12,15 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
+import type { VNode } from '@mscomms/core';
+
 import {
   DEFAULT_FORMAT,
   displayWidth,
   formatBytes,
   formatDate,
   formatDocument,
+  formatListing,
   formatRows,
   padTo,
   relativeTime,
@@ -325,3 +328,121 @@ describe('formatRows in announce mode', () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Unavailable nodes
+// ---------------------------------------------------------------------------
+
+describe('formatListing for an unavailable node', () => {
+  const broken: VNode = {
+    name: 'projects',
+    kind: 'dir',
+    subtype: 'folder',
+    title: 'Projects',
+    id: 'p',
+    unavailable: 'needs the read:project scope',
+  };
+  const fine: VNode = { name: 'issues', kind: 'dir', subtype: 'folder', title: 'Issues', id: 'i' };
+
+  it('marks the row with a glyph, not only a colour', () => {
+    // The accessibility rule the whole feature has to obey: a listing read without colour,
+    // or spoken aloud, still has to carry the warning.
+    const out = formatListing([broken, fine], { ...DEFAULT_FORMAT, color: false });
+
+    assert.match(out, /^1\. ! projects\//m);
+    assert.match(out, /^2\.   issues\//m);
+  });
+
+  it('prints the reason without being asked for --long', () => {
+    // A reason the user has to run a second command to see is a reason they will not read
+    // until after they have already hit the error it was meant to prevent.
+    const out = formatListing([broken], { ...DEFAULT_FORMAT, color: false });
+
+    assert.match(out, /needs the read:project scope/);
+  });
+
+  it('paints the reason yellow and the name dim when colour is on', () => {
+    const out = formatListing([broken], { ...DEFAULT_FORMAT, color: true });
+
+    assert.match(out, /\u001B\[2mprojects\//, 'the name was not dimmed');
+    assert.match(out, /\u001B\[33mneeds the read:project scope/, 'the reason was not yellow');
+  });
+
+  it('says the word first in announce mode', () => {
+    // Spoken output is linear: a listener who hears the title first has already started
+    // deciding whether to open it. The state has to arrive before the name does.
+    const out = formatListing([broken], { ...DEFAULT_FORMAT, color: false, mode: 'announce' });
+
+    assert.match(out, /^1\. Unavailable\./);
+    assert.match(out, /needs the read:project scope\.$/);
+  });
+
+  it('keeps tsv and plain free of escape codes', () => {
+    // Both are machine-facing. A colour code here ends up inside somebody's cut(1) field.
+    for (const mode of ['tsv', 'plain'] as const) {
+      const out = formatListing([broken], { ...DEFAULT_FORMAT, color: true, mode });
+      assert.doesNotMatch(out, /\u001B\[/, `${mode} emitted an escape`);
+      assert.match(out, /needs the read:project scope/, `${mode} dropped the reason`);
+    }
+  });
+
+  it('prefers the warning over the unread marker', () => {
+    // Both compete for one column. Unread says there is something to read; unavailable
+    // says there is not. The second is the one that changes what the user does.
+    const out = formatListing(
+      [{ ...broken, flags: ['unread'] }],
+      { ...DEFAULT_FORMAT, color: false },
+    );
+
+    assert.match(out, /^1\. ! projects\//m);
+  });
+
+  it('leaves an ordinary node exactly as it was', () => {
+    const out = formatListing([fine], { ...DEFAULT_FORMAT, color: false });
+
+    assert.equal(out.trimEnd(), '1.   issues/');
+  });
+});
+
+describe('formatListing width when a reason is present', () => {
+  const long = 'this token is not SSO-authorized for this organization';
+  const rows: readonly VNode[] = [
+    { name: 'projects', kind: 'dir', subtype: 'folder', title: 'P', id: 'p', unavailable: long },
+    { name: 'azure-sdk-for-net-track2-preview', kind: 'dir', subtype: 'repo', title: 'A', id: 'a' },
+    { name: 'vscode-remote-containers-spec', kind: 'dir', subtype: 'repo', title: 'V', id: 'v' },
+  ];
+
+  it('keeps every row inside the terminal', () => {
+    // The reason column is new to the default listing, where nobody asked for a wide value.
+    // Uncapped it pushes the row past the terminal edge and wraps, which costs two lines and
+    // breaks the alignment the numbers are read from.
+    const out = formatListing(rows, { ...DEFAULT_FORMAT, color: false, width: 80 });
+
+    for (const line of out.split('\n')) {
+      assert.ok(displayWidth(line) <= 80, `row overflowed at ${String(displayWidth(line))} columns: ${line}`);
+    }
+  });
+
+  it('does not truncate the names to make room for it', () => {
+    // The name is what the user types next. One long reason must not cost every other row
+    // the identifier it is addressed by.
+    const out = formatListing(rows, { ...DEFAULT_FORMAT, color: false, width: 80 });
+
+    assert.match(out, /azure-sdk-for-net-track2-preview\//);
+    assert.match(out, /vscode-remote-containers-spec\//);
+  });
+
+  it('still shows enough of the reason to act on', () => {
+    const out = formatListing(rows, { ...DEFAULT_FORMAT, color: false, width: 80 });
+
+    assert.match(out, /this token is not SSO/);
+  });
+
+  it('does not cut a colour escape in half when truncating', () => {
+    // Truncation runs before painting, so the codes are neither measured as width nor
+    // sliced through the middle, which would leave the rest of the terminal yellow.
+    const out = formatListing(rows, { ...DEFAULT_FORMAT, color: true, width: 80 });
+
+    assert.match(out, /\u001B\[33m[^\u001B]*\u001B\[0m/, 'the yellow run was not closed');
+  });
+});

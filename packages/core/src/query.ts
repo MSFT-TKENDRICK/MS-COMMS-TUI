@@ -1162,6 +1162,10 @@ function judgeTerm(term: TermQuery, node: VNode, context: EvaluateContext): Term
       // `is:read` is the negation of the `unread` flag, not a flag of its own; encoding
       // it as a flag would force every provider to emit both halves of every boolean.
       if (value.toLowerCase() === 'read') return decide(!flags.includes('unread'));
+      // Likewise `unavailable` is a field, because it carries a reason as well as a state.
+      // Being able to ask for it matters at the sizes this tool works at: "what in here is
+      // broken" should not require walking into everything to find out.
+      if (value.toLowerCase() === 'unavailable') return decide(node.unavailable !== undefined);
       return decide(flags.some((flag) => equals(flag, value)));
     }
 
@@ -1352,7 +1356,7 @@ export const QUERY_FIELD_HELP: ReadonlyArray<readonly [string, string]> = [
   ['author:', 'sender name or address'],
   ['subject:', 'item title'],
   ['body:', 'item body (requires fetching content)'],
-  ['is:', 'flag: unread, read, unanswered, external, sent, flagged, attachment, mention, draft'],
+  ['is:', 'flag: unread, read, unanswered, external, sent, flagged, attachment, mention, draft, unavailable'],
   ['has:', 'alias of is:'],
   ['kind:', 'dir or file'],
   ['after:', 'newer than a date or duration, e.g. 2026-01-01 or 7d'],

@@ -419,7 +419,7 @@ relevance ranking), cross-source search, cache, the local Turso snapshot with ba
 sync, predictive prefetching and vector search, notifications, the line shell, tab
 completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
 GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1607 tests.
+1635 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been

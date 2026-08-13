@@ -73,6 +73,54 @@ export class GitHubClient {
     return this.#token !== undefined && this.#token.length > 0;
   }
 
+  /**
+   * Ask GitHub what this token is allowed to do.
+   *
+   * `/rate_limit` is the probe because it is the one endpoint documented not to count
+   * against the rate limit, so asking costs nothing that the user would rather spend on
+   * their mail. The answer is the `x-oauth-scopes` header, which classic tokens carry on
+   * every response.
+   *
+   * Returns `undefined` for "GitHub did not say", which is not the same as "no scopes" and
+   * must not be treated as such: fine-grained tokens and GitHub App installations omit the
+   * header entirely and are perfectly capable of reading projects. Anything that acts on
+   * this has to distinguish a known-empty list from an unknown one, or it will grey out
+   * working folders for everybody on a modern token.
+   */
+  async scopes(options: { signal?: AbortSignal } = {}): Promise<readonly string[] | undefined> {
+    if (!this.authenticated) return undefined;
+
+    const headers: Record<string, string> = {
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28',
+      'user-agent': this.#userAgent,
+      authorization: this.#bearer(),
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+    options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+
+    try {
+      const response = await this.#fetch(`${this.#baseUrl}/rate_limit`, {
+        headers,
+        signal: controller.signal,
+      });
+      const raw = response.headers.get('x-oauth-scopes');
+      if (raw === null) return undefined;
+      return raw
+        .split(',')
+        .map((scope) => scope.trim())
+        .filter((scope) => scope.length > 0);
+    } catch {
+      // Never fatal. This runs to make a later error friendlier, so failing to answer just
+      // returns the tool to the behaviour it had before the probe existed.
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async get<T>(
     path: string,
     options: { signal?: AbortSignal; etag?: string; accept?: string } = {},
@@ -256,6 +304,20 @@ export class GitHubClient {
           ? `Authenticated limit reached${resetAt === undefined ? '' : `; it resets at ${resetAt.toLocaleTimeString()}`}.`
           : 'Unauthenticated requests are limited to 60 per hour. Setting GITHUB_TOKEN raises that to 5000.',
         ...(resetAt === undefined ? {} : { retryAfter: Math.max(1, Math.ceil((resetAt.getTime() - Date.now()) / 1000)) }),
+      });
+    }
+
+    // The *secondary* limit, which is a different mechanism wearing the same status code:
+    // it fires on burst and concurrency rather than on quota, so `x-ratelimit-remaining` is
+    // still healthy and the check above misses it. Telling the two apart matters because the
+    // generic 403 below is a statement about the token, and repeating that to someone who
+    // simply went too fast sends them off to fix permissions that were never wrong.
+    const retryAfter = response.headers.get('retry-after');
+    if ((response.status === 403 || response.status === 429) && retryAfter !== null) {
+      const seconds = Number(retryAfter);
+      return new VfsError('ERATELIMIT', 'GitHub asked for a slower pace.', {
+        hint: 'A secondary rate limit, triggered by request rate rather than by quota. It clears on its own.',
+        ...(Number.isFinite(seconds) ? { retryAfter: Math.max(1, Math.ceil(seconds)) } : {}),
       });
     }
 

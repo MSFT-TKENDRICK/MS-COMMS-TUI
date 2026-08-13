@@ -794,3 +794,75 @@ describe('Vfs: degradation', () => {
     await assert.rejects(() => vfs.list('/m'), (error: unknown) => error instanceof VfsError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Learning from a refusal
+// ---------------------------------------------------------------------------
+
+/**
+ * A provider that discovers a folder is unreadable only by being asked.
+ *
+ * This is the ordinary case, not a contrived one: a missing scope, an organization that
+ * enforces SSO, a feature switched off for one repository. None of them can be known before
+ * the first attempt, so the provider learns from the failure and labels the entry from then
+ * on. Whether the user ever sees that label is up to the cache, which is what these tests
+ * are about.
+ */
+class LearningProvider implements Provider {
+  readonly id = 'learning';
+  readonly displayName = 'Learning';
+  readonly capabilities = new Set<Capability>(['list']);
+
+  listCalls = 0;
+  #refused = false;
+
+  constructor(private readonly code: 'EACCES' | 'ENETWORK' = 'EACCES') {}
+
+  list(parent: VNode | null): Promise<ListPage> {
+    this.listCalls += 1;
+    if (parent === null) {
+      const boards: VNode = { name: 'boards', id: 'boards', kind: 'dir', title: 'Boards' };
+      return Promise.resolve({
+        entries: [this.#refused ? { ...boards, unavailable: 'needs the read:project scope' } : boards],
+        total: 1,
+      });
+    }
+    this.#refused = true;
+    return Promise.reject(new VfsError(this.code, 'the child listing failed'));
+  }
+}
+
+describe('a listing that fails teaches the listing above it', () => {
+  function mountLearning(vfs: Vfs, code: 'EACCES' | 'ENETWORK' = 'EACCES'): LearningProvider {
+    const provider = new LearningProvider(code);
+    vfs.mount({ path: '/m', id: 'm', provider });
+    return provider;
+  }
+
+  it('shows the warning on the next listing of the parent', async () => {
+    // The parent was cached before anyone knew there was a problem. Left alone it keeps
+    // being served for the whole TTL, so the warning the provider just learned stays
+    // invisible and the user walks into the same error again.
+    const vfs = new Vfs();
+    mountLearning(vfs);
+
+    assert.equal((await vfs.list('/m')).entries[0]?.unavailable, undefined);
+    await assert.rejects(() => vfs.list('/m/boards'));
+
+    assert.equal((await vfs.list('/m')).entries[0]?.unavailable, 'needs the read:project scope');
+  });
+
+  it('keeps serving the parent from cache when the failure was a blip', async () => {
+    // Re-listing the parent costs a real request. An outage or a timeout says nothing about
+    // access, so there is nothing new for the parent to show and no reason to pay for it.
+    const vfs = new Vfs();
+    const provider = mountLearning(vfs, 'ENETWORK');
+
+    await vfs.list('/m');
+    const afterFirst = provider.listCalls;
+    await assert.rejects(() => vfs.list('/m/boards'));
+
+    await vfs.list('/m');
+    assert.equal(provider.listCalls, afterFirst + 1, 'the parent was refetched over a transient failure');
+  });
+});

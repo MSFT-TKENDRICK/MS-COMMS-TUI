@@ -147,7 +147,10 @@ function renderList(state: TuiState, width: number, body: number, options: Rende
     // The selection marker is drawn whichever pane has focus, so you never lose your place
     // while reading a message. Colour, the weaker signal, tracks focus instead.
     const marker = i === state.selected ? '> ' : '  ';
-    const unread = node.flags?.includes('unread') === true ? '*' : ' ';
+    // `!` outranks `*`: a folder you cannot open is more urgent than one with unread items
+    // in it, and the two are never both worth a single column.
+    const unread =
+      node.unavailable !== undefined ? '!' : node.flags?.includes('unread') === true ? '*' : ' ';
     const focused = i === state.selected && state.pane === 'list';
 
     const date = formatDate(node.mtime, options.dateStyle);

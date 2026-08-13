@@ -37,12 +37,47 @@ interface VNode {
   meta?: Record<string, unknown>;  // anything else; queryable as meta.key:value
   childCount?: number;
   unreadCount?: number;
+  unavailable?: string;  // why this cannot be opened; shown as a warning before it is tried
   parentPath?: string;   // required on search results, which have no listing context
 }
 ```
 
 Only `name` is genuinely required. A provider that returns `{name, kind, id, mtime, author}`
 is already useful.
+
+### Warn before the wall
+
+`unavailable` is for a node you can see but cannot open: a folder behind a permission your
+token does not have, a feature the account has switched off, a mailbox that is there but
+closed to you. Set it to a short reason in lower case, phrased as what is wrong rather than
+what happened -- `needs the read:project scope`, not `403 Forbidden`. The shell renders it
+as a `!` marker, a dimmed name and the reason in yellow beside it, and announce mode says
+"Unavailable" before it says anything else. `ls -q is:unavailable` finds them.
+
+Two rules make it useful rather than annoying:
+
+**Keep throwing.** The label is a warning, not a replacement for the error. `list` on an
+unavailable node must still reject, or scripts and pipes have to infer failure from an empty
+listing.
+
+**Only set it when you know.** A folder marked on a guess is worse than one that is not
+marked, because the user learns to ignore the marker. If a check cannot answer -- an
+endpoint that does not report scopes, a probe that timed out -- leave the field alone. It is
+also fine to learn the hard way: catch the permission failure the first time and set the
+field from then on, which is what the GitHub provider does for boards behind SAML. Clear it
+again when a later attempt succeeds, so a user who fixes their token is not left staring at
+a stale warning.
+
+**Scope the reason to what it actually covers.** Most refusals are narrower than the mount:
+per organization, per repository, per mailbox. Remembering one against the whole provider
+means a refusal from one owner greys out another's folder, and a success from the second
+deletes the first's true warning. Key what you remember by whatever the permission belongs
+to, and reserve provider-wide state for genuinely provider-wide facts such as a missing
+token scope.
+
+The engine helps with the timing: when a listing fails with `EACCES` or `EAUTH`, it drops
+the parent directory's cached listing, so the label you set in response is visible on the
+very next `ls` rather than after the cache expires.
 
 ### Names are yours to choose, and it matters
 

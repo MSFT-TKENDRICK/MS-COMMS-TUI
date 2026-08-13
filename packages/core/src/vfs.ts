@@ -824,8 +824,18 @@ export class Vfs {
     try {
       page = await this.#fetchPage(owner, node, normalized, { ...options, limit });
     } catch (error) {
+      const failure = toVfsError(error, normalized);
+      // A permission failure is news the parent listing did not have when it was cached.
+      // Providers respond to it by labelling the entry `unavailable` so the next listing
+      // warns instead of failing again — but the user never sees that if the parent keeps
+      // being served from cache until the TTL lapses. Dropping just that one entry (rather
+      // than calling `invalidate`, which would take the whole subtree and the snapshot with
+      // it) is what lets the warning actually arrive.
+      if (failure.code === 'EACCES' || failure.code === 'EAUTH') {
+        this.#dirCache.delete(vpath.dirname(normalized));
+      }
       const cached = this.#serveStaleOnError ? this.#dirCache.getStale(normalized) : undefined;
-      if (cached === undefined) throw toVfsError(error, normalized);
+      if (cached === undefined) throw failure;
       stale = true;
       staleAgeMs = cached.ageMs;
       const entries = cached.value.order
