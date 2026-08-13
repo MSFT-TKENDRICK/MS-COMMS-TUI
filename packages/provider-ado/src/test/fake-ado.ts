@@ -28,6 +28,7 @@ export interface RecordedRequest {
   readonly url: string;
   readonly path: string;
   readonly query: URLSearchParams;
+  readonly contentType?: string;
   readonly body: unknown;
 }
 
@@ -40,6 +41,7 @@ export interface FakeAdo {
 
 interface FakeWorkItem {
   readonly id: number;
+  readonly rev: number;
   readonly fields: Record<string, unknown>;
 }
 
@@ -214,7 +216,7 @@ function item(id: number, spec: ItemSpec): FakeWorkItem {
   if (spec.repro !== undefined) fields['Microsoft.VSTS.TCM.ReproSteps'] = spec.repro;
   if (spec.tags !== undefined) fields['System.Tags'] = spec.tags;
   if (spec.priority !== undefined) fields['Microsoft.VSTS.Common.Priority'] = spec.priority;
-  return { id, fields };
+  return { id, rev: 3, fields };
 }
 
 function person(displayName: string): Record<string, string> {
@@ -231,11 +233,14 @@ export function createFakeAdo(): FakeAdo {
     const url = new URL(rawUrl);
     const path = decodeURIComponent(url.pathname).replace(/^\/contoso/, '');
     const body = typeof init.body === 'string' ? (JSON.parse(init.body) as unknown) : undefined;
+    const contentType =
+      init.headers instanceof Headers ? init.headers.get('content-type') ?? undefined : headerValue(init.headers, 'content-type');
     requests.push({
       method: init.method ?? 'GET',
       url: rawUrl,
       path,
       query: url.searchParams,
+      ...(contentType === undefined ? {} : { contentType }),
       body,
     });
 
@@ -295,6 +300,15 @@ function route(path: string, method: string, body: unknown): Response {
   }
 
   const commentsMatch = /^\/(.+)\/_apis\/wit\/workitems\/(\d+)\/comments$/i.exec(path);
+  if (commentsMatch !== null && method === 'POST') {
+    return json({
+      id: 3,
+      text: String((body as { text?: unknown } | undefined)?.text ?? ''),
+      createdBy: person('Dana Scully'),
+      createdDate: '2026-08-12T09:00:00Z',
+    });
+  }
+
   if (commentsMatch !== null) {
     const id = Number(commentsMatch[2]);
     return json({
@@ -307,12 +321,18 @@ function route(path: string, method: string, body: unknown): Response {
   }
 
   const oneMatch = /^\/(.+)\/_apis\/wit\/workitems\/(\d+)$/i.exec(path);
+  if (oneMatch !== null && method === 'PATCH') {
+    const found = workItems.find((entry) => entry.id === Number(oneMatch[2]));
+    if (found === undefined) return notFound(path);
+    return json({ id: found.id, rev: found.rev + 1, fields: found.fields });
+  }
+
   if (oneMatch !== null) {
     const found = workItems.find((entry) => entry.id === Number(oneMatch[2]));
     if (found === undefined) return notFound(path);
     return json({
       id: found.id,
-      rev: 3,
+      rev: found.rev,
       fields: {
         ...found.fields,
         // Only the bug carries acceptance criteria, so the "nothing to show" path stays
@@ -331,7 +351,17 @@ function project(entry: FakeWorkItem, fields: readonly string[] | undefined): Fa
   for (const field of fields) {
     if (field in entry.fields) picked[field] = entry.fields[field];
   }
-  return { id: entry.id, fields: picked };
+  return { id: entry.id, rev: entry.rev, fields: picked };
+}
+
+function headerValue(headers: RequestInit['headers'], name: string): string | undefined {
+  if (headers === undefined) return undefined;
+  if (headers instanceof Headers) return headers.get(name) ?? undefined;
+  const lower = name.toLowerCase();
+  if (Array.isArray(headers)) {
+    return headers.find(([key]) => String(key).toLowerCase() === lower)?.[1];
+  }
+  return Object.entries(headers as Record<string, string>).find(([key]) => key.toLowerCase() === lower)?.[1];
 }
 
 /**

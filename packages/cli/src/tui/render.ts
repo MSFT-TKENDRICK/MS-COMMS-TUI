@@ -30,7 +30,7 @@
 
 import { displayWidth, formatDate, padTo, paint, sanitizeForDisplay, truncateWidth } from '../format.js';
 import type { FormatOptions } from '../format.js';
-import { visibleEntries } from './state.js';
+import { accelerators, currentParam, visibleEntries } from './state.js';
 import type { TuiState } from './state.js';
 
 export interface RenderOptions extends FormatOptions {
@@ -78,7 +78,11 @@ export function render(state: TuiState, options: RenderOptions): string[] {
   if (state.mode === 'help') return renderHelp({ ...options, columns: width });
 
   const body = bodyRows(options.rows);
-  const split = state.preview.length > 0;
+  // The palette earns a pane the same way the preview does, and takes the preview's when
+  // both want one: you asked to act on the thing you are reading, so the thing you are
+  // reading is not what needs the space.
+  const choosing = isActing(state);
+  const split = state.preview.length > 0 || choosing;
   // The 1 column is the divider. Below ~60 columns a split leaves neither pane readable,
   // so we stop splitting rather than render two useless slivers.
   const listWidth = split && width >= 60 ? Math.floor((width - 1) * 0.45) : width;
@@ -86,8 +90,18 @@ export function render(state: TuiState, options: RenderOptions): string[] {
 
   const lines: string[] = [titleLine(state, width, options), rule(width, options)];
 
-  const left = renderList(state, listWidth, body, options);
-  const right = previewWidth > 0 ? renderPreview(state, previewWidth, body, options) : [];
+  // On a narrow terminal there is one pane, so the palette has to take it outright —
+  // otherwise choosing an action would mean choosing from a list you cannot see.
+  const left =
+    choosing && previewWidth <= 0
+      ? renderActions(state, listWidth, body, options)
+      : renderList(state, listWidth, body, options);
+  const right =
+    previewWidth <= 0
+      ? []
+      : choosing
+        ? renderActions(state, previewWidth, body, options)
+        : renderPreview(state, previewWidth, body, options);
 
   for (let i = 0; i < body; i += 1) {
     const listRow = left[i] ?? ' '.repeat(listWidth);
@@ -99,34 +113,49 @@ export function render(state: TuiState, options: RenderOptions): string[] {
   }
 
   lines.push(rule(width, options));
-  lines.push(fit(statusLine(state), width));
+  lines.push(fit(statusRow(state), width));
   lines.push(inputLine(state, width, options));
   return lines;
 }
 
 /**
- * The status line, with the microphone state prepended when it is on.
+ * What the single status row says.
  *
- * A recording indicator is not decoration. The one thing a user must be able to check at a
- * glance, in a program that can hear them, is whether it is listening right now — and it has
- * to be a word rather than a coloured dot, because the people most likely to be using voice
- * control are the least likely to be able to see one.
+ * Startup wins while it is running, and only then. The pane is drawn before the sources are
+ * connected — that is what makes it feel instant — so for the first moment of a session the
+ * most useful thing the row can hold is what is being waited for. The instant startup is
+ * done the row goes back to the user's own business, and anything they did in the meantime
+ * that produced a message is still there underneath, unclobbered.
+ *
+ * The microphone state is prepended to whichever of the two is showing, and it outranks both
+ * on purpose. A recording indicator is not decoration: the one thing a user must be able to
+ * check at a glance, in a program that can hear them, is whether it is listening right now.
+ * It is a word rather than a coloured dot because the people most likely to be using voice
+ * control are the least likely to be able to see one, and this row is what a screen reader
+ * speaks. The chip in the input bar is the visual echo of the same fact, but the chip is
+ * absent while choosing or confirming an action, so this row is the indicator that is always
+ * present.
  */
-export function statusLine(state: TuiState): string {
+export function statusRow(state: TuiState): string {
+  const base = state.startup === '' ? state.status : state.startup;
   switch (state.voice.phase) {
     case 'listening':
-      // The status line is what a screen reader speaks, so the fact that decides the user's
-      // next move — whether letting go of the key ends the recording — is spoken, not left
-      // to the coloured chip in the input bar, which they may not be able to see.
-      return state.voice.hold === 'latched' ? `[MIC ON, LOCKED] ${state.status}` : `[MIC ON] ${state.status}`;
+      // Whether letting go of the key ends the recording decides what the user does next, so
+      // it is said in words rather than left to the colour of the chip.
+      return state.voice.hold === 'latched' ? `[MIC ON, LOCKED] ${base}` : `[MIC ON] ${base}`;
     case 'transcribing':
-      return `[MIC …] ${state.status}`;
+      return `[MIC …] ${base}`;
     case 'off':
     case 'idle':
-      return state.status;
+      return base;
     default:
-      return `[MIC] ${state.status}`;
+      return `[MIC] ${base}`;
   }
+}
+
+/** True while the user is choosing, filling in, or confirming an action. */
+function isActing(state: TuiState): boolean {
+  return state.mode === 'actions' || state.mode === 'param' || state.mode === 'confirm';
 }
 
 function rule(width: number, options: RenderOptions): string {
@@ -271,13 +300,70 @@ function inputLine(state: TuiState, width: number, options: RenderOptions): stri
   if (state.mode === 'filter') return painted + fit(`Filter: ${state.filter}\u2588`, room);
   if (state.mode === 'command') return painted + fit(`: ${state.command}\u2588`, room);
 
+  if (state.mode === 'param' && state.pending !== undefined) {
+    const param = currentParam(state.pending);
+    const name = param === undefined ? 'Value' : (param.label ?? param.name);
+    return fit(`${name}: ${state.pending.input}\u2588`, width);
+  }
+  if (state.mode === 'confirm' && state.pending !== undefined) {
+    const label = state.pending.descriptor.label ?? state.pending.descriptor.name;
+    return paint(fit(`${label} \u2014 press y to go ahead, any other key to cancel`, width), 'bold', options.color);
+  }
+  if (state.mode === 'actions') {
+    return paint(fit('Press the letter, or Up/Down then Enter   Escape cancels', width), 'dim', options.color);
+  }
+
   // `/` appears in both hints. It is now the only way into a filter, so it has to be on
   // screen in every state it works in — which is both panes.
   const hint =
     state.pane === 'preview'
-      ? 'Tab list   Up/Down scroll   / filter   : command   ? help   q quit'
-      : 'Enter open   Backspace up   / filter   : command   ? help   q quit';
+      ? 'Tab list   Up/Down scroll   a act   / filter   : command   ? help   q quit'
+      : 'Enter open   a act   Backspace up   / filter   : command   ? help   q quit';
   return painted + paint(fit(hint, room), 'dim', options.color);
+}
+
+/**
+ * The action palette.
+ *
+ * Grouped, because a flat list of fourteen verbs on a pull request is a wall: the groups a
+ * provider declares are the difference between "review, reply, triage" and fourteen equal
+ * choices. The accelerator is shown against every row — a menu whose shortcuts are secret
+ * is a menu nobody uses twice.
+ */
+function renderActions(state: TuiState, width: number, body: number, options: RenderOptions): string[] {
+  const target = state.actionTarget;
+  const heading = target === undefined ? 'Actions' : `Actions \u2014 ${target.title ?? target.name}`;
+  const rows: string[] = [paint(fit(heading, width), 'bold', options.color), ' '.repeat(width)];
+
+  const keys = accelerators(state.actions);
+  // The chosen action stays highlighted while its parameters are collected, so the screen
+  // still answers "what am I typing this into".
+  const active = state.pending?.descriptor.name;
+  let group: string | undefined;
+
+  for (const [index, descriptor] of state.actions.entries()) {
+    if (rows.length >= body) break;
+    if (descriptor.group !== group) {
+      group = descriptor.group;
+      if (group !== undefined && rows.length < body) {
+        rows.push(paint(fit(`  ${group}`, width), 'dim', options.color));
+      }
+    }
+    if (rows.length >= body) break;
+
+    const selected = active === undefined ? index === state.actionIndex : active === descriptor.name;
+    const marker = selected ? '>' : ' ';
+    const key = keys[index] ?? ' ';
+    const label = descriptor.label ?? descriptor.name;
+    // The exclamation is the only warning a destructive verb gets in the list itself; the
+    // real guard is the confirmation, and this is what tells you it is coming.
+    const warn = descriptor.destructive === true ? ' !' : '';
+    const line = fit(`${marker} ${key}  ${label}${warn}`, width);
+    rows.push(selected ? paint(line, 'cyan', options.color) : line);
+  }
+
+  while (rows.length < body) rows.push(' '.repeat(width));
+  return rows;
 }
 
 /**
@@ -305,6 +391,7 @@ export function renderHelp(options: RenderOptions): string[] {
     ['[  /  ]', 'back / forward through where you have been (also Alt+Left, Alt+Right)'],
     ['Tab', 'switch between the list and the preview'],
     ['/', 'filter as you type (Enter keeps it, Escape clears it)'],
+    ['a', 'what you can do with the selected item \u2014 reply, approve, comment, flag\u2026'],
     [':', 'run any command \u2014 ls, find, grep, cat, open, mark, watch\u2026'],
     ['r, F5', 'refresh the current folder'],
     ['u', 'undo the last change (anywhere \u2014 pane, shell, or voice)'],
@@ -317,6 +404,21 @@ export function renderHelp(options: RenderOptions): string[] {
   const keyWidth = keys.reduce((max, pair) => Math.max(max, displayWidth(pair[0])), 0);
   const out: string[] = [paint(fit('Keys', width), 'bold', options.color), ' '.repeat(width)];
   for (const [key, meaning] of keys) out.push(fit(`  ${padTo(key, keyWidth)}   ${meaning}`, width));
+
+  out.push(' '.repeat(width));
+  out.push(paint(fit('Acting on things', width), 'bold', options.color));
+  for (const line of [
+    '  a opens the actions the source says are possible for that item right now, so a',
+    '  merged pull request does not offer to merge and a message you have read does not',
+    '  offer to mark it read. Pick with the letter shown, or Up/Down then Enter.',
+    '  Anything marked ! asks you to press y before it happens.',
+    '  In a text answer, type \\n where you want a line break.',
+    '',
+    '  The same actions are available as commands: `actions` lists them and `do` runs',
+    '  one, so nothing here needs the pane.',
+  ]) {
+    out.push(fit(line, width));
+  }
 
   out.push(' '.repeat(width));
   out.push(paint(fit('The full-screen view adds no capability of its own.', width), 'bold', options.color));

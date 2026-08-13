@@ -110,7 +110,7 @@ manager/  reports/  peers/
 2026-08-11 16:04 chat — Ping about the rollout.md     unread unanswered
 2026-08-09 08:00 mail — Budget question.eml           unread unanswered
 2026-08-10 09:00 mail — Design review.eml             unanswered
-/> do 2 reply body="Looking at it now"
+/> do reply 2 --body "Looking at it now"
 ```
 
 The graph is genuinely cyclic — your manager's `reports/` contains you — and a person is one
@@ -229,6 +229,8 @@ mscomms          # starts the shell — `npm start` if you skipped `npm link`
 /> cat 3
 /> find /demo-mail -q "budget is:unread"
 /> ls /demo-people/Recent
+/> actions 3     # what can I do to this?
+/> do reply 3 --body "On it, thanks."
 ```
 
 The demo data is generated in-process. No credentials, no network.
@@ -326,6 +328,50 @@ That mount lists, pages, caches, searches and completes like any other, and `cat
 message inside it opens the real message. Sources that never heard of graphs get the one
 their tree implies, so nothing has to opt in. See [docs/PROJECTIONS.md](docs/PROJECTIONS.md).
 
+## Acting on what you find
+
+Reading is half of it. Every item carries the verbs that apply to it *right now*, and the
+same list drives the line shell, the pane and anything speaking to either.
+
+```
+/> cd /github/pulls
+/> ls
+1.  #15 Replace the cache with an LRU          Priya Raman     draft open
+2.  #14 Cap default listings and add paging    Dana Whitfield  open review-requested
+/> actions 2
+action           what it does                                   arguments
+approve          [review] Approve this pull request             --body
+request-changes  [review] Request changes on this pull request  --body*
+comment-review   [review] Leave a pull request review comment   --body*
+request-review   [review] Request a pull request review         --reviewers*
+comment          [discuss] Add a comment                        --body*
+assign           [triage] Assign this item                      --assignees*
+label            [triage] Label this item                       --labels*
+merge            [land] Merge this pull request (asks first)    --method=merge|squash|rebase --title --message
+close            [land] Close this item (asks first)            --reason=completed|not_planned
+url              [link] Show the web URL
+An argument marked * is required.
+/> do approve 2 --body "Paging looks right. Nice test."
+Approved #14 Cap default listings and add paging.
+```
+
+Item 1 is a draft, so `actions 1` does not offer `merge` at all. That is the point: the list
+is what applies to *this* item in *this* state, not what the type supports in general, so
+nothing you are offered is a thing that will come back refused.
+
+Mail gets `reply`, `reply-all`, `forward`, `archive` and `delete`; chats and channels get
+`send` and `reply`; issues and work items get `comment`, `assign`, `state` and `close`; a
+person gets `mail` and `chat`.
+
+Anything irreversible asks first: `do merge 2` explains and stops, `do merge 2 --yes` does
+it. In a non-interactive shell it refuses rather than guessing. In the full-screen pane, `a`
+opens the same list on the selection, asks for each argument in turn, confirms the
+destructive ones, and refreshes the view when it is done.
+
+Providers declare all of this as data — see [docs/PLUGINS.md](docs/PLUGINS.md#actions) — so
+a new source gains a keyboard-driven, tab-completable, help-documented set of verbs without
+touching the shell.
+
 ## Keyboard and accessibility
 
 - **Everything is a typed command.** There is no mouse, and no keystroke you must discover.
@@ -333,6 +379,8 @@ their tree implies, so nothing has to opt in. See [docs/PROJECTIONS.md](docs/PRO
   prints a numbered list as ordinary text — never a floating overlay, which a screen reader
   cannot observe.
 - **Numbers address items.** `ls`, then `cat 3`. Use `#3` when a file is genuinely named `3`.
+- **`a` acts on the selection** in the pane, and `actions <n>` / `do <verb> <n>` do the same
+  by typing. Nothing irreversible happens without a confirmation you have to answer.
 - **Colour is never information.** Anything shown in colour is also stated in words.
 - **`--announce`** renders listings as spoken sentences instead of aligned columns.
 - **Speak to it, if you want.** `voice on` turns on speech control. It produces the same

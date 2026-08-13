@@ -43,6 +43,12 @@ export interface AdoResponse<T> {
 
 export const DEFAULT_API_VERSION = '7.1';
 
+interface RequestOptions {
+  readonly signal?: AbortSignal;
+  readonly apiVersion?: string;
+  readonly contentType?: string;
+}
+
 export class AdoClient {
   readonly #orgUrl: string;
   readonly #authorization: () => Promise<string>;
@@ -79,11 +85,19 @@ export class AdoClient {
     return this.#request<T>('POST', path, body, options);
   }
 
-  async #request<T>(
-    method: 'GET' | 'POST',
+  async patch<T>(
     path: string,
     body: unknown,
-    options: { signal?: AbortSignal; apiVersion?: string },
+    options: RequestOptions = {},
+  ): Promise<AdoResponse<T>> {
+    return this.#request<T>('PATCH', path, body, options);
+  }
+
+  async #request<T>(
+    method: 'GET' | 'POST' | 'PATCH',
+    path: string,
+    body: unknown,
+    options: RequestOptions,
   ): Promise<AdoResponse<T>> {
     const url = this.#url(path, options.apiVersion ?? this.#apiVersion);
     let attempt = 0;
@@ -98,7 +112,7 @@ export class AdoClient {
           authorization: await this.#authorization(),
           accept: 'application/json',
         };
-        if (body !== undefined) headers['content-type'] = 'application/json';
+        if (body !== undefined) headers['content-type'] = options.contentType ?? 'application/json';
 
         const response = await this.#fetch(url, {
           method,

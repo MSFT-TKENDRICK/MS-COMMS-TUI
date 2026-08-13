@@ -10,6 +10,12 @@
  * already-read message as read changes nothing, so offering to undo it would put an entry on
  * the stack that reverses something the user never did — and `undo` would then quietly mark
  * unread a message that was read before they ever touched it.
+ *
+ * Most of those bad promises are now impossible to make, because the action registry refuses
+ * a verb whose `applies` says no. A gated verb has its precondition guaranteed before `run`
+ * is entered, so its inverse is unconditional and the tests below assert the refusal instead
+ * of a missing undo. `tag` is the exception — it applies to anything — so it is the one verb
+ * that still has to decide for itself whether anything changed.
  */
 
 import assert from 'node:assert/strict';
@@ -74,20 +80,20 @@ describe('memory provider: read and unread undo each other', () => {
     assert.deepEqual(await flagsOf(memory, 'Q3 budget review'), before);
   });
 
-  it('offers no inverse for marking an already-read message read', async () => {
-    // Nothing changed, so there is nothing to take back. Offering one would let `undo`
-    // mark unread a message that was read long before the user arrived.
+  it('will not mark an already-read message read, so no false inverse can exist', async () => {
+    // Nothing would change, so there would be nothing to take back. This used to be checked
+    // inside the verb and reported as a missing undo; the gate is the better place for it,
+    // because now `undo` cannot mark unread a message that was read before the user arrived
+    // even if a future edit to the verb forgot to guard.
     const memory = provider();
-    const result = await memory.invoke('read', await nodeNamed(memory, 'Lunch on Friday'), {});
-    assert.equal(result.ok, true);
-    assert.equal(result.undo, undefined);
+    const node = await nodeNamed(memory, 'Lunch on Friday');
+    await assert.rejects(() => memory.invoke('read', node, {}), /"read" does not apply/);
   });
 
-  it('offers no inverse for marking an already-unread message unread', async () => {
+  it('will not mark an already-unread message unread', async () => {
     const memory = provider();
-    const result = await memory.invoke('unread', await nodeNamed(memory, 'Q3 budget review'), {});
-    assert.equal(result.ok, true);
-    assert.equal(result.undo, undefined);
+    const node = await nodeNamed(memory, 'Q3 budget review');
+    await assert.rejects(() => memory.invoke('unread', node, {}), /"unread" does not apply/);
   });
 
   it('makes the round trip in the other direction too', async () => {
@@ -100,7 +106,7 @@ describe('memory provider: read and unread undo each other', () => {
   });
 });
 
-describe('memory provider: flagging is its own inverse', () => {
+describe('memory provider: flag and unflag undo each other', () => {
   it('returns to unflagged after flag then undo', async () => {
     const memory = provider();
     const before = await flagsOf(memory, 'Q3 budget review');
@@ -108,7 +114,7 @@ describe('memory provider: flagging is its own inverse', () => {
     const result = await memory.invoke('flag', await nodeNamed(memory, 'Q3 budget review'), {});
     assert.ok((await flagsOf(memory, 'Q3 budget review')).includes('flagged'));
     assert.ok(result.undo !== undefined);
-    assert.equal(result.undo.action, 'flag');
+    assert.equal(result.undo.action, 'unflag');
 
     await memory.invoke(result.undo.action, await nodeNamed(memory, 'Q3 budget review'), {});
     assert.deepEqual(await flagsOf(memory, 'Q3 budget review'), before);
@@ -119,9 +125,10 @@ describe('memory provider: flagging is its own inverse', () => {
     const before = await flagsOf(memory, 'Deploy plan');
     assert.ok(before.includes('flagged'));
 
-    const result = await memory.invoke('flag', await nodeNamed(memory, 'Deploy plan'), {});
+    const result = await memory.invoke('unflag', await nodeNamed(memory, 'Deploy plan'), {});
     assert.ok(!(await flagsOf(memory, 'Deploy plan')).includes('flagged'));
     assert.ok(result.undo !== undefined);
+    assert.equal(result.undo.action, 'flag');
 
     await memory.invoke(result.undo.action, await nodeNamed(memory, 'Deploy plan'), {});
     assert.deepEqual(await flagsOf(memory, 'Deploy plan'), before);
@@ -129,12 +136,27 @@ describe('memory provider: flagging is its own inverse', () => {
 
   it('says which direction the undo goes, so the prompt can be read aloud', async () => {
     // "Undo" on its own is meaningless out loud. The label is what a screen reader says,
-    // and a toggle needs opposite labels or the prompt tells the user the wrong thing.
+    // and the two directions need opposite labels or the prompt tells the user the wrong
+    // thing. They are separate verbs now rather than one toggle, which is what makes each
+    // label a fixed property of the verb instead of something to work out at run time.
     const memory = provider();
     const flagged = await memory.invoke('flag', await nodeNamed(memory, 'Q3 budget review'), {});
-    const unflagged = await memory.invoke('flag', await nodeNamed(memory, 'Deploy plan'), {});
+    const unflagged = await memory.invoke('unflag', await nodeNamed(memory, 'Deploy plan'), {});
     assert.equal(flagged.undo?.label, 'remove the flag again');
     assert.equal(unflagged.undo?.label, 'put the flag back');
+  });
+
+  it('offers only the one that applies, so neither can be a no-op', async () => {
+    const memory = provider();
+    const unflaggedNode = await nodeNamed(memory, 'Q3 budget review');
+    const flaggedNode = await nodeNamed(memory, 'Deploy plan');
+    const onUnflagged = (await memory.actions(unflaggedNode)).map((descriptor) => descriptor.name);
+    const onFlagged = (await memory.actions(flaggedNode)).map((descriptor) => descriptor.name);
+
+    assert.ok(onUnflagged.includes('flag'));
+    assert.ok(!onUnflagged.includes('unflag'));
+    assert.ok(onFlagged.includes('unflag'));
+    assert.ok(!onFlagged.includes('flag'));
   });
 });
 
@@ -165,11 +187,40 @@ describe('memory provider: tagging', () => {
     assert.equal(again.undo, undefined);
   });
 
-  it('offers no inverse for removing a tag that was not there', async () => {
+  it('is not offered at all on an item with no tags to remove', async () => {
+    // The old shape of this test asked `untag` to remove a tag that was not there and
+    // checked that it offered no inverse. The gate now refuses before `run`, which is the
+    // better answer: a verb that cannot do anything should not be on the menu either.
     const memory = provider();
-    const result = await memory.invoke('untag', await nodeNamed(memory, 'Q3 budget review'), { tag: 'nope' });
-    assert.equal(result.ok, true);
-    assert.equal(result.undo, undefined);
+    const node = await nodeNamed(memory, 'Q3 budget review');
+    const offered = (await memory.actions(node)).map((descriptor) => descriptor.name);
+    assert.ok(!offered.includes('untag'));
+    await assert.rejects(() => memory.invoke('untag', node, { tag: 'nope' }), /"untag" does not apply/);
+  });
+
+  it('names the tags it could remove when asked for one it cannot', async () => {
+    // `ActionDescriptor` is static, so `untag` cannot offer the tags as a list of choices
+    // the way a per-node descriptor could. The names have to reach the user somehow, so
+    // they are in the hint — which is the moment they are actually needed, and the hint is
+    // the half of an error this program is built to read out loud.
+    const memory = provider();
+    await memory.invoke('tag', await nodeNamed(memory, 'Q3 budget review'), { tag: 'urgent' });
+    const node = await nodeNamed(memory, 'Q3 budget review');
+    await assert.rejects(
+      () => memory.invoke('untag', node, { tag: 'nope' }),
+      (error: unknown) => {
+        assert.match(String((error as Error).message), /is not tagged nope/);
+        assert.equal((error as { hint?: string }).hint, 'Tagged: urgent.');
+        return true;
+      },
+    );
+  });
+
+  it('refuses to remove a built-in marker through the tag mechanism', async () => {
+    const memory = provider();
+    await memory.invoke('tag', await nodeNamed(memory, 'Q3 budget review'), { tag: 'urgent' });
+    const node = await nodeNamed(memory, 'Q3 budget review');
+    await assert.rejects(() => memory.invoke('untag', node, { tag: 'unread' }), /built-in marker/);
   });
 
   it('puts a removed tag back, with the tag named in the inverse', async () => {

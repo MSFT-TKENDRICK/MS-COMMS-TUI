@@ -263,6 +263,22 @@ export interface ActionDescriptor {
    * {@link ActionResult.undo}, because only the call itself knows what actually changed.
    */
   readonly irreversible?: boolean;
+  /**
+   * A related set of verbs to show together, e.g. `review` or `reply`.
+   *
+   * Presentation only, and optional, but it is what turns eleven verbs on a pull request
+   * from a wall into three short lists. A frontend that ignores it loses nothing.
+   */
+  readonly group?: string;
+  /**
+   * A single character the provider would like bound to this verb.
+   *
+   * A *request*, not a reservation: two providers cannot coordinate, and a mount can offer
+   * actions from more than one of them at once, so the frontend resolves collisions and
+   * may ignore the hint entirely. Offering it means `a` then `a` approves a pull request
+   * in every session rather than depending on where the verb happened to sort.
+   */
+  readonly key?: string;
 }
 
 /**
@@ -303,6 +319,14 @@ export interface ActionResult {
    * better than an inverse that only usually works.
    */
   readonly undo?: UndoSpec;
+  /**
+   * Further lines worth showing, e.g. the URL of a review that was just submitted.
+   *
+   * Separate from `message` because `message` is the sentence a screen reader announces
+   * and the shell prints on one line; anything longer belongs here, where a frontend can
+   * put it in a pane or leave it out.
+   */
+  readonly details?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------

@@ -23,10 +23,31 @@
  * unique power, so no user is locked out of a feature by being unable to use the pane.
  */
 
-import type { SessionEvent, VNode } from '@mscomms/core';
+import type { ActionDescriptor, ActionParam, ActionResult, MetaValue, SessionEvent, VNode } from '@mscomms/core';
 
 export type Pane = 'list' | 'preview';
-export type Mode = 'browse' | 'filter' | 'command' | 'help';
+export type Mode = 'browse' | 'filter' | 'command' | 'help' | 'actions' | 'param' | 'confirm';
+
+/**
+ * An action the user has chosen but not yet finished asking for.
+ *
+ * Actions are not atomic from the interface's point of view: choosing `reply` starts a
+ * conversation that continues through one prompt per parameter and possibly a confirmation
+ * before anything is sent. Keeping the half-finished request in one value means Escape at
+ * any point discards the whole thing cleanly, and nothing can be sent with a parameter list
+ * assembled from two different attempts.
+ */
+export interface PendingAction {
+  readonly descriptor: ActionDescriptor;
+  readonly node: VNode;
+  readonly path: string;
+  /** Parameters answered so far. */
+  readonly params: Readonly<Record<string, MetaValue>>;
+  /** Which parameter is being asked for now. */
+  readonly paramIndex: number;
+  /** The live text of the current answer. */
+  readonly input: string;
+}
 
 export interface TuiState {
   readonly cwd: string;
@@ -43,6 +64,16 @@ export interface TuiState {
   readonly previewOffset: number;
   readonly previewTitle: string;
   readonly status: string;
+  /**
+   * What startup is still doing, or `''` once it has finished.
+   *
+   * Separate from {@link status} rather than written into it, because the two have
+   * different owners and different lifetimes: `status` answers "what happened when you
+   * pressed that key" and must not be overwritten every time a background check ticks,
+   * while this answers "why is the tree still empty" and has to disappear on its own. The
+   * renderer decides which one the single status row shows; see `render.ts`.
+   */
+  readonly startup: string;
   readonly busy: boolean;
   /**
    * Frames elapsed since the current operation started. Drives the spinner.
@@ -89,6 +120,20 @@ export interface TuiState {
    * lose your place in a thousand-item Inbox, so people stop doing it.
    */
   readonly marks: ReadonlyMap<string, { readonly selected: number; readonly offset: number }>;
+  /**
+   * What can be done to {@link actionTarget}, as the provider last reported it.
+   *
+   * Fetched per node rather than held as a fixed menu, because what is offered is the whole
+   * point: a merged pull request must not offer to merge, and a message you have already
+   * read must not offer to mark it read. A menu that lists everything and fails on most of
+   * it teaches people to be afraid of it.
+   */
+  readonly actions: readonly ActionDescriptor[];
+  readonly actionTarget: VNode | undefined;
+  /** The path {@link actionTarget} was found at, which is what the engine needs to act on it. */
+  readonly actionPath: string;
+  readonly actionIndex: number;
+  readonly pending: PendingAction | undefined;
 }
 
 export interface VoiceIndicator {
@@ -117,6 +162,17 @@ export type Effect =
     }
   | { readonly kind: 'read'; readonly node: VNode }
   | { readonly kind: 'command'; readonly line: string }
+  /** Ask the provider what can be done to this node right now. */
+  | { readonly kind: 'actions'; readonly node: VNode; readonly path: string }
+  | {
+      readonly kind: 'invoke';
+      readonly action: string;
+      readonly node: VNode;
+      readonly path: string;
+      readonly params: Readonly<Record<string, MetaValue>>;
+      /** Carried through so the shell can name what it ran without re-deriving it. */
+      readonly label: string;
+    }
   | { readonly kind: 'refresh' }
   | { readonly kind: 'quit' }
   /** Record one spoken phrase and act on it. See `voiceListening` in {@link TuiState}. */
@@ -146,7 +202,14 @@ export interface Step {
  * user has stopped moving.
  */
 export function isFetching(effect: Effect): boolean {
-  return effect.kind === 'list' || effect.kind === 'read' || effect.kind === 'refresh' || effect.kind === 'command';
+  return (
+    effect.kind === 'list' ||
+    effect.kind === 'read' ||
+    effect.kind === 'refresh' ||
+    effect.kind === 'command' ||
+    effect.kind === 'actions' ||
+    effect.kind === 'invoke'
+  );
 }
 
 export function initialState(cwd: string, rows = 20): TuiState {
@@ -163,6 +226,7 @@ export function initialState(cwd: string, rows = 20): TuiState {
     previewOffset: 0,
     previewTitle: '',
     status: 'Loading…',
+    startup: '',
     busy: true,
     tick: 0,
     busyMs: 0,
@@ -172,6 +236,11 @@ export function initialState(cwd: string, rows = 20): TuiState {
     history: [cwd],
     historyIndex: 0,
     marks: new Map(),
+    actions: [],
+    actionTarget: undefined,
+    actionPath: '',
+    actionIndex: 0,
+    pending: undefined,
   };
 }
 
@@ -319,7 +388,236 @@ export function reduce(state: TuiState, key: Key): Step {
   if (state.mode === 'help') return reduceHelp(state, key);
   if (state.mode === 'filter') return reduceFilter(state, key);
   if (state.mode === 'command') return reduceCommand(state, key);
+  if (state.mode === 'actions') return reduceActions(state, key);
+  if (state.mode === 'param') return reduceParam(state, key);
+  if (state.mode === 'confirm') return reduceConfirm(state, key);
   return reduceBrowse(state, key);
+}
+
+// ---------------------------------------------------------------------------
+// Acting on the selection
+// ---------------------------------------------------------------------------
+
+/**
+ * The single letter that runs each action from the palette.
+ *
+ * Providers may ask for one via `ActionDescriptor.key`, and asking is all it is: two
+ * providers cannot coordinate, and the same node can offer actions from a provider and
+ * from a plugin at once, so a requested letter is honoured only when it is still free.
+ * Everything else falls back to the first free letter of its own name and then to a digit,
+ * which means every action always has exactly one accelerator — a menu where some rows can
+ * only be reached by arrowing is a menu people arrow through.
+ */
+export function accelerators(descriptors: readonly ActionDescriptor[]): readonly string[] {
+  const used = new Set<string>();
+  const assigned: string[] = [];
+  const take = (candidate: string | undefined): string | undefined => {
+    if (candidate === undefined || candidate.length !== 1) return undefined;
+    const lower = candidate.toLowerCase();
+    if (used.has(lower)) return undefined;
+    used.add(lower);
+    return lower;
+  };
+
+  // Requested letters are claimed in a first pass, so a provider's choice is not stolen by
+  // an earlier action that merely happened to start with the same letter.
+  const requested = descriptors.map((descriptor) => take(descriptor.key));
+
+  for (const [index, descriptor] of descriptors.entries()) {
+    let letter = requested[index];
+    if (letter === undefined) {
+      for (const char of descriptor.name.toLowerCase()) {
+        if (char < 'a' || char > 'z') continue;
+        letter = take(char);
+        if (letter !== undefined) break;
+      }
+    }
+    letter ??= take(String((index + 1) % 10));
+    assigned.push(letter ?? ' ');
+  }
+  return assigned;
+}
+
+/** The parameter currently being asked for, or undefined when they have all been answered. */
+export function currentParam(pending: PendingAction): ActionParam | undefined {
+  return pending.descriptor.params?.[pending.paramIndex];
+}
+
+/**
+ * A sentence describing where we are in the palette.
+ *
+ * Written to be heard rather than seen: it names the action, its position, and the fact
+ * that it needs confirmation, because a screen reader user gets the status line and not the
+ * highlight.
+ */
+export function describeAction(state: TuiState): string {
+  const descriptor = state.actions[state.actionIndex];
+  if (descriptor === undefined) return 'No actions available.';
+  const keys = accelerators(state.actions);
+  const parts = [
+    `${String(state.actionIndex + 1)} of ${String(state.actions.length)}`,
+    descriptor.label ?? descriptor.name,
+  ];
+  const key = keys[state.actionIndex];
+  if (key !== undefined && key !== ' ') parts.push(`press ${key}`);
+  if (descriptor.destructive === true) parts.push('asks for confirmation');
+  if (descriptor.description !== undefined) parts.push(descriptor.description);
+  return parts.join(', ') + '.';
+}
+
+/**
+ * Move from a chosen action to whatever has to happen before it can run.
+ *
+ * One function for all three exits — ask for a parameter, ask for confirmation, or go —
+ * because they are the same decision made at two different times: it is also what runs
+ * after each answer, so a five-parameter action and a zero-parameter action follow the
+ * identical path and cannot diverge.
+ */
+function advance(state: TuiState, pending: PendingAction): Step {
+  const param = currentParam(pending);
+  if (param !== undefined) {
+    return {
+      state: { ...state, mode: 'param', pending, status: promptFor(param) },
+      effects: [],
+    };
+  }
+  if (pending.descriptor.destructive === true) {
+    return {
+      state: {
+        ...state,
+        mode: 'confirm',
+        pending,
+        status: `${pending.descriptor.label ?? pending.descriptor.name}: press y to confirm, anything else to cancel.`,
+      },
+      effects: [],
+    };
+  }
+  return run(state, pending);
+}
+
+function run(state: TuiState, pending: PendingAction): Step {
+  const label = pending.descriptor.label ?? pending.descriptor.name;
+  return {
+    state: { ...state, mode: 'browse', pending: undefined, busy: true, status: `${label}…` },
+    effects: [
+      {
+        kind: 'invoke',
+        action: pending.descriptor.name,
+        node: pending.node,
+        path: pending.path,
+        params: pending.params,
+        label,
+      },
+    ],
+  };
+}
+
+function promptFor(param: ActionParam): string {
+  const name = param.label ?? param.name;
+  const parts = [name];
+  if (param.type === 'choice' && param.choices !== undefined) parts.push(`one of ${param.choices.join(', ')}`);
+  if (param.type === 'boolean') parts.push('yes or no');
+  if (param.default !== undefined) parts.push(`default ${String(param.default)}`);
+  parts.push(param.required === true ? 'required' : 'optional, Enter to skip');
+  return `${parts.join(' — ')}. Escape cancels.`;
+}
+
+function cancelled(state: TuiState): Step {
+  return {
+    state: { ...state, mode: 'browse', pending: undefined, status: 'Cancelled. Nothing was sent.' },
+    effects: [],
+  };
+}
+
+function reduceActions(state: TuiState, key: Key): Step {
+  if (key.name === 'escape') return cancelled(state);
+
+  if (key.name === 'down' || key.name === 'j' || key.name === 'tab') {
+    const index = (state.actionIndex + 1) % Math.max(1, state.actions.length);
+    const next: TuiState = { ...state, actionIndex: index };
+    return { state: { ...next, status: describeAction(next) }, effects: [] };
+  }
+  if (key.name === 'up' || key.name === 'k') {
+    const count = Math.max(1, state.actions.length);
+    const next: TuiState = { ...state, actionIndex: (state.actionIndex - 1 + count) % count };
+    return { state: { ...next, status: describeAction(next) }, effects: [] };
+  }
+
+  const start = (descriptor: ActionDescriptor, index: number): Step => {
+    const target = state.actionTarget;
+    if (target === undefined) return cancelled(state);
+    return advance(
+      { ...state, actionIndex: index },
+      { descriptor, node: target, path: state.actionPath, params: {}, paramIndex: 0, input: '' },
+    );
+  };
+
+  if (key.name === 'return' || key.name === 'enter') {
+    const descriptor = state.actions[state.actionIndex];
+    if (descriptor === undefined) return cancelled(state);
+    return start(descriptor, state.actionIndex);
+  }
+
+  // Accelerators are matched only against a bare character, so Ctrl+A cannot silently
+  // approve something on the way to whatever the user actually meant.
+  const char = printable(key)?.toLowerCase();
+  if (char !== undefined) {
+    const index = accelerators(state.actions).indexOf(char);
+    const descriptor = index < 0 ? undefined : state.actions[index];
+    if (descriptor !== undefined) return start(descriptor, index);
+    return { state: { ...state, status: `No action is bound to "${char}". Escape closes this list.` }, effects: [{ kind: 'bell' }] };
+  }
+  return { state, effects: [] };
+}
+
+function reduceParam(state: TuiState, key: Key): Step {
+  const pending = state.pending;
+  if (pending === undefined) return { state: { ...state, mode: 'browse' }, effects: [] };
+  if (key.name === 'escape') return cancelled(state);
+
+  const param = currentParam(pending);
+  if (param === undefined) return advance(state, pending);
+
+  if (key.name === 'return' || key.name === 'enter') {
+    const value = pending.input.trim();
+    if (value === '' && param.required === true) {
+      return {
+        state: { ...state, status: `${param.label ?? param.name} is required. Type a value, or press Escape to cancel.` },
+        effects: [{ kind: 'bell' }],
+      };
+    }
+    // Empty means "not supplied", which is exactly what the engine's parameter resolution
+    // expects: it is what lets a default apply instead of being overwritten with a blank.
+    const params = value === '' ? pending.params : { ...pending.params, [param.name]: unescapeNewlines(value) };
+    return advance(state, { ...pending, params, paramIndex: pending.paramIndex + 1, input: '' });
+  }
+  if (key.name === 'backspace') {
+    return { state: { ...state, pending: { ...pending, input: pending.input.slice(0, -1) } }, effects: [] };
+  }
+  const char = printable(key);
+  if (char === undefined) return { state, effects: [] };
+  return { state: { ...state, pending: { ...pending, input: pending.input + char } }, effects: [] };
+}
+
+function reduceConfirm(state: TuiState, key: Key): Step {
+  const pending = state.pending;
+  if (pending === undefined) return { state: { ...state, mode: 'browse' }, effects: [] };
+  // Only `y` proceeds. Enter is deliberately not an accepted confirmation: it is the key
+  // someone is already pressing when the prompt appears.
+  if (key.name === 'y') return run(state, pending);
+  return cancelled(state);
+}
+
+/**
+ * Turn a typed `\n` into a real newline.
+ *
+ * A single-line prompt is the honest shape for a terminal input, but review comments and
+ * replies genuinely want paragraphs, and telling someone to go and use the command line for
+ * that is telling them the pane is a toy. Two characters is a small enough price that it can
+ * be mentioned in the help and then forgotten by anyone who does not need it.
+ */
+function unescapeNewlines(value: string): string {
+  return value.replace(/\\n/g, '\n');
 }
 
 function reduceHelp(state: TuiState, key: Key): Step {
@@ -464,6 +762,21 @@ function reduceBrowse(state: TuiState, key: Key): Step {
     // rather than a bespoke path so the pane cannot undo something the shell could not.
     case 'u':
       return { state: { ...state, busy: true, status: 'Undoing…' }, effects: [{ kind: 'command', line: 'undo' }] };
+
+    case 'a': {
+      // Deliberately works from either pane and always means the item you are looking at.
+      // Someone reading a pull request in the preview should not have to Tab back to the
+      // list to approve it — that is the whole complaint about read-only detail panes.
+      const node = shown[state.selected];
+      if (node === undefined) {
+        return { state: { ...state, status: 'Nothing selected, so there is nothing to act on.' }, effects: [{ kind: 'bell' }] };
+      }
+      const path = joinPath(state.cwd, node.name);
+      return {
+        state: { ...state, busy: true, status: `Finding out what you can do with ${node.name}…` },
+        effects: [{ kind: 'actions', node, path }],
+      };
+    }
 
     default:
       break;
@@ -668,14 +981,69 @@ export function withPreview(state: TuiState, title: string, lines: readonly stri
     previewTitle: title,
     previewOffset: 0,
     pane: 'preview',
-    status: `${title}. Tab returns to the list.`,
+    status: `${title}. Tab returns to the list, a shows what you can do with it.`,
   };
+}
+
+/**
+ * Open the action palette with what the provider said is possible.
+ *
+ * An empty list is reported rather than shown as an empty menu, and it says *why* the list
+ * is empty as far as we can tell — "nothing right now" reads like a bug, whereas naming the
+ * node makes it clear the question was asked and answered.
+ */
+export function withActions(
+  state: TuiState,
+  node: VNode,
+  path: string,
+  descriptors: readonly ActionDescriptor[],
+): TuiState {
+  if (descriptors.length === 0) {
+    return withStatus(state, `There is nothing you can do with ${node.name} from here.`);
+  }
+  const next: TuiState = {
+    ...settled(state),
+    mode: 'actions',
+    actions: descriptors,
+    actionTarget: node,
+    actionPath: path,
+    actionIndex: 0,
+    pending: undefined,
+  };
+  return {
+    ...next,
+    status: `${String(descriptors.length)} actions for ${node.name}. ${describeAction(next)}`,
+  };
+}
+
+/**
+ * Report what an action did.
+ *
+ * `message` is used verbatim because the provider wrote it as a complete sentence for
+ * exactly this moment, and paraphrasing it here would mean two places to keep honest.
+ */
+export function withActionResult(state: TuiState, result: ActionResult): TuiState {
+  const details = result.details ?? [];
+  const suffix = details.length === 0 ? '' : ` ${details.join(' ')}`;
+  return { ...settled(state), mode: 'browse', pending: undefined, status: `${result.message}${suffix}` };
 }
 
 /** Replace the status line. The status line is the screen reader's primary channel, so
  *  callers should say something worth hearing rather than restating what's already visible. */
 export function withStatus(state: TuiState, message: string): TuiState {
   return { ...settled(state), status: message };
+}
+
+/**
+ * Replace the startup line, which takes the status row while it is non-empty.
+ *
+ * Deliberately not routed through {@link withStatus}: startup progress is not an answer to
+ * anything the user did, so it must not clear the working indicator, and it must not
+ * destroy a message they are still reading. Passing `''` hands the row back.
+ */
+export function withStartup(state: TuiState, message: string): TuiState {
+  if (state.startup === message) return state;
+  return { ...state, startup: message };
 }
 
 /**
@@ -712,9 +1080,11 @@ function settled(state: TuiState): TuiState {
 }
 
 /** Same mechanics as {@link withStatus}, named separately so a reader can tell at the call
- *  site whether a message is a failure or a hint. */
+ *  site whether a message is a failure or a hint. Also abandons any half-collected action:
+ *  a palette left open over a node whose state we no longer know is an invitation to send
+ *  the wrong thing. */
 export function withError(state: TuiState, message: string): TuiState {
-  return withStatus(state, message);
+  return { ...withStatus(state, message), mode: 'browse', pending: undefined };
 }
 
 export function withRows(state: TuiState, rows: number): TuiState {

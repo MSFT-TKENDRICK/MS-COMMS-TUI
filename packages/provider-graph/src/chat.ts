@@ -21,9 +21,14 @@
  */
 
 import {
+  ActionRegistry,
   VfsError,
   isVfsError,
+  metaText,
+  requiredText,
   timestampPrefix,
+  type ActionDescriptor,
+  type ActionResult,
   type Capability,
   type ChangeEvent,
   type Document,
@@ -35,6 +40,7 @@ import {
   type ProviderPlugin,
   type Query,
   type ReadOptions,
+  type MetaValue,
   type VNode,
 } from '@mscomms/core';
 import type { GraphApi, GraphPage } from './client.js';
@@ -53,6 +59,14 @@ export interface GraphChatOptions extends GraphSharedOptions {
   readonly pageSize?: number;
   /** Cap on replies fetched per thread. */
   readonly maxReplies?: number;
+  /**
+   * Enable the actions that write: sending new chat and channel messages.
+   *
+   * Off by default. A tool that reads corporate Teams messages is easy to justify
+   * installing; a tool that can speak as you is a different conversation, and it should be
+   * one the user opts into rather than discovers.
+   */
+  readonly allowSend?: boolean;
 }
 
 interface Chat {
@@ -101,20 +115,52 @@ interface ChatMessage {
 export class GraphChatProvider implements Provider {
   readonly id: string;
   readonly displayName = 'Teams and chats';
-  readonly capabilities: ReadonlySet<Capability> = new Set<Capability>(['list', 'read', 'poll']);
+  readonly capabilities: ReadonlySet<Capability> = new Set<Capability>(['list', 'read', 'poll', 'actions']);
 
   readonly #options: GraphChatOptions;
   readonly #context: ProviderContext;
+  readonly #registry = new ActionRegistry<GraphChatProvider>([
+    {
+      descriptor: {
+        name: 'send',
+        label: 'Send a message',
+        description: 'Post a new Teams message here.',
+        group: 'reply',
+        key: 's',
+        params: [{ name: 'body', type: 'text', label: 'Message', required: true }],
+      },
+      applies: (node) => node.subtype === 'chat' || node.subtype === 'channel' || node.subtype === 'thread',
+      run: ({ node, params, context }) => context.#send(node, params),
+    },
+    {
+      descriptor: {
+        name: 'reply',
+        label: 'Reply',
+        description: 'Reply in the containing chat or thread.',
+        group: 'reply',
+        key: 'r',
+        params: [{ name: 'body', type: 'text', label: 'Reply', required: true }],
+      },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, params, context }) => context.#reply(node, params),
+    },
+    {
+      descriptor: { name: 'url', label: 'Show the web URL', description: 'Print the Teams web link.', group: 'link', key: 'u' },
+      applies: (node) => typeof node.meta?.['webUrl'] === 'string' || typeof node.meta?.['webLink'] === 'string',
+      run: ({ node, context }) => context.#urlAction(node),
+    },
+  ]);
   #client: GraphApi | undefined;
 
-  constructor(options: GraphChatOptions, context: ProviderContext) {
+  constructor(options: GraphChatOptions, context: ProviderContext, client?: GraphApi) {
     this.#options = options;
     this.#context = context;
     this.id = `graph-chat:${context.mountPath}`;
+    this.#client = client;
   }
 
   async init(): Promise<void> {
-    this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
+    this.#client ??= createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
   /** Bring the transport up in the background. See `Provider.warm`. */
@@ -428,6 +474,55 @@ export class GraphChatProvider implements Provider {
     return { changes, ...(deltaLink === undefined ? {} : { cursor: deltaLink }) };
   }
 
+  // -------------------------------------------------------------------------
+  // Actions
+  // -------------------------------------------------------------------------
+
+  async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
+    return this.#registry.descriptors(node, this);
+  }
+
+  async invoke(action: string, node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    return this.#registry.invoke(action, node, params, this, this.id);
+  }
+
+  /**
+   * The gate on everything that writes.
+   *
+   * Named as one place rather than repeated per action so there is no way to add a writing
+   * action later and forget it, and so the message can name both halves of what is needed:
+   * the config switch *and* the Graph scopes, because having one without the other produces
+   * a failure that is otherwise very hard to diagnose.
+   */
+  #requireSend(action: string): void {
+    if (this.#options.allowSend === true) return;
+    throw new VfsError('ENOTSUP', `"${action}" is disabled: the ${this.id} mount is read-only.`, {
+      hint:
+        'Set "allowSend": true on this mount in your config, then re-run `login` so consent ' +
+        'covers Chat.ReadWrite and ChatMessage.Send.',
+    });
+  }
+
+  async #send(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('send');
+    const body = requiredText(params, 'body');
+    await this.#api.post(postTargetOf(node), { body: { contentType: 'text', content: body } });
+    return { ok: true, message: `Sent a message to "${node.title}".`, invalidates: [node.path ?? node.name] };
+  }
+
+  async #reply(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('reply');
+    const body = requiredText(params, 'body');
+    await this.#api.post(replyTargetOf(node), { body: { contentType: 'text', content: body } });
+    return { ok: true, message: `Replied to "${node.title}".`, invalidates: [parentOf(node)] };
+  }
+
+  async #urlAction(node: VNode): Promise<ActionResult> {
+    const web = node.meta?.['webUrl'] ?? node.meta?.['webLink'];
+    if (typeof web === 'string') return { ok: true, message: web };
+    return { ok: true, message: metaText(node, 'webUrl') };
+  }
+
   /**
    * Run a Teams call, converting "the tenant will not let you do this" into an empty
    * result plus one warning, rather than an error that takes the whole mount down.
@@ -452,6 +547,50 @@ function isVisible(message: ChatMessage): boolean {
   // messages are tombstones. Neither is worth a line in a listing.
   if (message.deletedDateTime !== null && message.deletedDateTime !== undefined) return false;
   return message.messageType === 'message';
+}
+
+function isMessageNode(node: VNode): boolean {
+  return node.kind === 'file' && (node.subtype === 'post' || node.subtype === 'reply');
+}
+
+function postTargetOf(node: VNode): string {
+  if (node.subtype === 'chat') return `/chats/${encodeURIComponent(node.id)}/messages`;
+
+  const teamId = node.meta?.['teamId'];
+  const channelId = node.subtype === 'channel' ? node.id : node.meta?.['channelId'];
+  if (typeof teamId !== 'string' || typeof channelId !== 'string') {
+    throw VfsError.invalid(
+      'That Teams location is missing the ids needed to post into it.',
+      'Refresh the listing and try the action from the chat, channel or thread node again.',
+    );
+  }
+  const channel = `/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}/messages`;
+  if (node.subtype === 'thread') return `${channel}/${encodeURIComponent(node.id)}/replies`;
+  return channel;
+}
+
+function replyTargetOf(node: VNode): string {
+  const chatId = node.meta?.['chatId'];
+  if (typeof chatId === 'string') return `/chats/${encodeURIComponent(chatId)}/messages`;
+
+  const teamId = node.meta?.['teamId'];
+  const channelId = node.meta?.['channelId'];
+  const threadId = node.meta?.['threadId'];
+  if (typeof teamId !== 'string' || typeof channelId !== 'string') {
+    throw VfsError.invalid(
+      'That Teams message is missing the ids needed to reply to it.',
+      'Refresh the listing and try the action from the message again.',
+    );
+  }
+  const root = typeof threadId === 'string' ? threadId : node.id;
+  return `/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(root)}/replies`;
+}
+
+function parentOf(node: VNode): string {
+  const path = node.path;
+  if (path === undefined) return node.name;
+  const slash = path.lastIndexOf('/');
+  return slash <= 0 ? path : path.slice(0, slash);
 }
 
 function authorOf(message: ChatMessage): string {

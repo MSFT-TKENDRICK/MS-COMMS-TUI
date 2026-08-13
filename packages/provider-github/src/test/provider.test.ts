@@ -762,7 +762,13 @@ describe('actions', () => {
     const projects = await provider.list(await cd(provider, OWNER, 'projects'), {});
     const items = await provider.list(projects.entries[0] as VNode, {});
 
-    for (const node of [discussions.entries[0], projects.entries[0], items.entries[0]]) {
+    const discussionActions = await provider.actions(discussions.entries[0] as VNode);
+    assert.deepEqual(
+      discussionActions.map((action) => action.name),
+      ['comment', 'url'],
+    );
+
+    for (const node of [projects.entries[0], items.entries[0]]) {
       const actions = await provider.actions(node as VNode);
       assert.deepEqual(
         actions.map((action) => action.name),
@@ -781,5 +787,100 @@ describe('actions', () => {
     const draft = items.entries.find((entry) => entry.title === 'Write the migration note');
 
     assert.deepEqual(await provider.actions(draft as VNode), []);
+  });
+
+  it('offers contextual pull request review actions only while they can run', async () => {
+    const { provider } = await makeProvider({ state: 'all' });
+    const pulls = await provider.list(await cd(provider, OWNER, REPO, 'pulls'), { limit: 100 });
+    const open = pulls.entries.find((entry) => entry.title.startsWith('#101'));
+    const merged = pulls.entries.find((entry) => entry.title.startsWith('#102'));
+    assert.ok(open !== undefined);
+    assert.ok(merged !== undefined);
+
+    const openActions = (await provider.actions(open)).map((action) => action.name);
+    assert.ok(openActions.includes('approve'));
+    assert.ok(openActions.includes('request-changes'));
+    assert.ok(openActions.includes('merge'));
+
+    const mergedActions = (await provider.actions(merged)).map((action) => action.name);
+    assert.ok(!mergedActions.includes('approve'));
+    assert.ok(!mergedActions.includes('request-changes'));
+    assert.ok(!mergedActions.includes('merge'));
+  });
+
+  it('approves a pull request review with the supplied body', async () => {
+    const { provider, fake } = await makeProvider();
+    const pulls = await provider.list(await cd(provider, OWNER, REPO, 'pulls'), { limit: 100 });
+    const open = pulls.entries.find((entry) => entry.title.startsWith('#101'));
+    assert.ok(open !== undefined);
+
+    const result = await provider.invoke('approve', open, { body: 'Ship it.' });
+
+    assert.equal(result.message, 'Approved #101 Pull 101.');
+    const request = fake.matching(`/repos/${OWNER}/${REPO}/pulls/101/reviews`).at(-1);
+    assert.equal(request?.method, 'POST');
+    assert.deepEqual(request?.body, { event: 'APPROVE', body: 'Ship it.' });
+  });
+
+  it('refuses request-changes without posting an empty review', async () => {
+    const { provider, fake } = await makeProvider();
+    const pulls = await provider.list(await cd(provider, OWNER, REPO, 'pulls'), { limit: 100 });
+    const open = pulls.entries.find((entry) => entry.title.startsWith('#101'));
+    assert.ok(open !== undefined);
+    const before = fake.matching(`/repos/${OWNER}/${REPO}/pulls/101/reviews`).length;
+
+    await assert.rejects(() => provider.invoke('request-changes', open, {}), (error) => {
+      assert.ok(isVfsError(error));
+      assert.match(error.message, /needs body/);
+      return true;
+    });
+    assert.equal(fake.matching(`/repos/${OWNER}/${REPO}/pulls/101/reviews`).length, before);
+  });
+
+  it('merges with the chosen merge method', async () => {
+    const { provider, fake } = await makeProvider();
+    const pulls = await provider.list(await cd(provider, OWNER, REPO, 'pulls'), { limit: 100 });
+    const open = pulls.entries.find((entry) => entry.title.startsWith('#101'));
+    assert.ok(open !== undefined);
+
+    await provider.invoke('merge', open, { method: 'squash' });
+
+    const request = fake.matching(`/repos/${OWNER}/${REPO}/pulls/101/merge`).at(-1);
+    assert.equal(request?.method, 'PUT');
+    assert.deepEqual(request?.body, { merge_method: 'squash' });
+  });
+
+  it('closes an issue by patching its state', async () => {
+    const { provider, fake } = await makeProvider();
+    const issues = await provider.list(await cd(provider, OWNER, REPO, 'issues'), { limit: 100 });
+    const issue = issues.entries.find((entry) => entry.title.startsWith('#1 '));
+    assert.ok(issue !== undefined);
+
+    await provider.invoke('close', issue, {});
+
+    const request = fake.matching(`/repos/${OWNER}/${REPO}/issues/1`).at(-1);
+    assert.equal(request?.method, 'PATCH');
+    assert.deepEqual(request?.body, { state: 'closed' });
+  });
+
+  it('still rejects an unknown action', async () => {
+    const { provider } = await makeProvider();
+    const pulls = await provider.list(await cd(provider, OWNER, REPO, 'pulls'), { limit: 100 });
+
+    await assert.rejects(() => provider.invoke('dance', pulls.entries[0] as VNode, {}), (error) => {
+      assert.ok(isVfsError(error));
+      assert.match(error.message, /not supported/i);
+      return true;
+    });
+  });
+
+  it('flags destructive actions in their descriptors', async () => {
+    const { provider } = await makeProvider();
+    const pulls = await provider.list(await cd(provider, OWNER, REPO, 'pulls'), { limit: 100 });
+    const open = pulls.entries.find((entry) => entry.title.startsWith('#101'));
+    assert.ok(open !== undefined);
+
+    const merge = (await provider.actions(open)).find((action) => action.name === 'merge');
+    assert.equal(merge?.destructive, true);
   });
 });

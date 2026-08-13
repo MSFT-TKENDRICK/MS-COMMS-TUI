@@ -30,6 +30,7 @@ import { adoBoardsPlugin } from '@mscomms/provider-ado';
 import { execPlugin } from '@mscomms/provider-exec';
 import { Session } from './session.js';
 import { Shell } from './shell.js';
+import { bridgeLauncherTasks } from './startup.js';
 import { Tui } from './tui/app.js';
 import { CommandTable, parseLine, surplusMessage, tokenize } from './commands/types.js';
 import { navigationCommands } from './commands/navigate.js';
@@ -277,50 +278,96 @@ export async function main(options: CliOptions): Promise<number> {
     ...(globals.mode === undefined ? {} : { mode: globals.mode }),
   });
 
+  // The config has already been read by the time a session exists, so this records an
+  // answer rather than asking a question. It is in the list anyway because "is there a
+  // config, and does it name anything?" is the check a first-time user most needs the
+  // answer to, and `Ready. No config file — run init.` is how they get it without having
+  // to know that an empty tree and a missing file look identical.
+  session.tasks.record('config', 'Reading the config', describeConfig(config, globals.noConfig));
+
+  // Whatever launched us may still be checking things of its own — that a rebuild is
+  // current, that dependencies are installed — and it reports them down the IPC channel so
+  // they appear in the same list as ours. Nothing happens when there is no launcher.
+  const unbridge = bridgeLauncherTasks(session.tasks, process);
+
+  // Not awaited: this is the line that used to hold the whole program up. Sources connect,
+  // the cache opens and watches restart behind whichever interface starts below, which can
+  // draw itself and take keystrokes immediately.
+  session.begin();
+
+  // Mount the sample data as the last step of startup, rather than in front of the user.
+  //
+  // The line shell can be told `demo` at its prompt, but the full-screen view has no prompt
+  // until it has already drawn itself, so a first-time user opening it lands on an empty
+  // tree with no obvious way out. This is the startup-time equivalent, and it delegates to
+  // the command rather than repeating the mount list, so the flag cannot drift away from
+  // what `demo` actually does.
+  //
+  // Queued rather than awaited because it has to follow the configured mounts — building on
+  // a half-finished tree is how the demo entries end up ordered differently than `demo`
+  // typed by hand — and awaiting that ordering here would blank the screen for as long as
+  // connecting the sources takes. It blocks readiness because a listing taken before four
+  // more mounts appear has answered a question nobody asked.
+  if (globals.demo) {
+    session.enqueue(
+      'demo',
+      'Mounting the sample data',
+      async () => {
+        // The command's own confirmation is written for someone who typed `demo` and is
+        // waiting for an answer. Here the task list is already saying this is happening and
+        // the ready summary is about to say it happened, so a second copy of the same news —
+        // arriving out of nowhere, possibly on top of a pane — is worse than none.
+        const before = session.vfs.mounts.length;
+        await session.capture(async () => {
+          await demoCommand.run(session, { positional: [], flags: {}, raw: 'demo' });
+        });
+        const added = session.vfs.mounts.length - before;
+        return added === 1 ? '1 sample mount' : `${String(added)} sample mounts`;
+      },
+      { blocking: true },
+    );
+  }
+
   const table = buildCommandTable();
 
   try {
-    await session.start();
-
-    // Same reasoning as the config warnings above, one level down: a mount that came up but
-    // ignored part of what it was given is not broken enough to report as an error and not
-    // harmless enough to leave for whoever thinks to run `doctor`.
-    for (const warning of session.mountWarnings) writeError(`Warning: ${warning}\n`);
-
-    // Mount the sample data before any interface exists.
-    //
-    // The line shell can be told `demo` at its prompt, but the full-screen view has no
-    // prompt until it has already drawn itself, so a first-time user opening it lands on
-    // an empty tree with no obvious way out. This is the startup-time equivalent, and it
-    // delegates to the command rather than repeating the mount list, so the flag cannot
-    // drift away from what `demo` actually does.
-    if (globals.demo) {
-      try {
-        await demoCommand.run(session, { positional: [], flags: {}, raw: 'demo' });
-      } catch (error) {
-        writeError(`${error instanceof Error ? error.message : String(error)}\n`);
-        if (isVfsError(error) && error.hint !== undefined) writeError(`${error.hint}\n`);
-        return 2;
-      }
-    }
-
     // The full-screen view is opt-in and never inferred. `--tui` with a command still runs
     // the command: someone scripting `mscomms ls --tui` wants the listing, not a pane.
+    const interactive = globals.rest.length === 0 || globals.shell;
+
     if (globals.tui && globals.rest.length === 0) {
       const tui = new Tui({ session, table });
       return await tui.run();
     }
 
     // No arguments, or an explicit --shell: interactive.
-    if (globals.rest.length === 0 || globals.shell) {
+    if (interactive) {
       const shell = new Shell({ session, table });
       return await shell.run();
     }
 
+    // A one-shot command has nobody to show progress to and nothing to do while it waits,
+    // so here — and only here — startup is something to be waited for.
+    await session.ready();
     return await runOneShot(session, table, globals, writeError);
   } finally {
+    unbridge();
     await session.dispose();
   }
+}
+
+/** What the config task reports: whether there is one, and whether it named anything. */
+function describeConfig(config: AppConfig, noConfig: boolean): { readonly state: 'ok' | 'warn' | 'skipped'; readonly detail: string } {
+  if (noConfig) return { state: 'skipped', detail: '--no-config' };
+  if (config.sourcePath === undefined) {
+    return { state: 'warn', detail: 'no config file yet \u2014 run `init` to write one' };
+  }
+  // Nothing to add when it worked. The mounts check is about to say how many sources there
+  // are, from the authority of having actually connected them, and a summary that reports
+  // the same number twice — once as an intention and once as a fact — reads as a stutter.
+  return config.mounts.length === 0
+    ? { state: 'warn', detail: 'config names no sources' }
+    : { state: 'ok', detail: '' };
 }
 
 async function runOneShot(

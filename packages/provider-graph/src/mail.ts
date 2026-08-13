@@ -15,7 +15,11 @@
  */
 
 import {
+  ActionRegistry,
   VfsError,
+  metaText,
+  optionalText,
+  requiredText,
   timestampPrefix,
   type ActionDescriptor,
   type ActionResult,
@@ -47,6 +51,14 @@ export interface GraphMailOptions extends GraphSharedOptions {
   /** Include folders Outlook hides by default (Conversation History, and similar). */
   readonly includeHiddenFolders?: boolean;
   readonly pageSize?: number;
+  /**
+   * Enable the actions that write: replying, forwarding, marking read, flagging and moving.
+   *
+   * Off by default. A tool that reads corporate mail is easy to justify installing; a tool
+   * that can send as you or move mail out of sight is a different conversation, and it
+   * should be one the user opts into rather than discovers.
+   */
+  readonly allowSend?: boolean;
 }
 
 interface MailFolder {
@@ -102,16 +114,103 @@ export class GraphMailProvider implements Provider {
 
   readonly #options: GraphMailOptions;
   readonly #context: ProviderContext;
+  readonly #registry = new ActionRegistry<GraphMailProvider>([
+    {
+      descriptor: {
+        name: 'reply',
+        label: 'Reply',
+        description: 'Reply to this message.',
+        group: 'reply',
+        key: 'r',
+        params: [{ name: 'body', type: 'text', label: 'Reply', required: true }],
+      },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, params, context }) => context.#reply(node, params),
+    },
+    {
+      descriptor: {
+        name: 'reply-all',
+        label: 'Reply all',
+        description: 'Reply to everyone on this message.',
+        group: 'reply',
+        params: [{ name: 'body', type: 'text', label: 'Reply', required: true }],
+      },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, params, context }) => context.#replyAll(node, params),
+    },
+    {
+      descriptor: {
+        name: 'forward',
+        label: 'Forward',
+        description: 'Forward this message to one or more recipients.',
+        group: 'reply',
+        key: 'f',
+        params: [
+          { name: 'to', type: 'text', label: 'Recipients', required: true },
+          { name: 'body', type: 'text', label: 'Comment' },
+        ],
+      },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, params, context }) => context.#forward(node, params),
+    },
+    {
+      descriptor: { name: 'read', label: 'Mark as read' },
+      applies: (node) => isMessageNode(node) && (node.flags ?? []).includes('unread'),
+      run: ({ node, context }) => context.#setRead(node, true),
+    },
+    {
+      descriptor: { name: 'unread', label: 'Mark as unread' },
+      applies: (node) => isMessageNode(node) && !(node.flags ?? []).includes('unread'),
+      run: ({ node, context }) => context.#setRead(node, false),
+    },
+    {
+      descriptor: { name: 'flag', label: 'Flag for follow up' },
+      applies: (node) => isMessageNode(node) && !(node.flags ?? []).includes('flagged'),
+      run: ({ node, context }) => context.#setFlag(node, true),
+    },
+    {
+      descriptor: { name: 'unflag', label: 'Clear follow-up flag' },
+      applies: (node) => isMessageNode(node) && (node.flags ?? []).includes('flagged'),
+      run: ({ node, context }) => context.#setFlag(node, false),
+    },
+    {
+      descriptor: {
+        name: 'move',
+        label: 'Move to folder',
+        description: 'Move this message to a well-known Outlook folder.',
+        group: 'file',
+        params: [{ name: 'folder', type: 'text', label: 'Folder', required: true }],
+      },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, params, context }) => context.#move(node, requiredText(params, 'folder')),
+    },
+    {
+      descriptor: { name: 'archive', label: 'Archive', description: 'Move this message to Archive.', group: 'file', key: 'e' },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, context }) => context.#move(node, 'archive'),
+    },
+    {
+      descriptor: { name: 'delete', label: 'Delete', description: 'Move this message to Deleted Items.', destructive: true, group: 'file' },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, context }) => context.#move(node, 'deleteditems', 'Deleted'),
+    },
+    {
+      descriptor: { name: 'url', label: 'Show the web URL', description: 'Print the Outlook on the web link.', group: 'link', key: 'u' },
+      applies: (node) => isMessageNode(node),
+      run: ({ node, context }) => context.#urlAction(node),
+    },
+  ]);
   #client: GraphApi | undefined;
 
-  constructor(options: GraphMailOptions, context: ProviderContext) {
+  constructor(options: GraphMailOptions, context: ProviderContext, client?: GraphApi) {
     this.#options = options;
     this.#context = context;
     this.id = `graph-mail:${context.mountPath}`;
+    this.#client = client;
   }
 
   async init(): Promise<void> {
-    this.#client = createClient(this.#options, this.#context.state, this.#context.logger);
+    this.#client ??= createClient(this.#options, this.#context.state, this.#context.logger);
   }
 
   /** Bring the transport up in the background. See `Provider.warm`. */
@@ -365,30 +464,84 @@ export class GraphMailProvider implements Provider {
   // -------------------------------------------------------------------------
 
   async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
-    if (node.kind === 'dir') return [];
-    const unread = (node.flags ?? []).includes('unread');
-    return [
-      unread
-        ? { name: 'read', label: 'Mark as read' }
-        : { name: 'unread', label: 'Mark as unread' },
-      { name: 'flag', label: 'Toggle follow-up flag' },
-      { name: 'url', label: 'Show the web URL', description: 'Print the Outlook on the web link.' },
-    ];
+    return this.#registry.descriptors(node, this);
   }
 
-  async invoke(action: string, node: VNode, _params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
-    if (action === 'url') {
-      const url = node.meta?.['webLink'];
-      if (typeof url !== 'string') throw VfsError.invalid('That message has no web link.');
-      return { ok: true, message: url };
-    }
-    // Anything that writes requires Mail.ReadWrite, which the default scope set
-    // deliberately does not request: a read-only tool that cannot possibly destroy mail is
-    // a much easier thing to justify installing.
-    throw VfsError.unsupported(
-      `Action "${action}"`,
-      `${this.id} (read-only: add "Mail.ReadWrite" to the mount's scopes to enable writes)`,
-    );
+  async invoke(action: string, node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    return this.#registry.invoke(action, node, params, this, this.id);
+  }
+
+  /**
+   * The gate on everything that writes.
+   *
+   * Named as one place rather than repeated per action so there is no way to add a writing
+   * action later and forget it, and so the message can name both halves of what is needed:
+   * the config switch *and* the Graph scopes, because having one without the other produces
+   * a failure that is otherwise very hard to diagnose.
+   */
+  #requireSend(action: string): void {
+    if (this.#options.allowSend === true) return;
+    throw new VfsError('ENOTSUP', `"${action}" is disabled: the ${this.id} mount is read-only.`, {
+      hint:
+        'Set "allowSend": true on this mount in your config, then re-run `login` so consent ' +
+        'covers Mail.ReadWrite and Mail.Send.',
+    });
+  }
+
+  async #reply(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('reply');
+    await this.#api.post(`/me/messages/${encodeURIComponent(node.id)}/reply`, { comment: requiredText(params, 'body') });
+    return { ok: true, message: `Replied to "${node.title}".`, invalidates: [parentOf(node)] };
+  }
+
+  async #replyAll(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('reply-all');
+    await this.#api.post(`/me/messages/${encodeURIComponent(node.id)}/replyAll`, { comment: requiredText(params, 'body') });
+    return { ok: true, message: `Replied to everyone on "${node.title}".`, invalidates: [parentOf(node)] };
+  }
+
+  async #forward(node: VNode, params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    this.#requireSend('forward');
+    const toRecipients = parseRecipients(requiredText(params, 'to'));
+    const comment = optionalText(params, 'body') ?? '';
+    await this.#api.post(`/me/messages/${encodeURIComponent(node.id)}/forward`, { comment, toRecipients });
+    return {
+      ok: true,
+      message: `Forwarded "${node.title}" to ${String(toRecipients.length)} recipient${toRecipients.length === 1 ? '' : 's'}.`,
+      invalidates: [parentOf(node)],
+    };
+  }
+
+  async #setRead(node: VNode, read: boolean): Promise<ActionResult> {
+    this.#requireSend(read ? 'read' : 'unread');
+    await this.#api.patch(`/me/messages/${encodeURIComponent(node.id)}`, { isRead: read });
+    return { ok: true, message: `Marked "${node.title}" as ${read ? 'read' : 'unread'}.`, invalidates: [parentOf(node)] };
+  }
+
+  async #setFlag(node: VNode, flagged: boolean): Promise<ActionResult> {
+    this.#requireSend(flagged ? 'flag' : 'unflag');
+    await this.#api.patch(`/me/messages/${encodeURIComponent(node.id)}`, {
+      flag: { flagStatus: flagged ? 'flagged' : 'notFlagged' },
+    });
+    return { ok: true, message: `${flagged ? 'Flagged' : 'Unflagged'} "${node.title}".`, invalidates: [parentOf(node)] };
+  }
+
+  async #move(node: VNode, folder: string, verb = 'Moved'): Promise<ActionResult> {
+    this.#requireSend(verb === 'Deleted' ? 'delete' : folder === 'archive' ? 'archive' : 'move');
+    const destinationId = folder.trim().toLowerCase();
+    if (destinationId === '') throw VfsError.invalid('The destination folder cannot be empty.');
+    // Outlook delete moves a message to Deleted Items; modelling it as `move` avoids adding a
+    // Graph DELETE transport for an operation whose user-visible semantics are not permanent.
+    await this.#api.post(`/me/messages/${encodeURIComponent(node.id)}/move`, { destinationId });
+    return {
+      ok: true,
+      message: `${verb} "${node.title}"${verb === 'Moved' ? ` to ${destinationId}.` : '.'}`,
+      invalidates: [parentOf(node)],
+    };
+  }
+
+  async #urlAction(node: VNode): Promise<ActionResult> {
+    return { ok: true, message: metaText(node, 'webLink') };
   }
 }
 
@@ -455,6 +608,28 @@ function formatAddress(address: { name?: string; address?: string } | undefined)
   if (address.name === undefined) return address.address ?? '(unknown)';
   if (address.address === undefined) return address.name;
   return `${address.name} <${address.address}>`;
+}
+
+function isMessageNode(node: VNode): boolean {
+  return node.kind === 'file' && node.subtype === 'message';
+}
+
+function parseRecipients(raw: string): Array<{ emailAddress: { address: string } }> {
+  const recipients = raw
+    .split(',')
+    .map((address) => address.trim())
+    .filter((address) => address !== '');
+  if (recipients.length === 0) {
+    throw VfsError.invalid('At least one forwarding recipient is required.', 'Pass --to with one or more comma-separated email addresses.');
+  }
+  return recipients.map((address) => ({ emailAddress: { address } }));
+}
+
+function parentOf(node: VNode): string {
+  const path = node.path;
+  if (path === undefined) return node.name;
+  const slash = path.lastIndexOf('/');
+  return slash <= 0 ? path : path.slice(0, slash);
 }
 
 /** Pull the free-text and subject/body terms out of a query, for `$search`. */

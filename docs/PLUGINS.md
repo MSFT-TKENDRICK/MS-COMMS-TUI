@@ -237,6 +237,109 @@ Register it with:
 Then use its type name in a mount. `plugins` runs your code in-process; prefer `exec` for
 anything you did not write yourself.
 
+## Actions
+
+An action is a verb a user can run against one node: approve a pull request, reply to a
+mail, close an issue. `Provider.actions(node)` advertises them and `Provider.invoke(node,
+name, params)` performs them, and the two must agree — an action offered but not handled
+tells the user "not supported" about a verb they were just shown, and an action handled but
+no longer offered is dead code nobody can reach.
+
+`ActionRegistry` removes that possibility by deriving both halves from one table. Each verb
+is a single object: what it advertises, when it applies, and what it does.
+
+```ts
+import { ActionRegistry, requiredText, type ActionCommand } from '@mscomms/core';
+
+interface Ctx { readonly client: MyClient }
+
+const approve: ActionCommand<Ctx> = {
+  descriptor: {
+    name: 'approve',
+    label: 'Approve this pull request',
+    description: 'Submit an approving review.',
+    group: 'review',
+    key: 'a',
+    params: [{ name: 'body', type: 'text', label: 'Review comment', required: true }],
+  },
+  applies: (node) => node.subtype === 'pull' && !(node.flags ?? []).includes('merged'),
+  async run({ node, params, context }) {
+    const url = await context.client.approve(node.id, requiredText(params, 'body'));
+    return { ok: true, message: `Approved ${node.title}.`, details: [url] };
+  },
+};
+
+const registry = new ActionRegistry<Ctx>([approve /* , ... */]);
+```
+
+Wire it to the provider once and never think about it again:
+
+```ts
+actions(node) { return registry.descriptors(node, this.#ctx); }
+invoke(node, name, params) { return registry.invoke(name, node, params, this.#ctx, this.id); }
+```
+
+### `applies` is the whole point
+
+It is what makes actions contextual rather than merely typed. "Approve" is not a property of
+pull requests in general; it is a property of *this* one, which is open, is not a draft, and
+is not already merged. Encoding that as a predicate beside the descriptor means the list a
+user is offered is the list that will actually work. The alternative — offering a verb and
+then explaining why it was refused — is a worse interface, and for someone driving by
+keyboard or by voice it is a longer one.
+
+Omit `applies` to mean "always".
+
+### Parameters are declared, not parsed
+
+`params` states which arguments exist, which are `required`, what `type` each is (`text`,
+`number`, `boolean`, `choice`) and, for a choice, the legal `choices`. The registry enforces
+that declaration **before** `run` is called, so a command receives values that are already
+present and already the right type. Do not re-check them.
+
+Unknown parameters are rejected rather than ignored, with a "did you mean" for near misses.
+`--commnet "looks good"` that silently approves with no comment is a wrong answer wearing
+the costume of a right one, and it cannot be taken back.
+
+Use `requiredText`, `optionalText`, `optionalFlag`, `metaText` and `metaNumber` to read
+them; they express intent and keep the types honest.
+
+### Descriptor fields the shell uses
+
+| Field | Effect |
+|---|---|
+| `label` | The sentence shown in the palette and in `actions`. |
+| `group` | Sorts related verbs together — `review`, `reply`, `state`, `triage`. |
+| `key` | A *requested* accelerator. Collisions are resolved by the frontend, so treat it as a hint. |
+| `destructive` | The shell confirms first: `--yes` on the command line, `y` in the palette. |
+| `params` | Drives both flag parsing and the palette's prompts. |
+
+`ActionResult.details` carries anything longer than one line, such as the URL of a review
+just submitted. `message` is the sentence a screen reader announces, so keep it short and
+put the rest in `details`. List every path whose cached state you invalidated in
+`invalidates`, or the listing will keep showing the state you just changed.
+
+### How it reaches the user
+
+Actions are surfaced three ways from the same descriptors, so anything you declare works in
+all of them with no extra wiring:
+
+- `actions <item>` lists what applies, and `do <verb> <item> --body "…"` runs it.
+- In the full-screen shell, `a` opens a contextual palette on the selection, prompts for
+  each declared parameter in turn, confirms anything destructive, then refreshes the view.
+- Anything driving the shell by text or voice uses the same two commands.
+
+Mark a verb `destructive` if it cannot be undone. Merging and deleting are not the same
+class of thing as flagging, and the shell is the only place that distinction can be
+enforced consistently.
+
+### From a mapping, or over the wire
+
+A mapping type declares `invoke` and the mount gains the `actions` capability
+automatically; see below. An `exec` plugin implements the `actions` and `invoke` methods of
+the wire protocol and gets the same treatment — the registry is a convenience for
+in-process providers, not part of the contract.
+
 ## The mapping surface
 
 Implementing `Provider` means writing paging, cursors, name allocation, `resolveChild`,

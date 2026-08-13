@@ -4,7 +4,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { resolve as resolveHostPath } from 'node:path';
-import { vpath, type MetaValue } from '@mscomms/core';
+import { resolveParams, vpath, type MetaValue } from '@mscomms/core';
 import { Session } from '../session.js';
 import { formatDocument, formatPairs, formatRows, formatBytes, sanitizeForDisplay } from '../format.js';
 import {
@@ -152,12 +152,26 @@ export const actionsCommand: Command = {
         ['action', 'what it does', 'arguments'],
         actions.map((action) => [
           action.name,
-          action.label + (action.destructive === true ? ' (destructive)' : ''),
-          (action.params ?? []).map((param) => `${param.name}${param.required === true ? '*' : ''}`).join(' '),
+          // The group is a prefix rather than a column: eleven verbs on a pull request need
+          // separating into review, reply and triage, and a fourth column would cost width
+          // that the argument list needs more.
+          (action.group === undefined ? '' : `[${action.group}] `) +
+            action.label +
+            (action.destructive === true ? ' (asks first)' : ''),
+          (action.params ?? [])
+            .map((param) => {
+              const suffix = param.required === true ? '*' : '';
+              const choices = param.type === 'choice' && param.choices !== undefined ? `=${param.choices.join('|')}` : '';
+              return `--${param.name}${choices}${suffix}`;
+            })
+            .join(' '),
         ]),
         session.withMode(mode),
       ),
     );
+    if (actions.some((action) => (action.params ?? []).some((param) => param.required === true))) {
+      session.status('An argument marked * is required.');
+    }
   },
 };
 
@@ -174,11 +188,12 @@ export const doCommand: Command = {
     'shell they refuse outright rather than guessing, because a script that silently\n' +
     'deletes mail is a much worse failure than one that stops.',
   args: ['action', 'node'],
+  openFlags: true,
   flags: [
     { name: 'yes', description: 'Skip the confirmation prompt for destructive actions.', aliases: ['y'] },
     ...OUTPUT_FLAGS,
   ],
-  examples: ['do read 3', 'do flag 1', 'do close 2 --comment "fixed"'],
+  examples: ['do read 3', 'do flag 1', 'do approve 2 --body "paging looks right"', 'do reply 4 --body "on it"'],
   async run(session, args) {
     const action = args.positional[0];
     if (action === undefined) throw new Error('Which action? Run `actions` to see what is available.');
@@ -199,31 +214,40 @@ export const doCommand: Command = {
       );
     }
 
-    const params: Record<string, MetaValue> = {};
-    for (const param of descriptor.params ?? []) {
-      const raw = args.flags[param.name];
-      if (raw === undefined) {
-        if (param.required === true) {
-          throw new Error(`"${action}" needs --${param.name} (${param.label}).`);
-        }
-        continue;
-      }
-      params[param.name] =
-        param.type === 'number' ? Number(raw) : param.type === 'boolean' ? raw === true || raw === 'true' : String(raw);
+    // Everything the user typed that is not one of this command's own flags is offered to
+    // the action, and the engine decides. Filtering down to the declared names instead —
+    // which is what this used to do — silently swallowed `--commnet "wait, no"` on an
+    // approval and then approved with no comment at all.
+    const supplied: Record<string, MetaValue> = {};
+    for (const [name, value] of Object.entries(args.flags)) {
+      if (RESERVED_FLAGS.has(name)) continue;
+      supplied[name] = value;
     }
 
     // Through the session rather than straight at the VFS, so the action lands in the
     // journal with the inverse the provider named and the view hears that it happened.
     // Calling `session.vfs.invoke` here would still work and would still be wrong: it is
     // the one path by which a mutation can escape `undo`.
-    const result = await session.runAction(action, path, params, { command: args.raw });
+    const result = await session.runAction(action, path, resolveParams(descriptor, supplied), {
+      command: args.raw,
+    });
     session.print(result.message);
+    for (const line of result.details ?? []) session.print(line);
 
     if (result.undo !== undefined) {
       session.status(`\`undo\` will ${result.undo.label ?? `run \`${result.undo.action}\``}.`);
     }
   },
 };
+
+/**
+ * Flags `do` consumes itself, which therefore cannot be action parameters.
+ *
+ * Listed explicitly so that adding an output flag cannot quietly start being forwarded to
+ * providers, and so an action that genuinely wants a `--json` parameter fails loudly here
+ * rather than mysteriously at the provider.
+ */
+const RESERVED_FLAGS = new Set(['yes', 'y', 'json', 'tsv', 'announce', 'plain']);
 
 export const attachmentsCommand: Command = {
   name: 'attachments',

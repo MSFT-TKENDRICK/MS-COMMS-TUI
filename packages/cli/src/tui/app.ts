@@ -56,7 +56,10 @@ import {
   initialState,
   isFetching,
   reduce,
+  selectedNode,
   shouldRefuseTui,
+  withActionResult,
+  withActions,
   withError,
   withListing,
   withFreshListing,
@@ -64,11 +67,13 @@ import {
   withProgress,
   withRefusal,
   withRows,
+  withStartup,
   withStatus,
   withVoiceHold,
 } from './state.js';
 import type { Effect, Key, TuiState } from './state.js';
 import type { SessionEvent } from '@mscomms/core';
+import { externalTasks, ownTasks, readySummary, startupLine } from '../startup.js';
 
 const ALT_SCREEN_ON = '\u001B[?1049h';
 const ALT_SCREEN_OFF = '\u001B[?1049l';
@@ -94,6 +99,24 @@ const LIST_LIMIT = 500;
  * is nothing next to the network call it is reporting on.
  */
 const TICK_MS = 120;
+
+/**
+ * How long the "ready" announcement stays on the status row before it gets out of the way.
+ *
+ * Long enough to be read, short enough that it is gone by the time it would be in the way of
+ * the user's own business. It is the row's only permanent resident that is not about what
+ * the user just did, so it does not get to keep it.
+ */
+const READY_MS = 2500;
+
+/**
+ * How many stray writes to hold for the exit summary.
+ *
+ * A watch on a busy mailbox can notify indefinitely, and nobody is going to read a thousand
+ * lines of it after quitting. This keeps the first few, which is where an explanation of
+ * something that went wrong will be.
+ */
+const ASIDE_LIMIT = 40;
 
 export interface TuiOptions {
   readonly session: Session;
@@ -162,6 +185,17 @@ export class Tui {
   #onData: ((chunk: Buffer | string) => void) | undefined;
   /** Repaint timer that animates the working indicator. Only alive while {@link #working}. */
   #ticker: NodeJS.Timeout | undefined;
+  /** The same, for the startup line, which runs on its own clock and often overlaps. */
+  #startupTicker: NodeJS.Timeout | undefined;
+  #startupTick = 0;
+  /** Clears the "ready" announcement once it has been up long enough to read. */
+  #startupClear: NodeJS.Timeout | undefined;
+  /** Re-derives the startup row. Held as a field so the ticker and the watcher share one. */
+  #refreshStartup: (() => void) | undefined;
+  #unwatchStartup: (() => void) | undefined;
+  #unredirect: (() => void) | undefined;
+  /** Anything that printed while the pane owned the screen, to be shown after it lets go. */
+  readonly #aside: string[] = [];
 
   constructor(options: TuiOptions) {
     this.#session = options.session;
@@ -195,6 +229,7 @@ export class Tui {
     }
 
     this.#enter();
+    this.#hush();
 
     // The pane is an interface, not a separate program: say so, so the journal records how
     // each interaction arrived and `history` can tell a keypress from a spoken command.
@@ -233,21 +268,55 @@ export class Tui {
     return new Promise<number>((resolve) => {
       this.#resolve = resolve;
       this.#listen();
+      this.#watchStartup();
+      // Busy from the first frame, because it is: startup is running behind this one and the
+      // listing cannot even be asked for until it finishes. Saying so up front is also what
+      // keeps a key that would start a second fetch from being honoured against a VFS whose
+      // mounts have not been attached yet.
+      this.#working = true;
+      this.#startTicking();
       // Painted *before* the first listing, not after. The initial state already says
       // "Loading…", and the whole complaint about this view was that a slow first fetch
       // showed a blank alternate screen for as long as it took — the frame existed, it was
       // just never drawn. A screen reader announcing "Loading" and then the result is the
       // correct behaviour here; announcing nothing at all was not.
       this.#paint();
-      void this.#perform({ kind: 'list', path: this.#session.cwd }).then(() => {
-        this.#paint();
-      });
+      // The cwd is read when this runs rather than when the pane was constructed, because
+      // startup can move it: a session with exactly one source lands the user inside it,
+      // and that is decided by the mounts step, which is still running behind this frame.
+      void this.#session
+        .ready()
+        .then(async () => this.#perform({ kind: 'list', path: this.#session.cwd }))
+        .then(() => {
+          this.#paint();
+        });
     });
   }
 
   // -------------------------------------------------------------------------
   // Terminal lifecycle
   // -------------------------------------------------------------------------
+
+  /**
+   * Take the terminal away from anything that prints on its own schedule.
+   *
+   * The pane draws by absolute cursor positioning, so a single unexpected newline from
+   * somewhere else scrolls the frame out from under itself and every paint after that lands
+   * in the wrong place. Commands are already safe — they run inside `capture` — but startup
+   * now runs in the background, which means a step that mounts sample data, a watch that
+   * fires, or a warning from a source that gave up can all write while the pane is up.
+   *
+   * Silently discarding them would trade a corrupted screen for a lost warning, so they are
+   * kept and printed on the way out, next to the exit summary and for the same reason: the
+   * alternate screen is not a place things can be left. The cap is there because a watch on
+   * a busy mailbox could otherwise fill memory with text nobody will read.
+   */
+  #hush(): void {
+    this.#unredirect = this.#session.redirect((text) => {
+      if (this.#aside.length >= ASIDE_LIMIT) return;
+      this.#aside.push(text);
+    });
+  }
 
   #enter(): void {
     this.#stdout.write(ALT_SCREEN_ON + CLEAR_SCREEN + CURSOR_HIDE);
@@ -279,6 +348,9 @@ export class Tui {
     if (this.#restored) return;
     this.#restored = true;
     this.#stopTicking();
+    this.#stopStartupTicking();
+    this.#unwatchStartup?.();
+    this.#unwatchStartup = undefined;
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
     this.#session.voice?.stop();
@@ -300,6 +372,12 @@ export class Tui {
     // keys the same way it was before we started. A terminal left reporting key releases
     // would feed stray escape sequences to every program the user runs next.
     this.#stdout.write(KEYBOARD_POP + CURSOR_SHOW + ALT_SCREEN_OFF);
+    // Only now is there a scrollback to write into again.
+    this.#unredirect?.();
+    this.#unredirect = undefined;
+    const aside = this.#aside.join('').trimEnd();
+    this.#aside.length = 0;
+    if (aside !== '') this.#session.status(aside);
   }
 
   #listen(): void {
@@ -344,6 +422,112 @@ export class Tui {
       this.#state = next;
       this.#paint();
     });
+  }
+
+  /**
+   * Show what startup is doing, on the status row, until it stops doing it.
+   *
+   * This exists because the pane is now drawn *before* the sources are connected. That is
+   * the fix for a blank terminal on launch, but it trades one confusion for another: a
+   * first frame that is empty and says nothing looks like a mailbox with no mail in it.
+   * So the row names the check that is running, the spinner keeps it visibly alive, and
+   * the moment this session's own checks settle it says what was found.
+   *
+   * Three things can want the row, in this order: what the session is still doing, the
+   * announcement that it has finished, and whatever the launcher is still doing behind it.
+   * A rebuild in the launcher is worth showing — ten unexplained seconds of disk noise is
+   * worse than ten explained ones — but it must not delay the announcement, because it is a
+   * fact about the next launch rather than this one.
+   *
+   * All of it lives in `startup` rather than `status`, and none of it touches `busy`. Those
+   * two belong to the user's own operation: writing an announcement about background work
+   * into them would clobber the answer to whatever key they just pressed, and clearing
+   * `busy` would drop the spinner in the middle of the first listing and claim the screen
+   * was finished when it was not.
+   *
+   * Nothing is announced when startup was already over before the pane opened — a one-shot
+   * run, or a test that started the session first. Announcing the end of something the user
+   * never saw begin is noise, and it would sit where "Loading…" belongs.
+   *
+   * The timers are separate from the one that animates a fetch, and unreferenced for the
+   * same reason: an indicator must never be why a process is still running.
+   */
+  #watchStartup(): void {
+    const tasks = this.#session.tasks;
+    let seen = false;
+    let announcing = false;
+
+    const refresh = (): void => {
+      if (this.#restored) return;
+      const snapshot = tasks.snapshot();
+      const own = startupLine(ownTasks(snapshot), this.#startupTick);
+
+      if (own !== undefined) {
+        seen = true;
+        this.#startStartupTicking();
+        this.#state = withStartup(this.#state, own);
+        this.#paint();
+        return;
+      }
+
+      // Own checks are done. Say so, once, and only to someone who watched them run.
+      if (seen && !announcing) {
+        seen = false;
+        announcing = true;
+        this.#stopStartupTicking();
+        this.#state = withStartup(this.#state, readySummary(ownTasks(snapshot)));
+        this.#paint();
+        this.#startupClear = setTimeout(() => {
+          this.#startupClear = undefined;
+          announcing = false;
+          refresh();
+        }, READY_MS);
+        this.#startupClear.unref?.();
+        return;
+      }
+      if (announcing) return;
+
+      const external = startupLine(externalTasks(snapshot), this.#startupTick);
+      if (external === undefined) {
+        this.#stopStartupTicking();
+        this.#state = withStartup(this.#state, '');
+        this.#paint();
+        return;
+      }
+      seen = true;
+      this.#startStartupTicking();
+      this.#state = withStartup(this.#state, external);
+      this.#paint();
+    };
+
+    this.#refreshStartup = refresh;
+    this.#unwatchStartup = tasks.subscribe(() => {
+      refresh();
+    });
+    refresh();
+  }
+
+  #startStartupTicking(): void {
+    if (this.#startupTicker !== undefined) return;
+    this.#startupTicker = setInterval(() => {
+      this.#startupTick += 1;
+      // Only the spinner moved, but `refresh` is the single place that knows which of the
+      // three things owns the row, and it is cheap and idempotent. Re-deriving beats
+      // keeping a second, subtly different copy of that decision here.
+      this.#refreshStartup?.();
+    }, TICK_MS);
+    this.#startupTicker.unref?.();
+  }
+
+  #stopStartupTicking(): void {
+    if (this.#startupTicker !== undefined) {
+      clearInterval(this.#startupTicker);
+      this.#startupTicker = undefined;
+    }
+    if (this.#startupClear !== undefined) {
+      clearTimeout(this.#startupClear);
+      this.#startupClear = undefined;
+    }
   }
 
   #finish(): void {
@@ -609,6 +793,24 @@ export class Tui {
           }
           break;
         }
+
+        case 'actions': {
+          const descriptors = await this.#session.vfs.actions(effect.node);
+          this.#state = withActions(this.#state, effect.node, effect.path, descriptors);
+          break;
+        }
+
+        case 'invoke': {
+          const result = await this.#session.vfs.invoke(effect.action, effect.node, effect.params);
+          this.#state = withActionResult(this.#state, result);
+          // Acting on something changes it, and the whole point of doing it here rather than
+          // in a browser tab is seeing that immediately: the engine has already dropped the
+          // stale entries, so re-listing shows the reply that was just sent and the review
+          // that was just left. The status line survives it, because the result sentence is
+          // the only report the user gets.
+          await this.#refreshAfterAction(effect.node);
+          break;
+        }
       }
     } catch (error) {
       this.#state = withError(this.#state, messageOf(error));
@@ -655,6 +857,37 @@ export class Tui {
     return new Promise<boolean>((resolve) => {
       this.#confirming = resolve;
     });
+  }
+
+  /**
+   * Bring the screen back in line with what an action just changed.
+   *
+   * Failures here are deliberately swallowed down to the status line the action already
+   * produced. The action succeeded; a refresh that then fails is a lesser, separate problem,
+   * and replacing "Approved #14." with a listing error would tell the user the thing they
+   * care about did not happen.
+   */
+  async #refreshAfterAction(node: { readonly name: string }): Promise<void> {
+    const announced = this.#state.status;
+    try {
+      const result = await this.#session.vfs.list(this.#state.cwd, { limit: LIST_LIMIT });
+      this.#state = withFreshListing(this.#state, this.#state.cwd, result.entries);
+      this.#session.setListing({ path: this.#state.cwd, nodes: result.entries, startIndex: 1, source: 'ls' });
+
+      // Re-read only what is already open, and only if it is still the same item: replacing
+      // the preview with something the user did not ask to see is worse than leaving it.
+      if (this.#state.preview.length > 0 && this.#state.previewTitle === node.name) {
+        const fresh = selectedNode(this.#state);
+        if (fresh !== undefined && fresh.name === node.name) {
+          const doc = await this.#session.vfs.read(fresh);
+          const width = Math.max(20, Math.floor((this.#stdout.columns ?? 80) * 0.5) - 2);
+          this.#state = withPreview(this.#state, fresh.name, formatDocument(doc, { ...this.#session.format, width }).split('\n'));
+        }
+      }
+    } catch {
+      // Intentionally ignored; see above.
+    }
+    this.#state = withStatus(this.#state, announced);
   }
 
   /**

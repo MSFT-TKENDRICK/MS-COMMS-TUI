@@ -18,6 +18,7 @@ import {
   type SqlDriver,
 } from '@mscomms/core';
 import { formatRows } from '../format.js';
+import { startupRows } from '../startup.js';
 import {
   resolveMcpServer,
   resolveTransport,
@@ -193,6 +194,11 @@ export const doctorCommand: Command = {
     for (const warning of session.config.warnings ?? []) {
       checks.push({ name: 'config setting', status: 'warn', detail: warning });
     }
+
+    // What startup did, and what it cost — including anything the launcher reported into the
+    // same list, since "why did that take ten seconds?" is usually answered by a rebuild the
+    // user did not know was happening.
+    checks.push(...startupRows(session.tasks.snapshot()));
 
     checks.push({
       name: 'sources',
