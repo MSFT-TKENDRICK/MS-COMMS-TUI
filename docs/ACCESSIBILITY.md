@@ -493,6 +493,19 @@ than a statement of one. The pane is routinely 35 columns, where that would cost
 the row, so it writes `(3)` — and the word is not lost, because the status line spells it out
 for the selected row, and that sentence is also what prints to scrollback on the way out.
 
+**A narrow terminal loses columns, never the edge of the row.** `ls` allocates the width it
+was given rather than assuming it has enough: below about 70 columns it gives up the extra
+flags, then the author, then the date, and only then shortens `3 unread` to `(3)`. The
+counter goes last because it is the reason to look at the row at all, and `(3)` is the form
+the full-screen pane already uses, so nothing new has to be learned to read it.
+
+Getting this wrong is worse for a screen reader than for a sighted user, which is why it is
+stated as a rule rather than left to chance. An over-long row does not visibly overflow in a
+terminal — it wraps, and one listing row silently becomes two, so "3 of 17" stops agreeing
+with what an arrow key does and every row after it is announced in two pieces. A previous
+version of this program floored the name column at twenty characters and let everything to
+the right of it run past the edge, which at 40 columns produced exactly that.
+
 **A blank means "not counted", not "nothing new".** Some sources have no read state to
 report at all — GitHub issues are the plain example — so their rows carry no counter, and the
 shell will not invent a `0` to fill the gap. This matters most to someone reading the column

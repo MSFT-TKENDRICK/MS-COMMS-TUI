@@ -179,6 +179,24 @@ For the counter to be there on the *first* listing, the derivation needs warm pr
 to survive navigation, which it now does — warm tasks are the lowest-ranked work in the
 queue, so keeping them costs nothing in contention.
 
+That still leaves a window, and it is the one the user is actually in. The synthetic root
+paints instantly; the sources behind it have not answered yet; a count derived from an empty
+cache is therefore correctly absent, and becomes correct a moment later. The missing half was
+that nothing told the screen. So when a listing lands, the engine walks up from it and
+announces any ancestor whose counters have moved, over the same `onListingChanged` the
+full-screen view was already subscribed to. Three details make it quiet rather than annoying:
+an ancestor is only eligible once somebody has actually listed it, so resolving a deep path
+does not announce directories nobody is looking at; the comparison is over the counts alone,
+not the whole listing, so a relative timestamp ticking over a minute boundary does not
+repaint a list somebody is reading; and the listing fingerprint had to start including
+`unreadCount`, or a corrected number was computed, compared, found "unchanged" and dropped.
+
+Where the derivation genuinely cannot be made correct, it defers. Adding up the top-level
+folders of a mount assumes they are disjoint, which is false for any source shaped like a
+graph — see the people directory below — so `Provider.unreadTotal()` lets a source state its
+own whole-mount figure, and the engine prefers it. It must answer without I/O, and must say
+`undefined` rather than `0` when it has no basis, which keeps both rules above intact.
+
 ## The local snapshot
 
 Caching in memory makes the second `ls` fast. It does nothing for the first one, and the
@@ -466,6 +484,18 @@ tracks the provider's own `id` — defined as identifying the item rather than t
 for both the results and the queue. Every provider gets the fix; only this one needed it. The
 same applies to `provider-memory`, whose fixtures can now be graphs (`refs`) rather than
 trees, so the offline demo models the real shape instead of a convenient approximation of it.
+
+**And it made the unread counter dedupe too, in two different places.** The number on a
+folder is derived by adding up what is beneath it, which is only valid if "beneath it" is a
+tree. Here the same person is under `Org`, `Recent`, `Colleagues` and the `Directory` they
+are defined in, and the demo org chart's six unread messages were being reported as
+thirty-three on the row standing for the whole mount. Inside a subtree the engine can fix
+this itself, and does: the walk in `#unreadBeneath` counts each `id` once however many routes
+reach it. Between the top-level sections it cannot — each has handed over an opaque total and
+nothing in it says which of them overlap — so `Provider.unreadTotal()` exists for a source to
+state its own, and the engine takes it in preference to its own arithmetic. Providers that do
+not implement it keep the derived number, which is every provider until one has a reason not
+to.
 
 ## Two ways into Microsoft 365
 

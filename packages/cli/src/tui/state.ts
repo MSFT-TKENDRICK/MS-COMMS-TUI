@@ -864,9 +864,15 @@ export function withListing(
  *
  * Ignored when it is not about where the user currently is, and while they are typing a
  * filter or a command, which are moments when the screen changing underneath is hostile.
+ *
+ * Not ignored while the preview has focus, though it once was. The list pane is still on
+ * screen in that state, and freezing it means opening a message stops the counters dead —
+ * which was half of "you aren't updating counts in realtime". Reading is not typing: nothing
+ * the user is aiming at moves, because the highlight is re-found by name and the preview is
+ * separate state that this does not touch.
  */
 export function withFreshListing(state: TuiState, path: string, entries: readonly VNode[]): TuiState {
-  if (state.cwd !== path || state.mode !== 'browse' || state.pane !== 'list') return state;
+  if (state.cwd !== path || state.mode !== 'browse') return state;
 
   const anchor = visibleEntries(state)[state.selected];
   const candidate: TuiState = { ...state, entries };

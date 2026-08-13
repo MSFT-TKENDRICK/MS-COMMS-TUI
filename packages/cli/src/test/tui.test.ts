@@ -944,9 +944,20 @@ describe('tui: the last stage of a staged read', () => {
     assert.equal(withFreshListing(commanding, '/mail', FRESH), commanding);
   });
 
-  it('does not pull the reader out of a message', () => {
+  it('refreshes the list behind a reader without disturbing them', () => {
+    // The list pane is still on screen while the preview has focus, so freezing it meant
+    // opening a message stopped the counters dead. What the reader is owed is not a frozen
+    // list — it is that nothing they are aiming at moves: focus stays in the preview, the
+    // body they are reading is untouched, and the highlight is still on the same item.
     const reading = withPreview(stateWith(), 'Budget review', ['body']);
-    assert.equal(withFreshListing(reading, '/mail', FRESH), reading);
+    const next = withFreshListing(reading, '/mail', FRESH);
+
+    assert.notEqual(next, reading, 'the listing behind them is allowed to catch up');
+    assert.equal(next.entries, FRESH);
+    assert.equal(next.pane, 'preview', 'and focus does not jump back to the list');
+    assert.deepEqual(next.preview, reading.preview);
+    assert.equal(next.previewTitle, reading.previewTitle);
+    assert.equal(next.previewOffset, reading.previewOffset);
   });
 
   it('copes with the selected item having gone away', () => {

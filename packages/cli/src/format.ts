@@ -245,7 +245,7 @@ export function formatListing(nodes: readonly VNode[], options: ListingOptions):
           return [
             `${String(start + i)}.`,
             `${sanitizeForDisplay(node.name)}${marker}`,
-            unreadBadge(node),
+            unreadBadge(unreadOf(node)),
             formatDate(node.mtime, options.dateStyle),
             node.author ?? '',
             flags,
@@ -292,7 +292,8 @@ function announceNode(node: VNode, index: number, options: ListingOptions): stri
 function formatTable(nodes: readonly VNode[], start: number, options: ListingOptions): string {
   const rows = nodes.map((node, i) => {
     const flags = node.flags ?? [];
-    const carriesUnread = flags.includes('unread') || unreadOf(node) > 0;
+    const count = unreadOf(node);
+    const carriesUnread = flags.includes('unread') || count > 0;
     // A leading marker column, always in the same place, so it is scannable. The word
     // form is still present in `stat` and in announce mode, so no information is
     // colour- or glyph-only. A folder holding unread children earns the same mark as an
@@ -303,7 +304,7 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
       index: `${String(start + i)}.`,
       marker,
       name,
-      badge: unreadBadge(node),
+      count,
       when: formatDate(node.mtime, options.dateStyle),
       who: sanitizeForDisplay(node.author ?? ''),
       extra: options.long === true ? extraColumn(node) : '',
@@ -313,25 +314,49 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
   });
 
   const indexWidth = Math.max(...rows.map((row) => row.index.length));
-  const badgeWidth = Math.max(0, ...rows.map((row) => displayWidth(row.badge)));
-  const whenWidth = Math.min(20, Math.max(0, ...rows.map((row) => displayWidth(row.when))));
-  const whoWidth = Math.min(22, Math.max(0, ...rows.map((row) => displayWidth(row.who))));
-  const extraWidth = Math.max(0, ...rows.map((row) => displayWidth(row.extra)));
+  const naturalBadge = Math.max(0, ...rows.map((row) => displayWidth(unreadBadge(row.count))));
+  const compactBadgeWidth = Math.max(0, ...rows.map((row) => displayWidth(compactUnreadBadge(row.count))));
 
-  const fixed =
+  // Every column but the name has a width it wants; the name takes what is left. When what
+  // is left is not enough, columns are given up in order of what a narrow terminal can most
+  // afford to lose, because a row wider than the terminal wraps — and a wrapped row turns a
+  // scannable list into a paragraph, which is the one thing this layout exists to prevent.
+  //
+  // The old rule floored the name at 20 columns and let the row run off the edge instead.
+  // That was survivable while the row was narrow, and stopped being survivable when the
+  // counter added a column: at 40 columns a row came out 63 wide.
+  const budget = Math.max(1, options.width);
+  const MIN_NAME = 12;
+  let badgeWidth = naturalBadge;
+  let whenWidth = Math.min(20, Math.max(0, ...rows.map((row) => displayWidth(row.when))));
+  let whoWidth = Math.min(22, Math.max(0, ...rows.map((row) => displayWidth(row.who))));
+  let extraWidth = Math.max(0, ...rows.map((row) => displayWidth(row.extra)));
+  let compact = false;
+
+  // index + gap + marker + gap, then one gap in front of each column that is present.
+  const overhead = (): number =>
     indexWidth +
-    1 +
-    1 +
-    1 +
-    badgeWidth +
-    (badgeWidth > 0 ? 1 : 0) +
-    whenWidth +
     2 +
-    whoWidth +
-    2 +
-    extraWidth +
-    (extraWidth > 0 ? 2 : 0);
-  const nameWidth = Math.max(20, options.width - fixed - 1);
+    1 +
+    (badgeWidth > 0 ? badgeWidth + 1 : 0) +
+    (whenWidth > 0 ? whenWidth + 1 : 0) +
+    (whoWidth > 0 ? whoWidth + 1 : 0) +
+    (extraWidth > 0 ? extraWidth + 1 : 0);
+  const cramped = (): boolean => budget - overhead() < MIN_NAME;
+
+  if (cramped() && extraWidth > 0) extraWidth = 0;
+  if (cramped() && whoWidth > 0) whoWidth = 0;
+  if (cramped() && whenWidth > 0) whenWidth = 0;
+  // The counter shortens before it disappears: `3 unread` becomes `(3)`, the same fact in a
+  // third of the room, and the spelled-out form is still what `stat` and announce mode give.
+  // It is the last column to be dropped because it is the reason to look at this row at all.
+  if (cramped() && badgeWidth > 0) {
+    compact = true;
+    badgeWidth = compactBadgeWidth;
+  }
+  if (cramped() && badgeWidth > 0) badgeWidth = 0;
+
+  const nameWidth = Math.max(1, budget - overhead());
 
   return rows
     .map((row) => {
@@ -341,18 +366,19 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
         : name;
       const pieces = [row.index.padStart(indexWidth), row.marker, painted];
       if (badgeWidth > 0) {
-        // Right-aligned: it is a number, so the digits should line up by magnitude, and
-        // padding on the left is also what keeps the word `unread` in a column of its own
-        // instead of stepping sideways one place with every extra digit.
+        const badge = compact ? compactUnreadBadge(row.count) : unreadBadge(row.count);
+        // Right-aligned within its own column: it is a number, so the digits line up by
+        // magnitude, and padding on the left keeps `unread` in a column of its own instead
+        // of stepping sideways one place with every extra digit.
         //
         // Fit first, colour second — the rule the whole file runs on, because an escape
         // sequence counts as columns to the padding and silently shears the row after it.
-        const text = truncateWidth(row.badge, badgeWidth);
-        const badge = ' '.repeat(Math.max(0, badgeWidth - displayWidth(text))) + text;
-        pieces.push(options.color && row.badge !== '' ? paint(badge, 'bold') : badge);
+        const text = truncateWidth(badge, badgeWidth);
+        const cell = ' '.repeat(Math.max(0, badgeWidth - displayWidth(text))) + text;
+        pieces.push(options.color && badge !== '' ? paint(cell, 'bold') : cell);
       }
-      pieces.push(padTo(truncateWidth(row.when, whenWidth), whenWidth));
-      pieces.push(padTo(truncateWidth(row.who, whoWidth), whoWidth));
+      if (whenWidth > 0) pieces.push(padTo(truncateWidth(row.when, whenWidth), whenWidth));
+      if (whoWidth > 0) pieces.push(padTo(truncateWidth(row.who, whoWidth), whoWidth));
       if (extraWidth > 0) pieces.push(row.extra);
       return pieces.join(' ').trimEnd();
     })
@@ -373,9 +399,20 @@ function unreadOf(node: VNode): number {
  * reason the date does: appended to the name, the one row where the name is long is
  * exactly the row where the count is truncated away.
  */
-function unreadBadge(node: VNode): string {
-  const count = unreadOf(node);
+function unreadBadge(count: number): string {
   return count > 0 ? `${String(count)} unread` : '';
+}
+
+/**
+ * The same counter for a terminal that has no room for the word.
+ *
+ * Used only once the layout has already given up the author and the date; the alternative
+ * at that width is dropping the count altogether, and a number in parentheses is a great
+ * deal more use than nothing. This is the form the TUI pane uses at every width, for the
+ * same reason, so it is not a new vocabulary either.
+ */
+function compactUnreadBadge(count: number): string {
+  return count > 0 ? `(${String(count)})` : '';
 }
 
 function extraColumn(node: VNode): string {

@@ -414,3 +414,82 @@ describe('formatListing: the unread counter', () => {
   });
 });
 
+
+/**
+ * A row must not be wider than the terminal.
+ *
+ * Reported as: "your right-alignment draws offscreen in different resolutions." The layout
+ * floored the name at 20 columns and let everything to its right run past the edge, which was
+ * survivable while the row was narrow and stopped being survivable the moment the counter
+ * added a column — at 40 columns a row came out 63 wide. A row wider than the terminal wraps,
+ * and a wrapped row turns a scannable list into a paragraph.
+ *
+ * These check the invariant at a spread of widths rather than one, because the failure was
+ * width-dependent and a single 80-column case is exactly what missed it.
+ */
+describe('formatListing: fitting the terminal', () => {
+  const WIDE = new Date('2026-08-11T12:00:00Z');
+  const nodes: readonly VNode[] = [
+    { name: 'Chats', title: 'Chats', kind: 'dir', id: '1', path: '/x/Chats', unreadCount: 3, mtime: WIDE },
+    { name: 'Inbox', title: 'Inbox', kind: 'dir', id: '2', path: '/x/Inbox', unreadCount: 1247, mtime: WIDE },
+    {
+      name: 'A folder with a deliberately very long name that fits nowhere',
+      title: 'A folder with a deliberately very long name that fits nowhere',
+      kind: 'dir',
+      id: '3',
+      path: '/x/long',
+      unreadCount: 9,
+      mtime: WIDE,
+      author: 'Dana Whitfield',
+    },
+    {
+      name: '2026-08-11 FY26 budget review.eml',
+      title: 'FY26 budget review',
+      kind: 'file',
+      id: '4',
+      path: '/x/m.eml',
+      mtime: WIDE,
+      author: 'Tom Okafor',
+      flags: ['unread'],
+    },
+  ];
+
+  for (const width of [20, 30, 40, 50, 60, 72, 80, 100, 120]) {
+    it(`never exceeds ${String(width)} columns`, () => {
+      const out = formatListing(nodes, { width, color: false, dateStyle: 'relative', mode: 'table' });
+      for (const line of out.split('\n')) {
+        assert.ok(
+          displayWidth(line) <= width,
+          `row is ${String(displayWidth(line))} columns in a ${String(width)}-column terminal: ${JSON.stringify(line)}`,
+        );
+      }
+    });
+  }
+
+  it('keeps the counter at a width where it has to drop the author and the date', () => {
+    // The counter is the last optional column to go, because it is the reason to look at the
+    // row. What gets given up first is the material that says nothing about what is new.
+    const out = formatListing(nodes, { width: 30, color: false, dateStyle: 'relative', mode: 'table' });
+    assert.match(out, /3 unread/);
+    assert.doesNotMatch(out, /Dana Whitfield/);
+  });
+
+  it('shortens the counter rather than dropping it when the room runs out', () => {
+    // `3 unread` becomes `(3)` — the same fact in a third of the room, and the form the pane
+    // already uses at every width, so it is not a new vocabulary either.
+    const narrow: readonly VNode[] = [
+      { name: 'Chats', title: 'Chats', kind: 'dir', id: '1', path: '/x/Chats', unreadCount: 3, mtime: WIDE },
+    ];
+    const out = formatListing(narrow, { width: 24, color: false, dateStyle: 'relative', mode: 'table' });
+    assert.ok(displayWidth(out) <= 24, out);
+    assert.match(out, /\(3\)/);
+  });
+
+  it('still spells the word out when there is room for it', () => {
+    const out = formatListing(nodes, { width: 100, color: false, dateStyle: 'relative', mode: 'table' });
+    assert.match(out, /3 unread/);
+    assert.doesNotMatch(out, /\(3\)/);
+  });
+});
+
+

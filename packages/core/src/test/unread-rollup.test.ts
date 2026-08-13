@@ -27,6 +27,14 @@ interface Folder {
   readonly files?: Readonly<Record<string, boolean>>;
   /** Withhold a cursor-free page, so the directory never reads as fully listed. */
   readonly paged?: boolean;
+  /**
+   * "This is the same item as that one, reached another way." Makes the fake tree a graph,
+   * which is what a people directory and a chat roster actually are: the same person is
+   * under `Org`, under `Recent` and under the `Directory` they are defined in. Both routes
+   * then report the same provider id and the same contents, which is the only thing that
+   * lets a counter tell one item from two.
+   */
+  readonly same?: string;
 }
 
 class TreeStub implements Provider {
@@ -43,17 +51,30 @@ class TreeStub implements Provider {
     this.#tree = tree;
   }
 
+  /** Follow `same` to the key that actually owns the contents, and its identity. */
+  #resolve(key: string): { key: string; folder: Folder } {
+    let at = key;
+    for (let hop = 0; hop < 8; hop += 1) {
+      const folder = this.#tree[at] ?? {};
+      if (folder.same === undefined) return { key: at, folder };
+      at = folder.same;
+    }
+    return { key: at, folder: this.#tree[at] ?? {} };
+  }
+
   list(parent: VNode | null, _options?: ListOptions): Promise<ListPage> {
     const key = parent === null ? '' : (parent.meta?.['key'] as string);
     this.listed.push(key === '' ? '<root>' : key);
-    const folder = this.#tree[key] ?? {};
+    const { key: owner, folder } = this.#resolve(key);
 
     const dirs = (folder.dirs ?? []).map((name): VNode => {
-      const childKey = key === '' ? name : `${key}/${name}`;
-      const spec = this.#tree[childKey] ?? {};
+      const childKey = owner === '' ? name : `${owner}/${name}`;
+      const resolved = this.#resolve(childKey);
+      const spec = resolved.folder;
       return {
         name,
-        id: childKey,
+        // The provider's identity for the thing, not for the route taken to it.
+        id: resolved.key,
         kind: 'dir',
         title: name,
         ...(spec.unreadCount === undefined ? {} : { unreadCount: spec.unreadCount }),
@@ -63,11 +84,11 @@ class TreeStub implements Provider {
 
     const files = Object.entries(folder.files ?? {}).map(([name, unread]): VNode => ({
       name,
-      id: `${key}/${name}`,
+      id: `${owner}/${name}`,
       kind: 'file',
       title: name,
       ...(unread ? { flags: ['unread'] } : {}),
-      meta: { key: `${key}/${name}` },
+      meta: { key: `${owner}/${name}` },
     }));
 
     const entries = [...dirs, ...files];
@@ -277,5 +298,215 @@ describe('unread counters: the mount list', () => {
     const rows = new Map(root.entries.map((entry) => [entry.name, entry.unreadCount]));
     assert.equal(rows.get('mail'), 6);
     assert.equal(rows.get('teams'), 1);
+  });
+});
+
+/**
+ * The counter has to arrive on its own.
+ *
+ * Reported as: "I'm not at all seeing what you're seeing until I start navigating ... you
+ * aren't updating counts in realtime or on cli init." Both halves of that are one bug. A
+ * folder's counter is derived from what the cache can see beneath it, and at startup the
+ * cache is empty, so the first listing of the root is necessarily uncounted. The numbers
+ * arrive moments later as warming fills in the mounts — and nothing told anyone, so they
+ * appeared only if the user happened to navigate, which is exactly when a counter has
+ * stopped being useful because they have already committed to going somewhere.
+ *
+ * The engine already had the seam for this: `onListingChanged`, built so a stale listing
+ * corrected against the source reaches the screen. It just never fired for a *parent* whose
+ * derived number moved.
+ */
+describe('unread counters: telling the screen when the number arrives', () => {
+  it('announces the parent when a listing lands underneath it', async () => {
+    const { vfs } = mount({
+      '': { dirs: ['Chats'] },
+      Chats: { dirs: ['Alice'] },
+      'Chats/Alice': { files: { 'a.md': true, 'b.md': true } },
+    });
+
+    const seen: { path: string; counters: string }[] = [];
+    vfs.onListingChanged((event) => {
+      seen.push({
+        path: event.path,
+        counters: event.entries.map((e) => `${e.name}=${String(e.unreadCount)}`).join(','),
+      });
+    });
+
+    // What the user sees at startup: the root, listed before anything beneath it is known.
+    assert.equal(await counterOn(vfs, '/src', 'Chats'), undefined, 'nothing to count yet');
+    assert.equal(seen.length, 0, 'a listing the caller just asked for is not news');
+
+    // Warming, arriving behind them.
+    await vfs.list('/src/Chats');
+    await vfs.list('/src/Chats/Alice');
+
+    const announced = seen.filter((event) => event.path === '/src');
+    assert.ok(announced.length > 0, 'the row the user is looking at was never corrected');
+    assert.equal(announced.at(-1)?.counters, 'Chats=2');
+  });
+
+  it('announces the synthetic root, which is the one listing nobody can navigate above', async () => {
+    // The root is computed rather than fetched, so it is the one directory with no cache
+    // entry of its own to notice a change. It is also the first thing anyone sees.
+    const { vfs } = mount({
+      '': { dirs: ['Inbox'] },
+      Inbox: { files: { 'a.md': true } },
+    });
+
+    const roots: string[] = [];
+    vfs.onListingChanged((event) => {
+      if (event.path === '/') roots.push(event.entries.map((e) => String(e.unreadCount)).join(','));
+    });
+
+    await vfs.list('/');
+    await vfs.list('/src');
+    await vfs.list('/src/Inbox');
+
+    assert.equal(roots.at(-1), '1', 'the mount row never learned its count');
+  });
+
+  it('says nothing when the number has not moved', async () => {
+    // Every announcement costs a repaint, and a list that flickers while being read is worse
+    // than one that updates a moment late. A folder is re-derived once per page landing
+    // anywhere beneath it, so the gate is doing most of the work here.
+    const { vfs } = mount({
+      '': { dirs: ['Inbox'] },
+      Inbox: { unreadCount: 9, dirs: ['Old'] },
+      'Inbox/Old': { unreadCount: 2 },
+    });
+
+    await vfs.list('/src');
+    let announcements = 0;
+    vfs.onListingChanged((event) => {
+      if (event.path === '/src') announcements += 1;
+    });
+
+    // The provider already gave `Inbox` its number, so nothing underneath can change it.
+    await vfs.list('/src/Inbox');
+    await vfs.list('/src/Inbox/Old');
+    assert.equal(announcements, 0);
+  });
+
+  it('does not announce a directory nobody has listed', async () => {
+    // An announcement is a correction to something on screen. A directory the user has never
+    // opened has nothing to correct, and firing for it would wake a subscriber up about a
+    // listing it has never held.
+    const { vfs } = mount({
+      '': { dirs: ['Chats'] },
+      Chats: { dirs: ['Alice'] },
+      'Chats/Alice': { files: { 'a.md': true } },
+    });
+
+    const paths: string[] = [];
+    vfs.onListingChanged((event) => paths.push(event.path));
+
+    await vfs.list('/src/Chats/Alice');
+    assert.equal(paths.length, 0, `nothing above has ever been shown, yet: ${paths.join(', ')}`);
+  });
+});
+
+/**
+ * Sources that are graphs rather than trees.
+ *
+ * A people directory reaches the same person from `Org`, from `Recent`, from `Colleagues`
+ * and from the `Directory` they are defined in; the real Graph hierarchy is a cycle, because
+ * your manager's reports contain you. Adding up what is under each route counted the demo
+ * org chart's six unread messages as thirty-three — a number bearing no relation to anything
+ * the user could go and read, on the one row whose whole job is to tell them where to go.
+ *
+ * Two defences, and they are needed at different levels. Inside a subtree the engine can see
+ * the items and count each one once. Between top-level folders it cannot: each has handed
+ * over an opaque total, and nothing in it says which of them overlap. Only the source knows,
+ * so the source is asked.
+ */
+describe('unread counters: when the same item is in two places', () => {
+  it('counts a person once however many folders point at them', async () => {
+    const { vfs } = mount({
+      '': { dirs: ['Org', 'Directory'] },
+      Org: { dirs: ['Dana'] },
+      // The same human being, filed under their manager as well as in the directory.
+      'Org/Dana': { same: 'Directory/Dana' },
+      Directory: { dirs: ['Dana'] },
+      'Directory/Dana': { files: { 'a.eml': true, 'b.eml': true } },
+    });
+
+    await vfs.list('/src/Directory/Dana');
+    await vfs.list('/src/Directory');
+    await vfs.list('/src/Org/Dana');
+    await vfs.list('/src/Org');
+
+    assert.equal(await counterOn(vfs, '/', 'src'), 2, 'two messages, not four');
+  });
+
+  it('still reports nothing when the duplicate had nothing to report', async () => {
+    // Silence has to survive de-duplication. A source with no notion of read state, seen
+    // twice, is still a source with no notion of read state — not one that counted twice
+    // and found nothing.
+    const { vfs } = mount({
+      '': { dirs: ['Org', 'Directory'] },
+      Org: { dirs: ['Dana'] },
+      'Org/Dana': { same: 'Directory/Dana' },
+      Directory: { dirs: ['Dana'] },
+      'Directory/Dana': { files: {} },
+    });
+
+    await vfs.list('/src/Directory/Dana');
+    await vfs.list('/src/Directory');
+    await vfs.list('/src/Org/Dana');
+    await vfs.list('/src/Org');
+
+    assert.equal(await counterOn(vfs, '/', 'src'), undefined);
+  });
+
+  it('takes the source at its word for the whole mount over its own arithmetic', async () => {
+    // The case the engine cannot reason its way out of. Both sections carry a count the
+    // provider gave, so both are final and neither can be looked inside; adding them is the
+    // only thing left, and it is wrong precisely when the sections overlap. A provider that
+    // says what its own total is settles it.
+    const { vfs, provider } = mount({
+      '': { dirs: ['Org', 'Directory'] },
+      Org: { unreadCount: 5 },
+      Directory: { unreadCount: 6 },
+    });
+    (provider as { unreadTotal?: () => number | undefined }).unreadTotal = () => 6;
+
+    assert.equal(await counterOn(vfs, '/', 'src'), 6, 'not eleven');
+    assert.equal(await counterOn(vfs, '/src', 'Org'), 5, 'and the breakdown is left alone');
+  });
+
+  it('falls back to its own arithmetic when the source declines to answer', async () => {
+    // Every provider that has no opinion — which is all of them until one implements this —
+    // has to keep the number it had before.
+    const { vfs, provider } = mount({
+      '': { dirs: ['Org', 'Directory'] },
+      Org: { unreadCount: 5 },
+      Directory: { unreadCount: 6 },
+    });
+    (provider as { unreadTotal?: () => number | undefined }).unreadTotal = () => undefined;
+
+    await vfs.list('/src');
+    assert.equal(await counterOn(vfs, '/', 'src'), 11);
+  });
+
+  it('ignores a total that cannot be true rather than printing it', async () => {
+    // A row is a decoration. A provider that throws, or answers with nonsense, costs the row
+    // its badge and must not cost the user the listing that tells them where everything is.
+    const { vfs, provider } = mount({
+      '': { dirs: ['Org'] },
+      Org: { unreadCount: 5 },
+    });
+    (provider as { unreadTotal?: () => number | undefined }).unreadTotal = () => -3;
+    await vfs.list('/src');
+    assert.equal(await counterOn(vfs, '/', 'src'), 5, 'the derived number, not the impossible one');
+
+    const { vfs: other, provider: thrower } = mount({
+      '': { dirs: ['Org'] },
+      Org: { unreadCount: 5 },
+    });
+    (thrower as { unreadTotal?: () => number | undefined }).unreadTotal = () => {
+      throw new Error('the source fell over');
+    };
+    await other.list('/src');
+    assert.equal(await counterOn(other, '/', 'src'), 5);
   });
 });

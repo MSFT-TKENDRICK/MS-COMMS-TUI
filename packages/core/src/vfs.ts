@@ -259,6 +259,14 @@ const WARM_CHILDREN = 4;
  */
 const UNREAD_ROLLUP_DEPTH = 4;
 
+/**
+ * Directories whose last-shown counters are remembered, to tell a real change from a repeat.
+ *
+ * One short string per directory, so this is a guard against a long session accumulating
+ * state without bound rather than a meaningful memory cost.
+ */
+const MAX_UNREAD_MEMORY = 1024;
+
 export class Vfs {
   readonly #mounts = new Map<string, Mount>();
   readonly #dirCache: TtlCache<DirectoryIndex>;
@@ -277,6 +285,12 @@ export class Vfs {
   >();
   /** Subscribers to {@link Vfs.onListingChanged}. */
   readonly #listingListeners = new Set<(event: ListingChanged) => void>();
+
+  /**
+   * Path → the counters last shown for it, so {@link Vfs.#announceIfUnreadMoved} can tell a
+   * genuine change from re-deriving the same answer.
+   */
+  readonly #announcedUnread = new Map<string, string>();
 
   #snapshot: SnapshotStore | undefined;
   #prefetchQueue: PrefetchQueue | undefined;
@@ -653,12 +667,18 @@ export class Vfs {
     if (normalized === vpath.ROOT) {
       this.#dirCache.clear();
       this.#docCache.clear();
+      this.#announcedUnread.clear();
       return;
     }
     this.#dirCache.delete(normalized);
     this.#dirCache.invalidatePrefix(normalized);
     this.#docCache.delete(normalized);
     this.#docCache.invalidatePrefix(normalized);
+    // Forget the counters shown for anything cleared, so the listing that replaces it is
+    // compared against what is on screen rather than against a discarded answer.
+    for (const key of [...this.#announcedUnread.keys()]) {
+      if (key === normalized || key.startsWith(`${normalized}/`)) this.#announcedUnread.delete(key);
+    }
   }
 
   get cacheStats(): { directories: CacheStats; documents: CacheStats } {
@@ -815,7 +835,13 @@ export class Vfs {
     const { mount, node, synthetic, path: normalized } = await this.#locate(target, options);
 
     if (mount === undefined && synthetic) {
-      return this.#listSynthetic(normalized, options);
+      const result = this.#listSynthetic(normalized, options);
+      // Recorded here rather than inside #listSynthetic, because that is also how the
+      // roll-up re-derives the root to check it for news. Recording it there would mean
+      // every check overwrote the very answer it was about to compare against, and the
+      // root — the one listing nobody can navigate above — could never report a change.
+      this.#rememberUnread(normalized, result.entries);
+      return result;
     }
 
     const owner = mount as Mount;
@@ -866,6 +892,10 @@ export class Vfs {
 
     const sorted = options.sort === undefined ? entries : sortNodes(entries, options.sort);
     const counted = this.#withRolledUpUnread(sorted);
+    // The caller is about to see these numbers, so they are not news. Recording them here is
+    // what keeps the first speculative listing to land underneath from announcing a
+    // "correction" that corrects nothing.
+    this.#rememberUnread(normalized, counted);
 
     // Learning and guessing happen only for a plain, un-narrowed listing the *user* asked
     // for: that is the shape of navigation. A filtered `ls` is someone interrogating a
@@ -1517,7 +1547,7 @@ export class Vfs {
       if (entry.kind !== 'dir') return entry;
       const path = entry.path;
       if (path === undefined) return entry;
-      const total = this.#unreadBeneath(path, entry.unreadCount, 0);
+      const total = this.#unreadBeneath(path, entry.unreadCount, 0, new Map());
       if (total === undefined || total === entry.unreadCount) return entry;
       changed = true;
       return { ...entry, unreadCount: total };
@@ -1531,8 +1561,27 @@ export class Vfs {
    *
    * Returns `own` untouched whenever the provider did give a count, so this only ever adds
    * rows to the display, never revises one.
+   *
+   * `seen` is what keeps the answer honest on a source that is a graph rather than a tree,
+   * and several of them are. The demo org chart reaches the same person from `Org`, from
+   * `Recent`, from `Colleagues` and from the `Directory` they are defined in; the real
+   * people provider is worse, being an outright cycle of managers and reports. Summing
+   * paths there counted six unread messages as thirty-three — a number with no relationship
+   * to anything the user could go and read, on the one row it exists to inform. So an item
+   * contributes once per row, keyed by the provider's own stable id, no matter how many ways
+   * there are to walk to it.
+   *
+   * The map remembers whether each id *had* an answer rather than merely that it was
+   * visited, because the second occurrence still has to distinguish "already counted" from
+   * "nobody down there counts": a source with no read state must stay silent even when it
+   * appears twice.
    */
-  #unreadBeneath(path: string, own: number | undefined, depth: number): number | undefined {
+  #unreadBeneath(
+    path: string,
+    own: number | undefined,
+    depth: number,
+    seen: Map<string, boolean>,
+  ): number | undefined {
     // The source counted. Whatever it said stands, and the walk stops here — this is what
     // keeps a number from drifting upward as the cache below it fills in.
     if (own !== undefined) return own;
@@ -1556,18 +1605,99 @@ export class Vfs {
       if (child.kind === 'dir') {
         // A folder contributes its number, never its `unread` flag as well: the flag says
         // "something inside is new", which is the fact the number already states.
-        const below = this.#unreadBeneath(child.path ?? vpath.join(path, name), child.unreadCount, depth + 1);
+        const already = seen.get(child.id);
+        if (already !== undefined) {
+          // Reached a second way. Its total is already in `total`; all that is left to
+          // carry over is whether it constituted an answer at all.
+          if (already) counted = true;
+          continue;
+        }
+        const below = this.#unreadBeneath(child.path ?? vpath.join(path, name), child.unreadCount, depth + 1, seen);
+        seen.set(child.id, below !== undefined);
         if (below !== undefined) {
           total += below;
           counted = true;
         }
       } else if (child.flags?.includes('unread') === true) {
+        // Only unread files are remembered. A read one contributes nothing by either route,
+        // so recording it would cost memory to answer a question nobody asks.
+        if (seen.has(child.id)) {
+          counted = true;
+          continue;
+        }
+        seen.set(child.id, true);
         total += 1;
         counted = true;
       }
     }
 
     return counted ? total : undefined;
+  }
+
+  /**
+   * Tell anyone watching an ancestor that its counters have moved.
+   *
+   * A folder's counter is derived from what the cache can see beneath it, so the moment a
+   * listing lands anywhere below, the number on a row *above* becomes wrong. That row is
+   * usually the one on screen: you sit at `/`, warming fills in `/mail` behind you, and the
+   * count belonging to the `mail/` row you are looking at arrives after the frame that
+   * should have shown it. Without this, it appeared only if you happened to navigate — which
+   * is precisely the moment the counter has stopped being useful, because you have already
+   * committed to going in.
+   *
+   * Bounded by the same depth as the roll-up, because a listing deeper than that cannot
+   * change anything up here, and stops at the first ancestor nobody has listed: a directory
+   * outside the cache is a directory nobody is looking at.
+   */
+  #announceUnreadAncestors(path: string): void {
+    // Nobody is watching, so there is nothing to be out of date.
+    if (this.#listingListeners.size === 0) return;
+
+    let current = path;
+    for (let depth = 0; depth <= UNREAD_ROLLUP_DEPTH; depth += 1) {
+      const parent = vpath.dirname(current);
+      if (parent === current) break;
+      this.#announceIfUnreadMoved(parent);
+      if (parent === vpath.ROOT) break;
+      current = parent;
+    }
+  }
+
+  /**
+   * Re-derive one directory's counters and announce it only if they actually changed.
+   *
+   * The gate matters more than the announcement. Every announcement costs a repaint, a
+   * listing is re-derived once per page that lands anywhere beneath it, and a list that
+   * flickers while being read is worse than one that updates a moment late.
+   */
+  #announceIfUnreadMoved(path: string): void {
+    const children = this.cachedChildren(path);
+    if (children === undefined) return;
+
+    const entries = this.#withRolledUpUnread(children);
+    const vector = unreadVector(entries);
+
+    // Only a listing someone has actually been given can be corrected. A directory that has
+    // never been served is not on anyone's screen, and recording it here would quietly make
+    // it eligible for a later "update" about a listing it has never held — which is how
+    // resolving a deep path ended up announcing every directory it walked through.
+    const shown = this.#announcedUnread.get(path);
+    if (shown === undefined || shown === vector) return;
+
+    this.#rememberUnread(path, entries);
+    this.#announce(path, entries, this.#dirCache.get(path)?.total);
+  }
+
+  /** What was last shown for `path`, so a later derivation can tell news from noise. */
+  #rememberUnread(path: string, entries: readonly VNode[]): void {
+    // Bounded so a long session that walks a large tree cannot accumulate one entry per
+    // directory forever. Insertion order is eviction order, and losing an old entry costs at
+    // most one redundant repaint of a directory nobody has looked at in a long time.
+    if (this.#announcedUnread.size >= MAX_UNREAD_MEMORY && !this.#announcedUnread.has(path)) {
+      const oldest = this.#announcedUnread.keys().next();
+      if (oldest.done !== true) this.#announcedUnread.delete(oldest.value);
+    }
+    this.#announcedUnread.set(path, unreadVector(entries));
   }
 
 
@@ -1659,12 +1789,19 @@ export class Vfs {
       const childPath = vpath.join(path, name);
       const isMountRoot = vpath.normalize(childPath) === mount.path;
 
+      // Asked only for the mount's own row, and only ever accepted, never added to — the
+      // same rule that governs every other provider-supplied count. A provider that declines
+      // to answer leaves the row to `#unreadBeneath`, which is where every provider that has
+      // no opinion still gets a number.
+      const stated = isMountRoot ? this.#statedUnread(mount) : undefined;
+
       seen.set(name, {
         name,
         kind: 'dir',
         title: isMountRoot ? (mount.description ?? mount.provider.displayName) : name,
         id: isMountRoot ? `mount:${mount.id}` : `synthetic:${childPath}`,
         path: childPath,
+        ...(stated === undefined ? {} : { unreadCount: stated }),
         meta: isMountRoot
           ? { mount: mount.id, provider: mount.provider.id, capabilities: [...mount.provider.capabilities].join(',') }
           : { synthetic: true },
@@ -1674,6 +1811,34 @@ export class Vfs {
     const entries = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
     const counted = this.#withRolledUpUnread(entries);
     return { path, entries: counted, total: entries.length, undecided: 0, stale: false };
+  }
+
+  /**
+   * What a provider says is unread across its whole mount, if it says anything.
+   *
+   * Wrapped because this runs inside the render path of every `ls /`. A provider that throws
+   * here, or that answers with something that is not a whole number, must cost the row its
+   * counter and nothing more — the root listing is how the user finds everything else, and
+   * it failing outright because one source miscounted would be a far worse trade than a
+   * missing badge.
+   */
+  #statedUnread(mount: Mount): number | undefined {
+    if (mount.provider.unreadTotal === undefined) return undefined;
+    try {
+      const stated = mount.provider.unreadTotal();
+      if (stated === undefined) return undefined;
+      if (!Number.isInteger(stated) || stated < 0) {
+        this.#logger.debug('Provider gave a nonsensical unread total; ignoring it.', {
+          mount: mount.id,
+          stated: String(stated),
+        });
+        return undefined;
+      }
+      return stated;
+    } catch (error) {
+      this.#logger.debug('Provider could not total its unread.', { mount: mount.id, error: String(error) });
+      return undefined;
+    }
   }
 
   /** Fetch (or serve from the accumulated index) one page of a provider-backed directory. */
@@ -2022,6 +2187,11 @@ export class Vfs {
     index.fetchedAt = this.#now();
     this.#dirCache.set(path, index);
 
+    // Data landing here changes what an ancestor's row should say, and an ancestor is
+    // usually what is on screen. This is the single point where new listings enter the
+    // cache, so it is the one place that has to notice.
+    this.#announceUnreadAncestors(path);
+
     return result;
   }
 
@@ -2181,6 +2351,19 @@ function encodeOffsetCursor(offset: number): string {
 }
 
 /**
+ * A listing reduced to just its counters.
+ *
+ * Narrower than {@link listingFingerprint} on purpose. This answers one question — "would
+ * any row's number look different?" — for the roll-up, which re-derives an ancestor every
+ * time a page lands anywhere beneath it. Comparing whole listings there would report a
+ * change whenever a message's relative time crossed a minute boundary, and repaint a list
+ * somebody is reading in order to say nothing.
+ */
+function unreadVector(entries: readonly VNode[]): string {
+  return entries.map((entry) => `${entry.name}\u0000${entry.unreadCount ?? ''}`).join('\u0001');
+}
+
+/**
  * A listing reduced to what a reader would actually notice about it.
  *
  * Used to decide whether a background refresh found anything worth telling anyone about.
@@ -2201,6 +2384,10 @@ function listingFingerprint(entries: readonly VNode[]): string {
         entry.summary ?? '',
         entry.mtime === undefined ? '' : entry.mtime.getTime(),
         (entry.flags ?? []).join(','),
+        // A folder whose counter moved has changed as far as anyone reading the list is
+        // concerned, even though every other field is identical. Leaving this out meant a
+        // corrected count was computed, compared, found "unchanged" and dropped.
+        entry.unreadCount ?? '',
       ].join('\u0000'),
     )
     .join('\u0001');
@@ -2279,3 +2466,6 @@ export function sortNodes(nodes: readonly VNode[], sort: SortSpec): VNode[] {
     return compare(a, b) * direction;
   });
 }
+
+
+

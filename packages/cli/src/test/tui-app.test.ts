@@ -118,9 +118,23 @@ async function harness(
      * ask what the user can do while it is there. The memory provider is instant, which is
      * exactly wrong for testing behaviour that only exists because real sources are not.
      */
-    readonly hold?: () => Promise<void>;
+    readonly hold?: (path: string) => Promise<void>;
     /** A different tree, for tests that need subtypes the action commands look for. */
     readonly items?: readonly MemoryItem[];
+    /**
+     * A second mount, which keeps the session at `/`. With one mount the session helpfully
+     * descends into it, so the synthetic root — the screen the user actually opens onto, and
+     * the one they reported as empty — is never on screen at all.
+     */
+    readonly second?: readonly MemoryItem[];
+    /**
+     * Strip the providers' ability to state a whole-mount total, which is what every real
+     * source is like. The fixture holds everything in memory and can total instantly; Graph
+     * and GitHub cannot say anything until they have fetched, so their mount rows are
+     * derived from the cache and only become right once it fills. Tests about *when* a
+     * number appears have to model the second kind or they test nothing.
+     */
+    readonly cannotTotal?: boolean;
   } = {},
 ): Promise<Harness> {
   const registry = new PluginRegistry(NULL_LOGGER);
@@ -138,6 +152,16 @@ async function harness(
               type: 'memory',
               options: { items: options.items ?? TREE, displayName: 'Test mail', now: () => NOW },
             },
+            ...(options.second === undefined
+              ? []
+              : [
+                  {
+                    id: 'chat',
+                    path: '/chat',
+                    type: 'memory',
+                    options: { items: options.second, displayName: 'Test chat', now: () => NOW },
+                  },
+                ]),
           ],
     ui: { ...DEFAULT_CONFIG.ui, color: 'never' },
   };
@@ -160,11 +184,17 @@ async function harness(
   });
   await session.start();
 
+  if (options.cannotTotal === true) {
+    for (const mount of session.vfs.mounts) {
+      (mount.provider as { unreadTotal?: (() => number | undefined) | undefined }).unreadTotal = undefined;
+    }
+  }
+
   if (options.hold !== undefined) {
     const { hold } = options;
     const real = session.vfs.list.bind(session.vfs);
     session.vfs.list = (async (target, listOptions) => {
-      await hold();
+      await hold(typeof target === 'string' ? target : String(target));
       return real(target, listOptions);
     }) as typeof session.vfs.list;
   }
@@ -902,3 +932,87 @@ describe('tui app: the unread counter', () => {
     await h.done;
   });
 });
+
+/**
+ * The complaint that produced this round, reproduced.
+ *
+ * Reported as: "I'm running the cli and not at all seeing what you're seeing until I start
+ * navigating ... you aren't updating counts in realtime or on cli init."
+ *
+ * Every earlier test listed a directory whose contents were already cached and then asked
+ * what was on screen, so every one of them passed while the program was broken. The window
+ * the user lives in is the other one: the root is synthetic and paints instantly, the mounts
+ * behind it have not answered yet, and a count derived from a cache that is still empty is
+ * necessarily zero. The number is only correct a moment later — and the bug was that nothing
+ * told the screen when that moment came.
+ *
+ * So the shape of this test is the point. The mounts are held shut, the root is allowed
+ * through, the first frame is asserted to be countless, and then the gate opens and the
+ * assertion is that the number appears *with no key ever pressed*. Send a keystroke here and
+ * the test passes against the broken program, because navigating is what the user had to do.
+ */
+async function waitFor(h: Harness, matches: (frame: string) => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 300; i += 1) {
+    if (matches(h.frame())) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`waited for ${what} and it never came; on screen: ${JSON.stringify(h.frame().slice(0, 600))}`);
+}
+
+describe('tui app: the counter that arrives after the first frame', () => {
+  it('fills the root in on its own, with nobody touching the keyboard', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+
+    const h = await harness({
+      items: NESTED,
+      second: NESTED,
+      cannotTotal: true,
+      // The root is synthetic and instant in the real program; the sources behind it are
+      // neither. Holding only the mounts is what makes that ordering reproducible instead
+      // of a race the memory provider happens to win.
+      hold: async (path) => {
+        if (path !== '/') await gate;
+      },
+    });
+
+    await waitFor(h, (frame) => frame.includes('mail/'), 'the root listing');
+    assert.doesNotMatch(h.frame(), /\(\d+\)/, 'nothing has answered yet, so there is nothing to count');
+
+    open();
+
+    await waitFor(h, (frame) => /mail\/\s*\(3\)/.test(frame), 'the count to arrive by itself');
+    assert.match(h.frame(), /chat\/\s*\(3\)/, 'and the same for every other source, not just the first');
+
+    await h.send('q');
+    await h.done;
+  });
+
+  it('does not need the count to be right before it will draw the row', async () => {
+    // The other half of the same decision: the root is shown immediately and corrected,
+    // rather than withheld until it is correct. A shell that opens onto a blank screen for
+    // as long as the slowest source takes is a worse trade than a number that lands late.
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+
+    const h = await harness({
+      items: NESTED,
+      second: NESTED,
+      cannotTotal: true,
+      hold: async (path) => {
+        if (path !== '/') await gate;
+      },
+    });
+
+    await waitFor(h, (frame) => frame.includes('mail/') && frame.includes('chat/'), 'both sources listed');
+    open();
+    await waitFor(h, (frame) => /mail\/\s*\(3\)/.test(frame), 'the count');
+    await h.send('q');
+    await h.done;
+  });
+});
+

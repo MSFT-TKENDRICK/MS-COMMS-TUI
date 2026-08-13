@@ -440,6 +440,19 @@ export class MemoryProvider implements Provider {
   }
 
   /**
+   * What is unread across the entire fixture, for the row standing for this mount in `/`.
+   *
+   * The engine's own fallback adds up the counts of the folders at the top, which is right
+   * for a mailbox and wrong here: the people fixture reaches the same person from `Org`,
+   * `Recent`, `Colleagues` and `Directory`, so six unread messages were being reported as
+   * thirty-three. One walk from every root with a single `seen` set counts each item once,
+   * however many sections point at it.
+   */
+  unreadTotal(): number {
+    return this.#unreadAcross(this.#roots, new Set<string>());
+  }
+
+  /**
    * Everything unread at or below `id`.
    *
    * Counted over the whole subtree rather than the immediate children because the folders
@@ -453,12 +466,15 @@ export class MemoryProvider implements Provider {
    * makes it affordable on every listing.
    */
   #unreadIn(id: string): number {
+    return this.#unreadAcross(this.#entries.get(id)?.children ?? [], new Set<string>([id]));
+  }
+
+  #unreadAcross(startIds: readonly string[], seen: Set<string>): number {
     // The fixture is a graph, not a tree: the people demo is deliberately cyclic (your
     // manager's reports contain you) and an item can be referenced from several folders. So
     // visits are tracked by id, which both terminates the walk and counts an item once
     // however many routes reach it — the same rule search already applies to such items.
-    const seen = new Set<string>([id]);
-    const stack = [...(this.#entries.get(id)?.children ?? [])];
+    const stack = [...startIds];
     let unread = 0;
 
     while (stack.length > 0) {

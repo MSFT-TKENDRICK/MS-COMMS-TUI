@@ -163,6 +163,9 @@ function titleLine(state: TuiState, width: number, options: RenderOptions): stri
   return paint(fit(state.cwd, leftWidth), 'bold', options.color) + paint(fit(right, rightWidth), 'dim', options.color);
 }
 
+/** Room a name needs before the pane starts giving up other columns to find it some. */
+const MIN_NAME_ROOM = 12;
+
 function renderList(state: TuiState, width: number, body: number, options: RenderOptions): string[] {
   const shown = visibleEntries(state);
   const rows: string[] = [];
@@ -197,7 +200,12 @@ function renderList(state: TuiState, width: number, body: number, options: Rende
     const focused = i === state.selected && state.pane === 'list';
 
     const date = formatDate(node.mtime, options.dateStyle);
-    const dateRoom = date === '' ? 0 : Math.min(displayWidth(date) + 1, Math.max(0, width - 12));
+    let dateRoom = date === '' ? 0 : Math.min(displayWidth(date) + 1, Math.max(0, width - 12));
+    // The pane can be split narrow enough that the name, the counter and the date do not all
+    // fit. The date goes first: it is the one thing here that says nothing about whether
+    // there is anything new. Dropping it explicitly matters because the alternative is
+    // letting `fit` shear the row, which silently eats whichever column happens to be last.
+    if (width - 3 - badgeRoom - dateRoom < MIN_NAME_ROOM) dateRoom = 0;
     const nameRoom = Math.max(1, width - 3 - badgeRoom - dateRoom);
 
     const name = fit(node.name + (node.kind === 'dir' ? '/' : ''), nameRoom);

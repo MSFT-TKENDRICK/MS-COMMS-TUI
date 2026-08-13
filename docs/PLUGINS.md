@@ -90,7 +90,38 @@ Where you report nothing, the engine may fill a number in from directories it ha
 listed and cached, purely so a parent isn't blank while its children are visibly counted. It
 never fetches to do this, it stops a few levels down, and it stays silent rather than guess:
 a partially-paged directory yields no number at all, because a floor presented as a total is
-worse than no total.
+worse than no total. It also counts each `id` once however many folders lead to it, so a
+source whose tree is really a graph is not inflated by its own cross-references.
+
+### `unreadTotal()` — for the row standing for your whole mount
+
+Optional, and only worth implementing if the engine would otherwise get it wrong.
+
+The row for `/mail` in `/` has no node of yours behind it, so its counter is obtained by
+adding up the counts of the folders you returned at the top level. For a mailbox that is
+correct. For anything shaped like a graph it is not: in a people directory the same person is
+under `Org`, under `Recent`, under `Colleagues` and in the `Directory` they are defined in,
+and the totals of those sections overlap in a way nothing outside your provider can see. The
+demo org chart's six unread messages were being reported as thirty-three.
+
+```ts
+unreadTotal(): number | undefined {
+  return this.#index === undefined ? undefined : this.#index.distinctUnread;
+}
+```
+
+Two obligations, both the same ones `unreadCount` carries. **No I/O** — this is called while
+a listing is being rendered, and a root that went to the network would make `ls /` fail
+offline for the sake of a badge. And **`undefined`, never `0`, when you have no basis**: a
+source that has fetched nothing yet, or has no concept of read state, has to stay silent.
+Returning `undefined` simply leaves the engine's own arithmetic in place, which is what every
+provider that does not implement this gets. If you throw, or answer with something that is
+not a whole number, the engine logs it, drops the badge and renders the listing anyway.
+
+This one is in-process only. It is synchronous by design — that is how "no I/O" is enforced
+rather than merely requested — and there is no way to make a synchronous call across the
+`exec` protocol's pipe. An `exec` plugin keeps the derived number, which for a tree-shaped
+source is the same answer.
 
 If the backend has no server-side notion of read — feeds mostly don't — you can keep the
 state yourself in `context.state`, which is exactly what `provider-rss` does; read it for the

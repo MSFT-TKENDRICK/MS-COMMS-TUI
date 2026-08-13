@@ -439,6 +439,29 @@ export interface Provider {
   list(parent: VNode | null, options: ListOptions): Promise<ListPage>;
 
   /**
+   * How much is unread across the whole mount, for the row that stands for it in `/`.
+   *
+   * Optional, and it exists because the engine cannot derive this correctly on its own. The
+   * row for `/people` has no provider node behind it, so its number is otherwise obtained by
+   * adding up the counts of the folders inside — which is right only if those folders are
+   * disjoint. Several sources are graphs rather than trees: in a people directory the same
+   * person is reachable from `Org`, from `Recent`, from `Colleagues` and from the `Directory`
+   * they are defined in, and the real Graph hierarchy is an outright cycle, since your
+   * manager's reports contain you. Summing there turned six unread messages into
+   * thirty-three. Only the provider knows its own identities well enough to count each thing
+   * once, so only the provider can answer.
+   *
+   * Two obligations. It must not perform I/O — this is called while rendering a listing, and
+   * a root that went to the network would make `ls /` fail offline for the sake of a
+   * decoration. And it must return `undefined`, never `0`, when it has no basis for an
+   * answer: a source that has fetched nothing yet, or has no notion of read state at all,
+   * has to stay silent rather than claim it counted and found nothing. Returning `undefined`
+   * leaves the engine's own derivation in place, which is what every provider that does not
+   * implement this gets.
+   */
+  unreadTotal?(): number | undefined;
+
+  /**
    * Optional fast path for resolving a single child by name, so `cat /mail/Inbox/x.eml`
    * on a cold cache does not have to page through a 200k-message folder. The engine falls
    * back to paged listing when this is absent or returns undefined.
