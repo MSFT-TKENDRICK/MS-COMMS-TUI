@@ -1,11 +1,10 @@
 /**
- * Speech to text, without taking on a dependency to do it.
+ * Speech to text over plain HTTP.
  *
- * Every engine here is reached over plain HTTP with the runtime's own `fetch`, `FormData`
- * and `Blob`. That is not asceticism. This program reads corporate mail; each package it
- * installs is another maintainer who can push code onto a machine where somebody's inbox is
- * open. A vendor SDK for a single multipart POST is a bad trade, and the POST is genuinely
- * about fifteen lines.
+ * Every engine here is reached with the runtime's own `fetch`, `FormData` and `Blob` rather
+ * than a vendor SDK. Each one is a single multipart POST of about fifteen lines, so an SDK
+ * per engine would be four packages to keep current for four functions we would still have
+ * to read to debug.
  *
  * The default engine is Microsoft Foundry's LLM Speech API running MAI-Transcribe-1.5,
  * which is currently the strongest option available to us: 43 languages, fast enough that a

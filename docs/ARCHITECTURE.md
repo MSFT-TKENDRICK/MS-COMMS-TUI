@@ -31,10 +31,11 @@ and `cat` once instead of learning five clients.
 | `@mscomms/provider-*` | memory, rss, github, graph, ado, exec |
 
 Runtime dependencies are kept few and chosen deliberately, not avoided on principle. Today
-there is one: `@libsql/client`, which backs the local snapshot store — see **The local
-snapshot** below. The small parsing this program needs (JSONC, RSS, MIME-ish headers) is
-still written here, because each is a few hundred well-tested lines and a package would be
-more surface than substance.
+there are two, both behind the local snapshot store: `@libsql/client`, the database driver,
+and `agentfs-sdk`, which presents that database as a filesystem — see **The local snapshot**
+below. The small parsing this program needs (JSONC, RSS, MIME-ish headers) is still written
+here, because each is a few hundred well-tested lines and a package would be more surface
+than substance.
 
 ## Core, module by module
 

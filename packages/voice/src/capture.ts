@@ -1,12 +1,11 @@
 /**
- * Getting audio off the microphone without a native dependency.
+ * Getting audio off the microphone without a native module.
  *
  * Node cannot open a capture device on its own, and every library that fixes that ships a
- * compiled binding. In a program that reads corporate mail, a compiled binding is a
- * meaningfully worse thing to install than a subprocess — it runs in our address space, it
- * has to be rebuilt per platform and per Node release, and it is a supply-chain surface for
- * the sake of a few seconds of PCM. So we spawn a recorder that the user's machine already
- * has, and read WAV from its stdout.
+ * compiled binding. A compiled binding is a meaningfully worse thing to take on than a
+ * subprocess — it runs in our address space, and it has to be rebuilt per platform and per
+ * Node release, for the sake of a few seconds of PCM. So we spawn a recorder that the user's
+ * machine already has, and read WAV from its stdout.
  *
  * That choice has a real cost: the user needs one of ffmpeg, sox or arecord installed. We pay
  * it deliberately, and in exchange the failure is honest and fixable — a missing program with

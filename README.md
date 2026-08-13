@@ -170,7 +170,7 @@ asks once and records the answer.
 ```sh
 git clone https://github.com/MSFT-TKENDRICK/MS-COMMS-TUI
 cd MS-COMMS-TUI
-npm run setup   # npm install (devDependencies only: TypeScript) + npm run build
+npm run setup   # npm install + npm run build
 npm link        # optional: puts `mscomms` and `msh` on your PATH
 ```
 

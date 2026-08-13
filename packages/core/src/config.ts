@@ -3,10 +3,8 @@
  *
  * Format is JSONC — JSON with `//` comments and trailing commas. TOML would be marginally
  * nicer to hand-edit and is what most terminal tools have converged on, but a correct TOML
- * parser is a few thousand lines and this project holds runtime dependencies at zero on
- * purpose: it reads corporate mail, so every transitive package is attack surface someone
- * has to justify. JSONC gets the two things that actually matter for a hand-edited file
- * (comments, forgiving commas) for about eighty lines of well-tested code.
+ * parser is a few thousand lines, and JSONC gets the two things that actually matter for a
+ * hand-edited file (comments, forgiving commas) for about eighty lines of well-tested code.
  *
  * Secrets are never stored in the file. A value written as `${env:GITHUB_TOKEN}` is
  * resolved from the environment at use time, so a config file is safe to commit and safe

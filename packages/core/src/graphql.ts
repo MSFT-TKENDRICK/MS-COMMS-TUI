@@ -1,11 +1,9 @@
 /**
  * A GraphQL query parser.
  *
- * Why hand-written, when `graphql-js` exists and is excellent: the same reason `config.ts`
- * parses JSONC itself and `xml.ts` parses RSS itself. This program reads corporate mail,
- * runtime dependencies are held at zero deliberately, and `graphql-js` is a megabyte of
- * code of which projections need the executor-free front half. What is here is the query
- * language only — no type system definition parsing, no mutations, no subscriptions —
+ * Why hand-written, when `graphql-js` exists and is excellent: projections need only its
+ * executor-free front half, and `graphql-js` is a megabyte of code. What is here is the
+ * query language only — no type system definition parsing, no mutations, no subscriptions —
  * which is a few hundred lines and can be read in one sitting.
  *
  * What IS supported, because projections need it:

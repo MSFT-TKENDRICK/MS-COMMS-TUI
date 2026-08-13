@@ -436,8 +436,10 @@ indirection exists to prevent.
 yourself and hear the result.
 
 Recording uses whatever the OS already provides — `ffmpeg`, `sox`/`rec`, `arecord` or
-PowerShell — rather than a native audio module, because this program has no third-party
-runtime dependencies and a microphone binding is not worth being the first.
+PowerShell — rather than a native audio module. A native binding needs a compiler and a
+rebuild for every platform and Node version, and it turns "is my microphone working" into a
+question you can only answer from inside this program. A recorder command line is one you
+can run yourself, which is why `voice devices` prints it.
 
 "I did not hear anything" and "I did not understand" are deliberately different messages.
 The first means the audio was silent — a muted or unselected microphone. The second means it
