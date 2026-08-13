@@ -245,6 +245,7 @@ export function formatListing(nodes: readonly VNode[], options: ListingOptions):
           return [
             `${String(start + i)}.`,
             `${sanitizeForDisplay(node.name)}${marker}`,
+            unreadBadge(node),
             formatDate(node.mtime, options.dateStyle),
             node.author ?? '',
             flags,
@@ -291,29 +292,45 @@ function announceNode(node: VNode, index: number, options: ListingOptions): stri
 function formatTable(nodes: readonly VNode[], start: number, options: ListingOptions): string {
   const rows = nodes.map((node, i) => {
     const flags = node.flags ?? [];
+    const carriesUnread = flags.includes('unread') || unreadOf(node) > 0;
     // A leading marker column, always in the same place, so it is scannable. The word
     // form is still present in `stat` and in announce mode, so no information is
-    // colour- or glyph-only.
-    const marker = flags.includes('unread') ? '*' : flags.includes('mention') ? '@' : ' ';
+    // colour- or glyph-only. A folder holding unread children earns the same mark as an
+    // unread message: one level up, "is there anything new in here" is the same question.
+    const marker = carriesUnread ? '*' : flags.includes('mention') ? '@' : ' ';
     const name = `${sanitizeForDisplay(node.name)}${node.kind === 'dir' ? '/' : ''}`;
     return {
       index: `${String(start + i)}.`,
       marker,
       name,
+      badge: unreadBadge(node),
       when: formatDate(node.mtime, options.dateStyle),
       who: sanitizeForDisplay(node.author ?? ''),
       extra: options.long === true ? extraColumn(node) : '',
       dir: node.kind === 'dir',
-      unread: flags.includes('unread'),
+      unread: carriesUnread,
     };
   });
 
   const indexWidth = Math.max(...rows.map((row) => row.index.length));
+  const badgeWidth = Math.max(0, ...rows.map((row) => displayWidth(row.badge)));
   const whenWidth = Math.min(20, Math.max(0, ...rows.map((row) => displayWidth(row.when))));
   const whoWidth = Math.min(22, Math.max(0, ...rows.map((row) => displayWidth(row.who))));
   const extraWidth = Math.max(0, ...rows.map((row) => displayWidth(row.extra)));
 
-  const fixed = indexWidth + 1 + 1 + 1 + whenWidth + 2 + whoWidth + 2 + extraWidth + (extraWidth > 0 ? 2 : 0);
+  const fixed =
+    indexWidth +
+    1 +
+    1 +
+    1 +
+    badgeWidth +
+    (badgeWidth > 0 ? 1 : 0) +
+    whenWidth +
+    2 +
+    whoWidth +
+    2 +
+    extraWidth +
+    (extraWidth > 0 ? 2 : 0);
   const nameWidth = Math.max(20, options.width - fixed - 1);
 
   return rows
@@ -322,25 +339,50 @@ function formatTable(nodes: readonly VNode[], start: number, options: ListingOpt
       const painted = options.color
         ? paint(name, row.dir ? 'blue' : row.unread ? 'bold' : 'reset')
         : name;
-      const pieces = [
-        row.index.padStart(indexWidth),
-        row.marker,
-        painted,
-        padTo(truncateWidth(row.when, whenWidth), whenWidth),
-        padTo(truncateWidth(row.who, whoWidth), whoWidth),
-      ];
+      const pieces = [row.index.padStart(indexWidth), row.marker, painted];
+      if (badgeWidth > 0) {
+        // Right-aligned: it is a number, so the digits should line up by magnitude, and
+        // padding on the left is also what keeps the word `unread` in a column of its own
+        // instead of stepping sideways one place with every extra digit.
+        //
+        // Fit first, colour second — the rule the whole file runs on, because an escape
+        // sequence counts as columns to the padding and silently shears the row after it.
+        const text = truncateWidth(row.badge, badgeWidth);
+        const badge = ' '.repeat(Math.max(0, badgeWidth - displayWidth(text))) + text;
+        pieces.push(options.color && row.badge !== '' ? paint(badge, 'bold') : badge);
+      }
+      pieces.push(padTo(truncateWidth(row.when, whenWidth), whenWidth));
+      pieces.push(padTo(truncateWidth(row.who, whoWidth), whoWidth));
       if (extraWidth > 0) pieces.push(row.extra);
       return pieces.join(' ').trimEnd();
     })
     .join('\n');
 }
 
+/** Unread children a directory is reporting. Zero for anything that is not a directory. */
+function unreadOf(node: VNode): number {
+  return node.kind === 'dir' ? (node.unreadCount ?? 0) : 0;
+}
+
+/**
+ * The unread counter a directory carries into a listing.
+ *
+ * Spelled `3 unread` rather than a bare `(3)`. A number on its own is a picture of a
+ * fact, and this listing gets read aloud, piped and grepped, so it has to say which fact
+ * it is. It gets a column of its own rather than a suffix on the name for the same
+ * reason the date does: appended to the name, the one row where the name is long is
+ * exactly the row where the count is truncated away.
+ */
+function unreadBadge(node: VNode): string {
+  const count = unreadOf(node);
+  return count > 0 ? `${String(count)} unread` : '';
+}
+
 function extraColumn(node: VNode): string {
   const bits: string[] = [];
-  if (node.kind === 'dir') {
-    if (node.unreadCount !== undefined && node.unreadCount > 0) bits.push(`${String(node.unreadCount)} unread`);
-    else if (node.childCount !== undefined) bits.push(`${String(node.childCount)} items`);
-  }
+  // The unread count has a column of its own, so `--long` contributes the total rather
+  // than repeating it.
+  if (node.kind === 'dir' && node.childCount !== undefined) bits.push(`${String(node.childCount)} items`);
   const flags = (node.flags ?? []).filter((flag) => flag !== 'unread');
   if (flags.length > 0) bits.push(flags.join(','));
   if (node.size !== undefined) bits.push(formatBytes(node.size));

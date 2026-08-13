@@ -18,6 +18,7 @@ import {
   formatBytes,
   formatDate,
   formatDocument,
+  formatListing,
   formatRows,
   padTo,
   relativeTime,
@@ -25,6 +26,7 @@ import {
   truncateWidth,
   wrapBody,
 } from '../format.js';
+import type { VNode } from '@mscomms/core';
 
 describe('sanitizeForDisplay', () => {
   it('leaves ordinary text alone', () => {
@@ -322,6 +324,93 @@ describe('formatRows in announce mode', () => {
     const out = formatRows(['subject'], [['Lunch?']], opts);
     assert.match(out, /Lunch\?$/m);
     assert.doesNotMatch(out, /Lunch\?\./);
+  });
+});
+
+/**
+ * The unread counter on a directory row.
+ *
+ * A folder that maps to a mailbox, a channel or a feed is the one place a number is worth
+ * more than the listing beneath it — it is what decides whether you go in. These pin the
+ * three properties that make it usable: it is a word and not only a digit, it holds its
+ * column, and it never claims a count for a folder that never reported one.
+ */
+describe('formatListing: the unread counter', () => {
+  const opts = { ...DEFAULT_FORMAT, color: false, width: 80 };
+
+  function dir(name: string, extra: Partial<VNode> = {}): VNode {
+    return { name, kind: 'dir', title: name, id: `id-${name}`, ...extra };
+  }
+
+  it('counts unread children on a folder row in the default table', () => {
+    // The count used to require --long, which meant the default listing of a mailbox
+    // showed nothing at all about where the new mail was.
+    const out = formatListing([dir('Inbox', { unreadCount: 3, childCount: 40 })], opts);
+    assert.match(out, /Inbox\/ +3 unread/);
+  });
+
+  it('says "unread" rather than leaving a bare number to be guessed at', () => {
+    const out = formatListing([dir('Newsletters', { unreadCount: 12 })], opts);
+    assert.doesNotMatch(out, /\(12\)/);
+    assert.match(out, /12 unread/);
+  });
+
+  it('marks the folder in the same leading column an unread message uses', () => {
+    // "Is there anything new in here" is the same question one level up, so it gets the
+    // same answer in the same place rather than a second vocabulary.
+    const out = formatListing([dir('Inbox', { unreadCount: 1 })], opts);
+    assert.match(out, /^\s*1\.\s\*\sInbox\//);
+  });
+
+  it('says nothing for a folder with nothing unread', () => {
+    const out = formatListing([dir('Archive', { unreadCount: 0, childCount: 900 })], opts);
+    assert.doesNotMatch(out, /unread/);
+  });
+
+  it('says nothing for a folder whose source does not report the count', () => {
+    // Silence and zero are different claims. A provider that cannot count must not be
+    // made to look like one that counted and found nothing.
+    const out = formatListing([dir('Projects')], opts);
+    assert.doesNotMatch(out, /unread/);
+  });
+
+  it('keeps the counter in one column across rows that differ in magnitude', () => {
+    const out = formatListing(
+      [dir('Inbox', { unreadCount: 3629 }), dir('Junk', { unreadCount: 1 }), dir('Sent')],
+      opts,
+    );
+    const columns = out
+      .split('\n')
+      .filter((line) => line.includes('unread'))
+      .map((line) => line.indexOf('unread'));
+    assert.equal(new Set(columns).size, 1, `counter is ragged: ${out}`);
+  });
+
+  it('does not let the counter push a row past the terminal width', () => {
+    const out = formatListing(
+      [dir('A folder with a rather long and inconvenient name', { unreadCount: 3629, childCount: 4000 })],
+      { ...opts, width: 60, long: true },
+    );
+    for (const line of out.split('\n')) assert.ok(displayWidth(line) <= 60, `too wide: ${line}`);
+  });
+
+  it('spends --long on the total rather than repeating the count', () => {
+    const out = formatListing([dir('Inbox', { unreadCount: 3, childCount: 40 })], { ...opts, long: true });
+    assert.equal(out.match(/unread/g)?.length, 1);
+    assert.match(out, /40 items/);
+  });
+
+  it('carries the count into plain mode, which is what gets piped', () => {
+    const out = formatListing([dir('Inbox', { unreadCount: 3 })], { ...opts, mode: 'plain' });
+    assert.match(out, /Inbox\/\t3 unread/);
+  });
+
+  it('never puts a count on a file, however the provider fills the field in', () => {
+    const out = formatListing(
+      [{ name: 'note.eml', kind: 'file', title: 'note', id: '1', unreadCount: 500 }],
+      opts,
+    );
+    assert.doesNotMatch(out, /unread/);
   });
 });
 

@@ -258,6 +258,11 @@ export function describeSelection(state: TuiState): string {
 
   const parts = [`${String(state.selected + 1)} of ${String(shown.length)}`, node.name];
   if (node.kind === 'dir') parts.push('folder');
+  // The pane shows this as a bare `(3)` for want of columns; the sentence is where the
+  // number gets told what it counts.
+  if (node.kind === 'dir' && node.unreadCount !== undefined && node.unreadCount > 0) {
+    parts.push(`${String(node.unreadCount)} unread`);
+  }
   if (node.author !== undefined && node.author !== '') parts.push(`from ${node.author}`);
   if (node.flags !== undefined && node.flags.length > 0) parts.push(node.flags.join(', '));
   if (state.filter !== '') parts.push(`filtered by "${state.filter}"`);

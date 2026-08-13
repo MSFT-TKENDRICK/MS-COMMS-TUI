@@ -248,6 +248,17 @@ export interface VfsOptions {
  */
 const WARM_CHILDREN = 4;
 
+/**
+ * How far {@link Vfs.#rollUpUnread} will walk the cache to total up a folder.
+ *
+ * A mount root is depth 1 from the synthetic root and its folders are depth 2, which covers
+ * every shape in the tool today. The bound is here because the graph is genuinely cyclic —
+ * a person's `reports/` contains their manager, whose `reports/` contains them — so a walk
+ * with no limit is a hang, and it would be one on the render path of the first thing a user
+ * ever types.
+ */
+const UNREAD_ROLLUP_DEPTH = 4;
+
 export class Vfs {
   readonly #mounts = new Map<string, Mount>();
   readonly #dirCache: TtlCache<DirectoryIndex>;
@@ -854,6 +865,7 @@ export class Vfs {
     }
 
     const sorted = options.sort === undefined ? entries : sortNodes(entries, options.sort);
+    const counted = this.#withRolledUpUnread(sorted);
 
     // Learning and guessing happen only for a plain, un-narrowed listing the *user* asked
     // for: that is the shape of navigation. A filtered `ls` is someone interrogating a
@@ -871,7 +883,7 @@ export class Vfs {
 
     return {
       path: normalized,
-      entries: sorted,
+      entries: counted,
       ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
       ...(page.total === undefined ? {} : { total: page.total }),
       ...(page.fromCache === undefined ? {} : { fromCache: page.fromCache }),
@@ -905,7 +917,14 @@ export class Vfs {
     if (predictor === undefined || queue === undefined) return;
     if (moved) {
       predictor.record(path);
-      queue.cancel({ minPriority: PREFETCH_PRIORITY.document });
+      // Predictions made from the previous directory are now guesses about somewhere the
+      // user has left, so they go. Warm-up is kept, because it is no longer only a latency
+      // bet: it is the one thing that puts an unread counter on a mount the user has not
+      // opened yet, and those rows — the root listing — are the first thing anyone sees.
+      // Dropping it here is why `ls /` came up blank however long the session had been
+      // running. Keeping it costs nothing in contention: warm is the worst-ranked work in
+      // the queue, so it still runs only when there is nothing a user is waiting for.
+      queue.cancel({ minPriority: PREFETCH_PRIORITY.document, keep: (task) => task.key.startsWith('warm:') });
       this.#persistNavigation();
     }
 
@@ -1455,6 +1474,102 @@ export class Vfs {
     return vpath.join(parent, canonical ?? entry.name);
   }
 
+  // -------------------------------------------------------------------------
+  // Unread roll-up
+  // -------------------------------------------------------------------------
+
+  /**
+   * Give a directory an unread counter when its provider did not.
+   *
+   * A counter earns its keep on the row you are choosing *from* — the row you have to commit
+   * to before you can see anything behind it. Two of the most important such rows are owned
+   * by no provider at all: the synthetic root, where `/mail`, `/teams` and `/github` live,
+   * and any synthetic directory between mounts. Left alone, the part of the tree everyone
+   * sees first, and the part a keyboard user must navigate blind, was exactly the part that
+   * said nothing.
+   *
+   * The same gap appears inside a mount whenever a source knows what is unread but never
+   * totals it. GitHub marks a notification unread and offers no count anywhere; Teams says
+   * only whether a chat has moved since you read it. Both would otherwise be silent for the
+   * same reason: nobody whose job it was to count did.
+   *
+   * So the engine fills the gaps, under three rules.
+   *
+   * **A provider's number is final.** If a source gave a count, that is the count, and
+   * nothing is added to it — a mail folder saying `9` means nine, exactly as it does in
+   * every mail client, and a folder whose children carry their own counts is showing you a
+   * breakdown rather than a contradiction. Adding to it would also double-count the moment a
+   * provider started totalling its own subtree, and would make the number on a row *change*
+   * as browsing filled the cache, which is the fastest way to teach someone to ignore it.
+   *
+   * **It never fetches.** This runs on the way out of `list()`, with a user waiting. A
+   * roll-up that went to the network would turn one listing of eight mounts into eight round
+   * trips and would make `ls /` fail offline — for a decoration on a row.
+   *
+   * **Silence is preserved.** `undefined` means "nobody has a basis for an answer" and stays
+   * `undefined`. Zero is a different claim — it says someone counted and found nothing — and
+   * a source with no notion of read state at all, like GitHub issues, must not be made to
+   * appear to have made it.
+   */
+  #withRolledUpUnread(entries: readonly VNode[]): readonly VNode[] {
+    let changed = false;
+    const filled = entries.map((entry) => {
+      if (entry.kind !== 'dir') return entry;
+      const path = entry.path;
+      if (path === undefined) return entry;
+      const total = this.#unreadBeneath(path, entry.unreadCount, 0);
+      if (total === undefined || total === entry.unreadCount) return entry;
+      changed = true;
+      return { ...entry, unreadCount: total };
+    });
+    return changed ? filled : entries;
+  }
+
+  /**
+   * What to show against a directory whose provider gave no count: everything unread that
+   * the cache can already see at or below `path`.
+   *
+   * Returns `own` untouched whenever the provider did give a count, so this only ever adds
+   * rows to the display, never revises one.
+   */
+  #unreadBeneath(path: string, own: number | undefined, depth: number): number | undefined {
+    // The source counted. Whatever it said stands, and the walk stops here — this is what
+    // keeps a number from drifting upward as the cache below it fills in.
+    if (own !== undefined) return own;
+    if (depth >= UNREAD_ROLLUP_DEPTH) return undefined;
+
+    // Stale is deliberately good enough. This is a decoration on a row, and the whole tool
+    // already prefers a slightly old answer to a spinner.
+    const index = this.#dirCache.get(path) ?? this.#dirCache.getStale(path)?.value;
+    // A half-paged directory can only produce a floor, and a number that silently means "at
+    // least" is worse than no number at all: nothing distinguishes it from an exact one.
+    if (index === undefined || !index.complete) return undefined;
+
+    let total = 0;
+    // Whether anything down here gave a basis for a number at all. A folder from a source
+    // with no notion of read state — GitHub issues, a channel's threads — must stay silent
+    // rather than report `0`, which would claim someone counted and found nothing.
+    let counted = false;
+    for (const name of index.order) {
+      const child = index.byName.get(name);
+      if (child === undefined) continue;
+      if (child.kind === 'dir') {
+        // A folder contributes its number, never its `unread` flag as well: the flag says
+        // "something inside is new", which is the fact the number already states.
+        const below = this.#unreadBeneath(child.path ?? vpath.join(path, name), child.unreadCount, depth + 1);
+        if (below !== undefined) {
+          total += below;
+          counted = true;
+        }
+      } else if (child.flags?.includes('unread') === true) {
+        total += 1;
+        counted = true;
+      }
+    }
+
+    return counted ? total : undefined;
+  }
+
 
 
   // -------------------------------------------------------------------------
@@ -1557,7 +1672,8 @@ export class Vfs {
     }
 
     const entries = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
-    return { path, entries, total: entries.length, undecided: 0, stale: false };
+    const counted = this.#withRolledUpUnread(entries);
+    return { path, entries: counted, total: entries.length, undecided: 0, stale: false };
   }
 
   /** Fetch (or serve from the accumulated index) one page of a provider-backed directory. */

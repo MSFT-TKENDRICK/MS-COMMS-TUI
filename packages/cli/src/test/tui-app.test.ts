@@ -829,3 +829,76 @@ describe('tui app: acting on the selection', () => {
     await h.done;
   });
 });
+
+/**
+ * The counter, in the pane people actually browse in.
+ *
+ * Reported as: "Github had 0 counters. Mail had 0 counters. Teams had 0 counters ... You
+ * aren't rendering the counters in the tree view." Rendering had in fact been built and
+ * unit-tested; what was missing was anything to render, because a folder whose children are
+ * folders counted only the messages loose inside it and found none. So the case worth
+ * holding onto is end-to-end and nested: a real session, a real provider, a folder of
+ * folders, and the number visible on the row you would be choosing from.
+ */
+const NESTED: readonly MemoryItem[] = [
+  {
+    id: 'chats',
+    title: 'Chats',
+    subtype: 'folder',
+    children: [
+      {
+        id: 'priya',
+        title: 'Priya Raman',
+        children: [
+          { id: 'c1', title: 'about the deploy', agoMinutes: 5, body: 'ping', flags: ['unread'] },
+          { id: 'c2', title: 'and one more thing', agoMinutes: 4, body: 'ping', flags: ['unread'] },
+        ],
+      },
+      { id: 'crew', title: 'Release crew', children: [{ id: 'c3', title: 'shipping', agoMinutes: 3, body: 'ping', flags: ['unread'] }] },
+    ],
+  },
+  { id: 'quiet', title: 'Archive', subtype: 'folder', children: [{ id: 'old', title: 'old thing', agoMinutes: 900, body: 'read' }] },
+];
+
+describe('tui app: the unread counter', () => {
+  it('shows a count on a folder whose unread all live further down', async () => {
+    const h = await harness({ items: NESTED });
+    await ready(h);
+
+    const frame = h.frame();
+    assert.match(frame, /Chats\/\s*\(3\)/, 'two conversations plus one, on the row you choose from');
+    await h.send('q');
+    await h.done;
+  });
+
+  it('leaves a folder with nothing new unmarked', async () => {
+    // The counter is only worth reading if its absence means something.
+    const h = await harness({ items: NESTED });
+    await ready(h);
+
+    const line = h
+      .frame()
+      .split('\n')
+      .find((row) => row.includes('Archive/'));
+    assert.ok(line !== undefined, 'expected an Archive row');
+    assert.doesNotMatch(line, /\(\d+\)/);
+    await h.send('q');
+    await h.done;
+  });
+
+  it('still counts after walking into the folder', async () => {
+    // Down one level the conversations carry their own numbers, and they add up to the one
+    // shown above them. A total that disagreed with its own breakdown would be worse than
+    // no total at all.
+    const h = await harness({ items: NESTED });
+    await ready(h);
+    await h.send('\u001B[B', 60);
+    await h.send('\r', 120);
+
+    const frame = h.frame();
+    assert.match(frame, /Priya Raman\/\s*\(2\)/);
+    assert.match(frame, /Release crew\/\s*\(1\)/);
+    await h.send('q');
+    await h.done;
+  });
+});

@@ -45,7 +45,8 @@ and covered in [PLUGINS.md](PLUGINS.md#names-are-yours-to-choose-and-it-matters)
 
 **`provider.ts`** — the plugin contract. See below.
 
-**`vfs.ts`** — the engine: mount table, resolution, listing, reading, search fan-out.
+**`vfs.ts`** — the engine: mount table, resolution, listing, reading, search fan-out, and
+filling in unread counts where a provider reported none.
 
 **`query.ts`** — parse, evaluate, rank and re-serialise `from:dana is:unread after:7d`,
 including the Lucene modifiers (wildcards, fuzzy, proximity, ranges, boosts).
@@ -85,7 +86,7 @@ outlives them.
 
 **`registry.ts`** — plugin registration and mount construction.
 
-## Three decisions worth defending
+## Four decisions worth defending
 
 ### Providers never parse paths
 
@@ -140,6 +141,43 @@ This is also why the Lucene modifiers had to survive `stringifyQuery` round-trip
 A boost or a slop value that vanished on the way out would make two different queries
 render identically, and the engine would then trust a filter that was never applied.
 Every new AST field is therefore covered by a round-trip test.
+
+### The unread count belongs to the provider
+
+A folder's unread count decides where people go next, so it has to be a number they can act
+on without checking it. That makes it a trust question rather than a display one, and the
+answer is the same shape as the push-down boundary above: **the engine never adjusts a count
+a provider reported.** If a source says `9`, the row says `9`.
+
+The alternative — the engine totalling a folder's cached children and adding them on — was
+built, and it failed in the only test that counts. `demo-mail` read `21` at the root and `26`
+a moment later, because browsing into `Inbox` had filled the cache the total was derived
+from. A number that grows while you look at it is a number people stop reading, and it also
+double-counts the moment a provider starts totalling its own subtree, which is precisely what
+a provider whose children are all folders has to do.
+
+What the count *means* is therefore the provider's decision, and it differs by source for
+good reason. A mail folder reports its own level, because that is what Outlook and Gmail show
+and what users already expect. A chat roster reports its subtree, because the folder is only
+a container and a `0` on it would be a lie. Both are right; only the provider can tell which
+case it is in.
+
+The engine's remaining job is narrow: where a provider reported *nothing*, fill a number in
+from directories already listed and cached, so a parent is not blank while its children are
+visibly counted. That derivation never fetches — it runs with a user waiting on a listing,
+and turning one `ls` of eight mounts into eight round trips for a decoration is not a trade
+worth making — and it is bounded to a few levels because the people graph is genuinely
+cyclic. It also refuses to guess: a partially-paged directory contributes nothing, since a
+floor presented as a total is worse than no total.
+
+Silence is preserved throughout. `undefined` means "nobody could count", `0` means "somebody
+counted and found nothing", and the engine will not convert the first into the second.
+GitHub is the case that forces this: its API has no notion of whether you have seen an issue,
+so those rows wear no counter rather than claiming everything is read.
+
+For the counter to be there on the *first* listing, the derivation needs warm prefetch work
+to survive navigation, which it now does — warm tasks are the lowest-ranked work in the
+queue, so keeping them costs nothing in contention.
 
 ## The local snapshot
 

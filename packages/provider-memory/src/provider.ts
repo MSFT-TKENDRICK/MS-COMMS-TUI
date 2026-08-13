@@ -420,11 +420,6 @@ export class MemoryProvider implements Provider {
     const isDir = item.children !== undefined || item.refs !== undefined || entry.children.length > 0;
     const body = item.body ?? '';
 
-    const unread = entry.children.reduce((count, childId) => {
-      const child = this.#entries.get(childId);
-      return count + (child?.flags.has('unread') === true ? 1 : 0);
-    }, 0);
-
     const meta = this.#metaOf(entry);
 
     return {
@@ -440,8 +435,43 @@ export class MemoryProvider implements Provider {
       ...(item.author === undefined ? {} : { author: item.author }),
       ...(item.authorId === undefined ? {} : { authorId: item.authorId }),
       ...(meta === undefined ? {} : { meta }),
-      ...(isDir ? { childCount: entry.children.length, unreadCount: unread } : {}),
+      ...(isDir ? { childCount: entry.children.length, unreadCount: this.#unreadIn(id) } : {}),
     };
+  }
+
+  /**
+   * Everything unread at or below `id`.
+   *
+   * Counted over the whole subtree rather than the immediate children because the folders
+   * worth putting a number on are usually folders of folders: `Chats` holds one directory
+   * per conversation and no loose messages at all, so counting only what is directly inside
+   * it reported a confident `0` beside three unread conversations. A wrong number is worse
+   * than no number — it is the difference between a counter people trust and one they learn
+   * to ignore.
+   *
+   * The whole fixture is already in memory, so this costs a walk and no I/O, which is what
+   * makes it affordable on every listing.
+   */
+  #unreadIn(id: string): number {
+    // The fixture is a graph, not a tree: the people demo is deliberately cyclic (your
+    // manager's reports contain you) and an item can be referenced from several folders. So
+    // visits are tracked by id, which both terminates the walk and counts an item once
+    // however many routes reach it — the same rule search already applies to such items.
+    const seen = new Set<string>([id]);
+    const stack = [...(this.#entries.get(id)?.children ?? [])];
+    let unread = 0;
+
+    while (stack.length > 0) {
+      const next = stack.pop() as string;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      const entry = this.#entries.get(next);
+      if (entry === undefined) continue;
+      if (entry.flags.has('unread')) unread += 1;
+      stack.push(...entry.children);
+    }
+
+    return unread;
   }
 
   /** Fixture metadata with anything an action has since changed layered on top. */

@@ -470,6 +470,87 @@ describe('tui: the spoken description', () => {
     const state = reduce(stateWith(), key('down')).state;
     assert.equal(describeSelection(state), strip(describeSelection(state)));
   });
+
+  it('spells out what a folder\u2019s counter counts', () => {
+    // The pane has room for `(3)` and no more. This sentence is where the number is told
+    // what it is counting, so the digit on screen is never the only carrier.
+    const state = stateWith([node('Inbox', { kind: 'dir', unreadCount: 3 })]);
+    assert.match(describeSelection(state), /3 unread/);
+  });
+
+  it('does not invent a count for a folder that reported none', () => {
+    const state = stateWith([node('Projects', { kind: 'dir' })]);
+    assert.doesNotMatch(describeSelection(state), /unread/);
+  });
+});
+
+/**
+ * The unread counter in the list pane.
+ *
+ * It is a reserved column rather than a suffix on the name, so these check the two things
+ * that go wrong with reserved columns: the row overflowing the pane, and the column being
+ * paid for on screens that have nothing to put in it.
+ */
+describe('tui: the unread counter', () => {
+  it('puts a folder\u2019s unread count on its row', () => {
+    const state = stateWith([node('Inbox', { kind: 'dir', unreadCount: 3 })]);
+    const lines = render(state, OPTIONS).map(strip);
+    assert.ok(
+      lines.some((line) => /Inbox\/\s+\(3\)/.test(line)),
+      lines.join('\n'),
+    );
+  });
+
+  it('marks the folder unread in the same column an unread message uses', () => {
+    const state = stateWith([node('Inbox', { kind: 'dir', unreadCount: 3 })]);
+    const row = render(state, OPTIONS).map(strip).find((line) => line.includes('Inbox/'));
+    assert.match(row ?? '', /^> \*Inbox\//);
+  });
+
+  it('shows nothing for a folder with nothing unread', () => {
+    const state = stateWith([node('Archive', { kind: 'dir', unreadCount: 0, childCount: 900 })]);
+    const row = render(state, OPTIONS).map(strip).find((line) => line.includes('Archive/'));
+    assert.doesNotMatch(row ?? '', /\(/);
+  });
+
+  it('costs no name width on a screenful with no counters in it', () => {
+    // The column is measured over the rows actually drawn, so a mailbox elsewhere in the
+    // tree with 3629 unread does not shrink every other listing in the session.
+    const long = 'a-very-long-message-subject-line-that-will-not-fit-in-the-pane.eml';
+    const narrow = { ...OPTIONS, columns: 40, rows: 24 };
+    const plain = stateWith([node(long)]);
+    const withCounter = stateWith([node(long), node('Inbox', { kind: 'dir', unreadCount: 3629 })]);
+
+    /** How much of the name you actually get to read. */
+    const shown = (state: TuiState): number => {
+      const row = render(state, narrow).map(strip).find((line) => line.includes('a-very-long')) ?? '';
+      let seen = 0;
+      while (seen < long.length && row.includes(long.slice(0, seen + 1))) seen += 1;
+      return seen;
+    };
+
+    assert.ok(shown(plain) > 0, 'the name should be visible at all');
+    assert.ok(
+      shown(plain) > shown(withCounter),
+      `no counter on screen should buy back name width: ${String(shown(plain))} vs ${String(shown(withCounter))}`,
+    );
+  });
+
+  it('keeps every row exactly the pane width, at every width and in colour', () => {
+    const entries = [
+      node('Inbox', { kind: 'dir', unreadCount: 3629, mtime: new Date('2026-08-11T10:00:00Z') }),
+      node('An inconveniently long folder name that will not fit', { kind: 'dir', unreadCount: 7 }),
+      node('2024-01-01-budget-review.eml', { author: 'Ada', flags: ['unread'] }),
+    ];
+    for (const columns of [40, 60, 80, 132]) {
+      for (const color of [false, true]) {
+        const state = withPreview(stateWith(entries), 'Budget review', ['body']);
+        for (const [i, line] of render(state, { ...OPTIONS, color, columns, rows: 24 }).entries()) {
+          assert.equal(strip(line).length, columns, `row ${String(i)} at ${String(columns)} columns`);
+        }
+      }
+    }
+  });
 });
 
 describe('tui: layout', () => {

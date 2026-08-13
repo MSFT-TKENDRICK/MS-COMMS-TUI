@@ -481,6 +481,26 @@ scrollbar and a screen-reader user does not get at all.
 Colour only tracks which pane has focus, and never carries information by itself. The marker
 stays put when focus moves to the preview, so "where was I" survives a pane switch.
 
+**A folder wears its unread count.** A directory that stands for a mailbox, a channel, a
+person or a feed takes the same `*` an unread message does — one level up, "is there
+anything new in here" is the same question, so it gets the same answer in the same column
+rather than a second vocabulary. The number itself is a reserved column, not a suffix on the
+name, so the row with a long name is not the row where the count is truncated away.
+
+It is spelled differently in the two interfaces, on purpose. `ls` writes `3 unread`, because
+a listing is read aloud, piped and grepped, and a bare digit is a picture of a fact rather
+than a statement of one. The pane is routinely 35 columns, where that would cost a quarter of
+the row, so it writes `(3)` — and the word is not lost, because the status line spells it out
+for the selected row, and that sentence is also what prints to scrollback on the way out.
+
+**A blank means "not counted", not "nothing new".** Some sources have no read state to
+report at all — GitHub issues are the plain example — so their rows carry no counter, and the
+shell will not invent a `0` to fill the gap. This matters most to someone reading the column
+aloud one row at a time, where a fabricated zero is indistinguishable from a real one and
+would say "you have seen all of this" about a source that has never been able to tell.
+A count nobody reported and a count of zero are different claims, and neither prints
+anything, but only one of them is silence about a question that was never asked.
+
 **It leaves a trace.** On exit it restores the terminal, then prints the working directory to
 stdout and the selection to stderr. An alternate-screen session normally vanishes without a
 record; this way the session ends with something you can read, and the directory you ended in
@@ -536,6 +556,8 @@ Use this checklist before merging user-visible CLI or TUI changes.
 
 - Verify no command depends on colour to be understood.
 - Verify unread, mention, important, open, and closed states have textual names somewhere visible.
+- Verify a folder's unread counter is spelled in words in `ls` and spoken by the TUI status line.
+- Verify a folder whose source reports no count prints nothing, rather than `0`.
 - Verify relative times are spoken words, not abbreviations such as `2h`.
 - Verify errors print an actionable hint when one exists.
 - Verify stack traces are not printed in the interactive prompt.

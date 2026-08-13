@@ -7,11 +7,11 @@ write forty lines of script for — as folders and files, from the keyboard.
 ```
 /> cd /demo-mail/Inbox
 Inbox> ls
- 1.  Newsletters/                                          just now
- 2.  Projects/                                             just now
- 3.  2026-08-11 FY26 budget review.eml       22 minutes ago  Tom Okafor      unread
- 4.  2026-08-11 Q3-Q4 planning.eml           3 hours ago     Dana Whitfield
- 5.  2026-08-11 Ship it — v2.4 is live.eml   5 hours ago     Sam Ito         flagged
+1. * Newsletters/                              4 unread just now
+2. * Projects/                                 1 unread just now
+3. * 2026-08-11 FY26 budget review.eml                  22 minutes ago Tom Okafor
+4.   2026-08-11 Q3-Q4 planning.eml                      3 hours ago    Dana Whitfield
+5.   2026-08-11 Ship it — v2.4 is live.eml              5 hours ago    Sam Ito
 Inbox> cat 3
 From: Tom Okafor <tom.okafor@contoso.example>
 Date: 2026-08-11T18:32:47Z
@@ -23,6 +23,10 @@ Inbox> find -a -q "budget~ after:7d"        # every source at once, ranked
 
 `ls`, `cd`, `cat`, `find`, `grep`, `stat`. The commands you already know, pointed at the
 systems you actually spend your day in.
+
+A folder that stands for a mailbox, a channel, a person or a feed carries a count of what
+is new in it, so the thing you need to know before you go in is on the row you choose from
+— `*` in the marker column, and the number spelled out in words beside it.
 
 ## Why
 
@@ -102,7 +106,7 @@ them rather than by date. Unread first, then unanswered, then everything else.
 ```
 /> cd /people/Me/manager
 /> ls
-Dana Whitfield          unread(2) unanswered   Engineering Manager — Platform
+Dana Whitfield/         2 unread  unanswered   Engineering Manager — Platform
 /> cd "Dana Whitfield"
 /> ls
 profile.md

@@ -64,6 +64,47 @@ deliberately contains a message named `CON`, a 200-character subject, an emoji, 
 messages with identical subjects, because those are the four things that break naive
 implementations.
 
+### `unreadCount` is a promise about cost
+
+A directory that reports `unreadCount` gets a counter drawn on its own row, in `ls` and in
+the pane, and that row is how a user decides where to go. So it is worth filling in — and
+worth filling in under one constraint: **`list()` on the parent must not go to the network to
+compute it.** A listing of eight mailboxes that fans out into eight requests is a listing that
+is slow when it works and broken when it doesn't. Report the number if you already know it,
+from the same response that gave you the children, from a counts endpoint you were calling
+anyway, or from something you wrote down last time. Otherwise leave it `undefined`.
+
+`undefined` and `0` are different claims, and the shell prints neither, but it will not turn
+one into the other: a source that cannot count must not be made to look like one that counted
+and found nothing.
+
+**Your number is final.** The engine never adds to a count you reported, so report the number
+you want a person to read on that row and nothing else has to be arranged around it. What
+that number means is your decision: a mail folder that says `9` means nine messages in *that*
+folder, which is what every mail client does and what users already expect, while a folder
+whose children are all folders should count its whole subtree or it will read `0` while
+holding unread mail. Only you can tell those two cases apart, which is why the choice lives
+here.
+
+Where you report nothing, the engine may fill a number in from directories it has *already*
+listed and cached, purely so a parent isn't blank while its children are visibly counted. It
+never fetches to do this, it stops a few levels down, and it stays silent rather than guess:
+a partially-paged directory yields no number at all, because a floor presented as a total is
+worse than no total.
+
+If the backend has no server-side notion of read — feeds mostly don't — you can keep the
+state yourself in `context.state`, which is exactly what `provider-rss` does; read it for the
+shape. Two rules there are easy to get backwards. **Listing a folder does not read it**, or
+the counter resets at the moment you look at the thing it is attached to and therefore counts
+nothing. And **the first sight of a source is silent**: a feed subscribed to this morning is
+not forty articles you have failed to read, and a counter whose first value is `40` is one the
+user learns to ignore on day one.
+
+Some sources have no read state to report. GitHub issues and pull requests are the clear
+case: nothing in the API says whether you have seen one, so those directories stay
+`undefined` and wear no counter. That is the honest answer, and it is better than a `0` that
+would quietly claim everything had been read.
+
 ## The `exec` protocol
 
 One JSON object per line on stdin, one per line on stdout.
