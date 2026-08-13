@@ -81,6 +81,7 @@ import { raceAbort } from './abort.js';
 import type { GraphApi } from './client.js';
 import {
   createClient,
+  GRAPH_SHARED_OPTION_KEYS,
   htmlToText,
   preview,
   validateSharedOptions,
@@ -1839,6 +1840,15 @@ export const graphPeoplePlugin: ProviderPlugin<GraphPeopleOptions> = {
   displayName: 'People (Microsoft Graph)',
   description:
     'The corporate hierarchy as folders, and every conversation with a person in one list, most owed first.',
+  optionKeys: [
+    ...GRAPH_SHARED_OPTION_KEYS,
+    'pageSize',
+    'commsPerPerson',
+    'allowSend',
+    'chats',
+    'signalTtlMs',
+    'maxChainDepth',
+  ],
   validateOptions(raw) {
     validateSharedOptions(raw);
     return (raw ?? {}) as GraphPeopleOptions;

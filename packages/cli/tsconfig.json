@@ -12,6 +12,7 @@
     { "path": "../provider-github" },
     { "path": "../provider-graph" },
     { "path": "../provider-ado" },
-    { "path": "../provider-exec" }
+    { "path": "../provider-exec" },
+    { "path": "../voice" }
   ]
 }

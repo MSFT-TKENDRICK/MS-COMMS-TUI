@@ -17,6 +17,11 @@ The design consequence is simple:
 MS-COMMS-TUI rations output, avoids repainting, preserves scrollback, and keeps
 every action reachable from the keyboard.
 
+Reachable *from the keyboard* is a floor, not a ceiling. Someone who cannot type has the
+inverse of the screen-reader user's problem, so every action is reachable by voice too —
+see [Voice as a second input modality](#voice-as-a-second-input-modality) — and every action
+is reversible, whichever channel it arrived through.
+
 ## Default interface: line shell, not full-screen TUI
 
 The line-oriented shell is the default interface.
@@ -332,6 +337,82 @@ A screen-reader user may hear only the sanitized or reordered final text and mis
 the fact that the display was attacked.
 Therefore remote text is sanitized before display, and path names are separately
 sanitized in `packages/core/src/naming.ts`.
+
+## Voice as a second input modality
+
+Voice control exists here for the same reason the keyboard rules do: some people cannot use
+the other one. A user with a motor impairment may find typing painful or impossible while
+reading the screen perfectly well, which is the mirror image of the screen-reader user the
+rest of this document is written for. Both need every action reachable, just through
+different channels.
+
+The rule that keeps it honest is that **speech produces a command line, never a function
+call.** `@mscomms/voice` turns audio into a string; that string goes to the same dispatcher a
+typed line goes to. So voice cannot do anything the keyboard cannot, cannot skip a
+confirmation the keyboard would have shown, and cannot leave the journal without an entry.
+It also means voice is not a second implementation of the program's behaviour that will drift
+from the first one.
+
+**Recognition is unreliable in a way typing is not, so the grammar refuses more readily than
+the parser does.** It never partially matches — "delete everything and go to inbox" matches
+no rule rather than matching `go to` and discarding the first half, which is the spoken form
+of the surplus-argument bug above. A name matching two visible items names both and asks
+which; "open nine" in a folder of four says so rather than clamping to the fourth. Guessing
+right most of the time is not good enough when the exceptions are messages archived unread.
+
+**Confirmation is asked and answered out loud, so hands-free stays hands-free**, but only
+unambiguous words count — "yes", "yeah", "go ahead", "no", "cancel". Silence, a half-sentence
+or a cough the recognizer rendered as a word all fall through to the keyboard. A confirmation
+prompt that resolves ambiguity in favour of proceeding is not a confirmation prompt.
+
+**"I did not hear anything" and "I did not understand" are different messages.** The first
+means the audio was silent — a muted or unselected microphone. The second means it was heard
+and matched nothing — a phrasing problem. Different causes, different fixes, so collapsing
+them into one message would send half the users to the wrong place.
+
+**The microphone indicator is words, not colour.** `[MIC LIVE]`, `[MIC WORKING]`,
+`[MIC FAILED]`, following the colour-is-never-information rule, which matters more here than
+anywhere else: the people most likely to be driving this by voice are the least likely to be
+able to see a coloured dot. `[MIC LIVE]` and `[MIC LIVE - LOCKED]` are different lengths too,
+so the row changes shape as well as colour. It sits on the prompt in the line shell and in
+the input bar in the pane — the row the cursor is already on, in both cases, because "am I
+being recorded right now?" must not require running a command to find out.
+
+**Hold-to-talk is never the only way to talk.** Holding `Ctrl+Space` through a sentence is
+the primary gesture, but a quick tap latches the microphone on until the next tap. Holding a
+key steadily is exactly the thing a tremor, a splint or a single-handed setup makes
+unreliable, so the gesture that is hardest to perform has an equivalent that is not. The same
+tap-to-latch behaviour is what you get automatically on a terminal that cannot report key
+releases, so no user is ever left without a working way in.
+
+**The indicator only appears while the microphone is open.** A permanent `[MIC OFF]` on the
+prompt would be re-read by a screen reader on every keystroke, forever, to convey the absence
+of a thing — a running cost charged to every user in exchange for nothing.
+
+`command <anything>` runs what follows verbatim, checked before normalization so punctuation
+and capitalization survive. Somebody who already knows the shell should not have to discover
+which English the grammar happens to accept.
+
+## Undo is an accessibility feature
+
+Every interaction — typed, arrow-keyed or spoken — is recorded with the command that repeats
+it and, where one exists, the inverse that reverses it. This is listed here rather than only
+in the architecture notes because the people most affected by its absence are the ones this
+document is about: a misrecognized phrase and a mis-heard screen-reader announcement are both
+mistakes made with incomplete information about what just happened.
+
+`history` records where each interaction came from, which answers the question everyone asks
+after a surprise — "did I do that, or did it mishear me?"
+
+**Undo refuses rather than skipping.** If the newest change cannot be reversed, it stops and
+names the obstacle instead of reaching past it. Skipping would mean the visible effect of
+`undo` was something several steps back that the user had stopped thinking about — and if
+you cannot see the resulting screen at a glance, an undo that quietly did something other
+than what you asked is not a safety net at all.
+
+Reads and view changes are journaled but not undoable. Putting them on the stack would mean
+`undo` frequently did nothing observable, which teaches people that undo is unreliable, and a
+safety net nobody trusts has already failed.
 
 ## Keyboard reference
 

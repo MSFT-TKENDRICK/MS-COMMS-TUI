@@ -2,11 +2,9 @@
  * A small, tolerant XML reader.
  *
  * Yes, this is a hand-written XML parser, and no, that is not normally a good idea. It is
- * here because the alternative is a dependency, and this project holds runtime
- * dependencies at zero on purpose: it reads corporate mail, so every transitive package is
- * something a security reviewer has to sign off on. Feed parsing is the only place XML
- * appears, the input is a well-defined subset (RSS, RDF, Atom), and the parser only has to
- * be good enough to pull text out of elements.
+ * here because feed parsing is the only place XML appears, the input is a well-defined
+ * subset (RSS, RDF, Atom), and the parser only has to be good enough to pull text out of
+ * elements.
  *
  * Tolerance over correctness is deliberate. Feeds in the wild are frequently malformed —
  * unescaped ampersands, stray `<` in titles, mismatched close tags. A strict parser would

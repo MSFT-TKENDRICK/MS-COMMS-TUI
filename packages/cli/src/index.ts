@@ -35,8 +35,10 @@ import { Tui } from './tui/app.js';
 import { CommandTable, parseLine, surplusMessage, tokenize } from './commands/types.js';
 import { navigationCommands } from './commands/navigate.js';
 import { graphCommands } from './commands/graph.js';
+import { journalCommands } from './commands/journal.js';
 import { readCommands } from './commands/read.js';
 import { searchCommands } from './commands/search.js';
+import { voiceCommands } from './commands/voice.js';
 import { watchCommands } from './commands/watch.js';
 import { demoCommand, systemCommands } from './commands/system.js';
 import { STARTER_CONFIG } from './starter-config.js';
@@ -55,6 +57,9 @@ export function buildCommandTable(): CommandTable {
   table.registerAll(searchCommands);
   table.registerAll(graphCommands);
   table.registerAll(watchCommands);
+  // Registered before the system group so `redo` can dispatch back into a complete table.
+  table.registerAll(journalCommands(table));
+  table.registerAll(voiceCommands(table));
   table.registerAll(systemCommands(table));
   return table;
 }
@@ -250,6 +255,10 @@ export async function main(options: CliOptions): Promise<number> {
     if (isVfsError(error) && error.hint !== undefined) writeError(`${error.hint}\n`);
     return 2;
   }
+
+  // Said once, before anything else runs, and on stderr so it survives the full-screen view.
+  // A warning nobody sees is exactly the silence this was meant to avoid.
+  for (const warning of config.warnings ?? []) writeError(`Warning: ${warning}\n`);
 
   const registry = builtinRegistry(logger);
   if (config.plugins.length > 0) {

@@ -188,6 +188,13 @@ export const doctorCommand: Command = {
           : session.config.sourcePath,
     });
 
+    // Parts of the file that were ignored. Reported one at a time rather than as a count,
+    // because "1 setting ignored" tells you that something is wrong without telling you what,
+    // which is the position this command exists to get people out of.
+    for (const warning of session.config.warnings ?? []) {
+      checks.push({ name: 'config setting', status: 'warn', detail: warning });
+    }
+
     // What startup did, and what it cost — including anything the launcher reported into the
     // same list, since "why did that take ten seconds?" is usually answered by a rebuild the
     // user did not know was happening.
@@ -201,6 +208,10 @@ export const doctorCommand: Command = {
           ? 'Nothing is mounted. Add a "mounts" entry to your config, or run `demo`.'
           : `${String(session.vfs.mounts.length)} mounted: ${session.vfs.mounts.map((mount) => mount.path).join(', ')}`,
     });
+
+    for (const warning of session.mountWarnings) {
+      checks.push({ name: 'mount option', status: 'warn', detail: warning });
+    }
 
     for (const broken of session.brokenMounts) {
       checks.push({
@@ -320,6 +331,19 @@ export const setCommand: Command = {
     '  dates       relative, absolute or iso',
     '  bell        on or off — an audible beep on notification',
     '',
+    'Voice settings are namespaced and change for this session only:',
+    '  voice.autoRun    on or off — run spoken changes without confirming',
+    '  voice.speak      on or off — read results back aloud',
+    '  voice.recorder   the program used to record, when detection picks wrong',
+    '  voice.device     input device name',
+    '  voice.wakeWord   required prefix in continuous mode',
+    '  voice.mode       push or continuous',
+    '  voice.language   BCP-47 tag, e.g. en-GB',
+    '',
+    'An empty value clears one: `set voice.device ""` undoes a guess that stopped the',
+    'microphone working. `voice.apiKey` is deliberately not settable here — a key typed at',
+    'a prompt ends up in scrollback and shell history.',
+    '',
     '`announce` mode prints one sentence per item instead of aligned columns. Column',
     'alignment is a purely visual affordance; through speech it is just padding.',
   ].join('\n'),
@@ -345,6 +369,15 @@ export const setCommand: Command = {
       return;
     }
     if (value === undefined) throw new Error(`What should "${name}" be set to? Try \`help set\`.`);
+
+    // Voice settings are namespaced and owned by the session, so they can be changed before
+    // anything has turned a microphone on — otherwise the advice in the confirmation error
+    // would only be usable after the point where you needed it. The controller re-reads them
+    // per utterance, so a change lands on the next thing said.
+    if (name.startsWith('voice.')) {
+      session.print(session.setVoiceOption(name.slice('voice.'.length), value));
+      return;
+    }
 
     switch (name) {
       case 'mode': {

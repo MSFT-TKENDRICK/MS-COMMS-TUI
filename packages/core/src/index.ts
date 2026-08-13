@@ -55,9 +55,34 @@ export {
   type SortField,
   type SortSpec,
   type StateStore,
+  type UndoSpec,
   type VNode,
   type WellKnownFlag,
 } from './provider.js';
+
+// ---------------------------------------------------------------------------
+// Interactions
+//
+// Every interaction is a value with a name, a command line and a stated inverse. That
+// single decision is what makes the program undoable, voice-drivable and consistent
+// between its two interfaces — see journal.ts for why those are the same problem.
+// ---------------------------------------------------------------------------
+
+export {
+  ChangeBus,
+  Journal,
+  reversalFor,
+  type JournalEntry,
+  type JournalKind,
+  type JournalOptions,
+  type JournalStep,
+  type JournalTarget,
+  type RecordInput,
+  type RedoStep,
+  type Reversal,
+  type SessionEvent,
+  type SessionListener,
+} from './journal.js';
 
 export {
   parseQuery,
@@ -214,6 +239,7 @@ export {
   type NotificationConfig,
   type SavedQueryConfig,
   type UiConfig,
+  type VoiceConfig,
   type WatchConfig,
 } from './config.js';
 

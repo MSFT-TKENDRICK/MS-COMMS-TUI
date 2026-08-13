@@ -25,15 +25,17 @@ and `cat` once instead of learning five clients.
 
 | Package | Contains |
 |---|---|
-| `@mscomms/core` | Paths, naming, the provider contract, the VFS engine, query language, the graph model and mapping surface, GraphQL projections, cache, config, notifications, watches |
+| `@mscomms/core` | Paths, naming, the provider contract, the VFS engine, query language, the graph model and mapping surface, GraphQL projections, cache, config, notifications, watches, the interaction journal |
 | `@mscomms/cli` | The shell, commands, completion, formatting |
+| `@mscomms/voice` | Speech capture, transcription, the phrase grammar, speech output |
 | `@mscomms/provider-*` | memory, rss, github, graph, ado, exec |
 
 Runtime dependencies are kept few and chosen deliberately, not avoided on principle. Today
-there is one: `@libsql/client`, which backs the local snapshot store — see **The local
-snapshot** below. The small parsing this program needs (JSONC, RSS, MIME-ish headers) is
-still written here, because each is a few hundred well-tested lines and a package would be
-more surface than substance.
+there are two, both behind the local snapshot store: `@libsql/client`, the database driver,
+and `agentfs-sdk`, which presents that database as a filesystem — see **The local snapshot**
+below. The small parsing this program needs (JSONC, RSS, MIME-ish headers) is still written
+here, because each is a few hundred well-tested lines and a package would be more surface
+than substance.
 
 ## Core, module by module
 
@@ -83,7 +85,60 @@ outlives them.
 
 **`config.ts`** — JSONC loading, validation, secret indirection, platform paths.
 
+**`journal.ts`** — the record of what happened: each interaction as a value with the command
+that repeats it and, where one exists, the inverse that reverses it. Also `ChangeBus`, which
+announces changes so views can follow them. See below.
+
 **`registry.ts`** — plugin registration and mount construction.
+
+## Interactions are values
+
+The requirement that everything be undoable and the requirement that everything be
+commandable are the same requirement wearing two hats. Both are impossible while an
+interaction is a side effect inside a key handler, and both are nearly free once an
+interaction is a *value*: a name, the command line that would repeat it, and optionally the
+command line that would reverse it.
+
+```ts
+interface Interaction {
+  label: string;         // "Marked 'FY26 budget review' as read"
+  command: string;       // do read 3
+  source: 'shell' | 'tui' | 'voice' | 'script';
+  undo?: UndoSpec;       // the inverse, when one exists
+}
+```
+
+Three things fall out of that, none of which needed their own machinery:
+
+- **Undo** is a stack of these, and `undo` runs the inverse through the ordinary dispatcher.
+- **The audit log** is the same list, printed. It records `source`, which is what lets you
+  answer "did I do that, or did the recognizer mishear me?"
+- **Voice** is just another producer of `command`. `@mscomms/voice` knows nothing about
+  sessions, providers or the VFS — it turns audio into a string. `cli/voice-service.ts` is
+  the only place the two meet, and it hands that string to the same dispatcher a typed line
+  goes to. A spoken command therefore cannot do anything a typed one cannot, and inherits
+  confirmation, journalling and undo without asking for them.
+
+The inverse comes from the provider, not from the core, because only the provider knows
+whether an action was actually reversible — and, importantly, whether it changed anything at
+all. Marking an already-read message as read offers no undo, because reversing it would mark
+unread something that was never unread.
+
+**Undo refuses rather than skipping.** If the newest change cannot be reversed it stops and
+says what is in the way. Reaching past it would mean the visible result of `undo` was
+something two steps back that the user was no longer thinking about — the worst possible
+behaviour for the one command whose entire promise is predictability.
+
+## Views follow the world, they do not track it
+
+`ChangeBus` exists so the full-screen pane never maintains a parallel idea of where it is.
+Anything that changes the world emits an event; the pane folds events into its state. There
+is exactly one direction of flow, so a state that disagrees with the VFS is not a bug to be
+found and fixed — it is unrepresentable.
+
+This is what makes arrow keys undoable. Pressing Enter on a folder does not assign to a
+field; it runs the same journaled navigation a typed `cd` does, which is why `u` in the pane
+and `undo` in the shell are the same operation.
 
 ## Three decisions worth defending
 

@@ -1,8 +1,8 @@
 /**
  * The GraphQL parser.
  *
- * Hand-written, because this project ships no runtime dependencies, and a parser nobody
- * else maintains has to be tested as if it were the one thing users notice — which it is.
+ * Hand-written — and a parser nobody else maintains has to be tested as if it were the one
+ * thing users notice, which it is.
  * A projection is written at a prompt, so the parser's error messages are part of the user
  * interface: "expected } at line 3, column 12" is help, "unexpected token" is not.
  *

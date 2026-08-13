@@ -18,9 +18,8 @@
 # Until then the app falls back to the per-project settings in its own store.
 scripts:
   # Run once when the app creates a workspace, before anything else: installs
-  # the devDependencies (TypeScript, and nothing else — this project ships no
-  # third-party runtime dependencies on purpose) and builds every workspace
-  # package. Incremental and safe to re-run.
+  # dependencies and builds every workspace package. Incremental and safe to
+  # re-run.
   - name: setup
     command: node scripts/app-setup.mjs
     triggers:
@@ -39,9 +38,7 @@ scripts:
 auto_open_in_browser: false
 
 instructions: |
-  Node 20.11+, npm workspaces, TypeScript project references. No third-party
-  runtime dependencies — that is a deliberate security property of a program
-  that reads corporate mail, so do not add any without being asked to.
+  Node 20.11+, npm workspaces, TypeScript project references.
 
   - Set up a fresh checkout with `npm run setup` (install + build). `node_modules/`
     and `dist/` are gitignored, so neither survives into a new worktree.

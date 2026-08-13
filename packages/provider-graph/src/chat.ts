@@ -46,6 +46,7 @@ import {
 import type { GraphApi, GraphPage } from './client.js';
 import {
   createClient,
+  GRAPH_SHARED_OPTION_KEYS,
   htmlToText,
   preview,
   validateSharedOptions,
@@ -720,6 +721,7 @@ export const graphChatPlugin: ProviderPlugin<GraphChatOptions> = {
   type: 'graph-chat',
   displayName: 'Teams and chats (Microsoft Graph)',
   description: 'Chats, teams, channels and threads as directories; messages as files.',
+  optionKeys: [...GRAPH_SHARED_OPTION_KEYS, 'chatsOnly', 'pageSize', 'maxReplies'],
   validateOptions(raw) {
     validateSharedOptions(raw);
     return (raw ?? {}) as GraphChatOptions;

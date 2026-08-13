@@ -19,11 +19,11 @@
  * Delivery is best-effort and never fatal: a missing `notify-send`, a locked-down
  * PowerShell policy or a headless CI box degrades to the in-app log and a log line.
  *
- * No dependency is used for this. `node-notifier` shells out to a bundled SnoreToast
- * binary and, per its own README, needs a registered AppUserModelID and a Start Menu
- * shortcut before Windows will brand a notification correctly — an install step a
- * zero-install CLI does not have. Spawning the platform's own mechanism directly is both
- * fewer moving parts and one less supply-chain dependency in a tool that reads corporate mail.
+ * This spawns the platform's own mechanism rather than using `node-notifier`, which shells
+ * out to a bundled SnoreToast binary and, per its own README, needs a registered
+ * AppUserModelID and a Start Menu shortcut before Windows will brand a notification
+ * correctly — an install step a zero-install CLI does not have. Spawning directly is fewer
+ * moving parts and works the moment the CLI is on the machine.
  */
 
 import { spawn } from 'node:child_process';

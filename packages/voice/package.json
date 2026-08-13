@@ -1,0 +1,19 @@
+{
+  "name": "@mscomms/voice",
+  "version": "0.1.0",
+  "description": "Speech input for the message VFS: microphone capture, speech-to-text through Microsoft Foundry or a local model, and a grammar that turns what was said into a real command line.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@mscomms/core": "0.1.0"
+  }
+}

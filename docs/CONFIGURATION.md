@@ -27,18 +27,44 @@ Cache, logs, notification history and OAuth tokens live in the data directory �
 | `MSCOMMS_CONFIG_DIR` | The directory the config file is looked for in. |
 | `MSCOMMS_DATA_DIR` | Cache, log, notification history and token storage. |
 
-## Unknown keys are an error
+## Unknown keys are reported, not fatal
 
 A typo in a config file usually fails silently, and you find out weeks later when the thing
-you configured turns out never to have been configured. This program refuses to start and
+you configured turns out never to have been configured. This program says so at startup and
 names the nearest real key:
 
 ```
-Unknown config key "notification". Did you mean "notifications"?
+Warning: Ignoring unknown setting "notification" in C:\Users\you\AppData\Roaming\mscomms\config.jsonc. Did you mean "notifications"?
 ```
 
-That is deliberate and there is no lenient mode. The suggestion is distance-capped, so a
-genuinely unrelated key gets a plain "unknown key" rather than a misleading guess.
+The suggestion is distance-capped, so a genuinely unrelated key gets the list of real keys
+rather than a misleading guess.
+
+The rest of the file still loads. An earlier version treated this as fatal, on the theory
+that a silently dropped key is the worst outcome — which is true, and a warning already fixes
+it. Refusing to start does not just fail to add anything, it takes away the tools you would
+use to recover: one stray key meant `doctor`, `config show` and even `help` all died with the
+same message, `init` refused to overwrite the file, and the launcher reported a machine with
+four working mounts as having none. The warning goes to stderr, so it survives the
+full-screen view and is still in the scrollback afterwards.
+
+`doctor` reports the same thing as a check, so it is visible after the fact too:
+
+```
+2. check config setting, status WARN, detail Ignoring unknown setting "cache" in C:\Users\you\AppData\Roaming\mscomms\config.jsonc. Known settings are: $schema, comment, keymap, mounts, notifications, plugins, queries, ttlMs, ui, voice, watches.
+```
+
+A mount option that no provider reads is the same failure one level down: the file says one
+thing, the program does another, and nothing mentions it. Providers with a closed set of
+options declare them, so an option that will never be read is named rather than quietly
+discarded:
+
+```
+Warning: Mount "/mail" (graph-mail) does not use the option "prefetch", so it has no effect.
+```
+
+Providers whose options are open-ended do not declare a list and are not checked, because
+warning about config that works would be the same mistake in the other direction.
 
 ## Top-level keys
 
@@ -49,6 +75,7 @@ genuinely unrelated key gets a plain "unknown key" rather than a misleading gues
 | `queries` | array | Saved queries, available by name to `find` and `watch`. |
 | `watches` | array | Watches to start automatically at launch. |
 | `ui` | object | Display settings. |
+| `voice` | object | Speech recognition and speech output. |
 | `notifications` | object | Desktop notification settings. |
 | `keymap` | object | Key rebindings for the opt-in TUI. |
 | `cache` | object | Local Turso/libSQL snapshot, background sync and prefetching. |
@@ -470,6 +497,64 @@ but nothing in the docs or the generated config will ever show you how.
 
 Colour is decoration only. Everything shown in colour is also stated in words, so
 `--plain` loses appearance and never loses information.
+
+## `voice`
+
+```jsonc
+"voice": {
+  "engine": "mai",
+  "endpoint": "https://my-resource.cognitiveservices.azure.com",
+  "apiKey": "${env:FOUNDRY_API_KEY}",
+  "language": "en-US"
+}
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Start listening at launch. Off by default, deliberately. |
+| `engine` | `"mai"` \| `"foundry"` \| `"azure-speech"` \| `"openai"` \| `"xai"` \| `"command"` | `"mai"` | Which service transcribes. `command` runs a local binary and sends nothing anywhere. |
+| `endpoint` | string | — | Resource URL. Required for everything except `command` and `azure-speech` with a `region`. For the OpenAI-compatible engines, an endpoint that already names a transcription path is used verbatim. |
+| `apiKey` | string | — | Use `${env:NAME}`. A literal-looking key is rejected at load time. |
+| `model` | string | `mai-transcribe-1.5` | Model name, or the deployment name for `engine: "foundry"` (which has no default and must be set). Not validated — hosted surfaces move faster than releases of this program. |
+| `phraseBias` | boolean | `true` | Send the names currently on screen to the recognizer as an entity bias. Used only by `mai`; ignored by engines that cannot accept it. |
+| `language` | string | `en-US` | BCP-47 tag. Sent as `locales` to `mai`; omitting it asks the model to identify the language itself. |
+| `region` | string | — | For `azure-speech`, as an alternative to `endpoint`. |
+| `command` / `commandArgs` | string / string[] | — | Local binary for `engine: "command"`. WAV on stdin, transcript on stdout. |
+| `mode` | `"push"` \| `"continuous"` | `"push"` | `push` captures one utterance at a time; `continuous` listens until told to stop and requires `wakeWord`. |
+| `wakeWord` | string | — | Required prefix in continuous mode, so ambient speech is not obeyed. |
+| `pushToTalk` | `"auto"` \| `"hold"` \| `"toggle"` | `"auto"` | How the talk key behaves in the pane. `auto` holds where the terminal reports key releases and latches where it does not; `hold` insists; `toggle` never holds. |
+| `talkKey` | string | `ctrl+space` | The hold-to-talk key in the pane. **One modifier and one key**, e.g. `ctrl+t`, `alt+v`. A bare key is rejected: a terminal sends an unmodified key as the character it types, so there is no "held" to detect. Also rejected if it collides with a key the terminal sends the same bytes for — `ctrl+m` is Enter, `ctrl+i` is Tab, `ctrl+h` is Backspace, and `ctrl+c` / `ctrl+[` are the ways out of the pane. |
+| `releaseDelayMs` | number | 250 | Keep recording this long after the key comes up, so the last syllable is not clipped. `0` stops immediately. |
+| `maxSeconds` | number | 15 | Longest single utterance. |
+| `recorder` / `recorderArgs` | string / string[] | auto | Force a capture program rather than detecting one. |
+| `device` | string | — | Input device name passed to the recorder. |
+| `autoRun` | boolean | `false` | Skip confirmation for mutating commands. |
+| `speak` | boolean | `false` | Read results back through the OS synthesizer. |
+
+`voice status` reports which engine resolved, whether the key reference resolved (without
+printing what it resolved to), whether a recorder was found, and how the talk key will
+behave. `voice devices` lists the capture backends available on this machine.
+
+Hold-to-talk needs a terminal that reports key releases, which is negotiated with the kitty
+keyboard protocol — kitty, foot, WezTerm, Ghostty, rio, Alacritty and Windows Terminal 1.25
+and later. Everywhere else the same key latches instead: press to start, press again to stop.
+See [VOICE.md](VOICE.md#push-to-talk).
+
+`mai` and `foundry` are two different APIs on the same Foundry resource. `mai` is the LLM
+Speech API that serves MAI-Transcribe — a different URL, request body and response shape
+from the OpenAI one — and it is the default because it is the only one that accepts a phrase
+list. `foundry` is the OpenAI-compatible surface, for a Whisper or `gpt-4o-transcribe`
+deployment, and needs the `model` set to whatever you named that deployment.
+
+The default model is **MAI-Transcribe-1.5**, Microsoft's current transcription model, across
+43 languages. Only `engine: "command"` keeps audio on the machine; the rest send it to the
+service you configured. Speech *output* is always the OS synthesizer and never a network
+service — sending subject lines to a cloud TTS API would leak exactly what the rest of this
+program is careful about.
+
+Voice never gains a capability the keyboard lacks: it produces a command line and hands it
+to the same dispatcher, so it inherits confirmation, journalling and undo rather than
+reimplementing them. Full details in [VOICE.md](VOICE.md).
 
 ## `notifications`
 
