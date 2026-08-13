@@ -42,6 +42,33 @@ import {
 } from '@mscomms/core';
 import { closeAllMcpClients } from '@mscomms/provider-graph';
 import { DEFAULT_FORMAT, type FormatOptions, type OutputMode } from './format.js';
+import { StartupTasks, type TaskOutcome, type TaskResult } from './startup.js';
+
+/**
+ * How long teardown waits for a startup step that is still running.
+ *
+ * Generous enough for anything doing local work, short enough that a provider stuck on a
+ * network call cannot make `q` feel broken. The steps check the abort signal between them,
+ * so this only ever covers the single step in flight.
+ */
+const ABANDON_STARTUP_MS = 250;
+
+/**
+ * Wait for a promise, but not forever.
+ *
+ * The timer is unreferenced deliberately: a race that loses must not be the reason the
+ * process stays alive, which would turn a guard against hanging into a cause of it.
+ */
+async function settleWithin(promise: Promise<void> | undefined, ms: number): Promise<void> {
+  if (promise === undefined) return;
+  await Promise.race([
+    promise.catch(() => undefined),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    }),
+  ]);
+}
 
 export interface SessionOptions {
   readonly config: AppConfig;
@@ -83,25 +110,61 @@ export class Session {
   /** Why the cache is not running, when it was asked for but could not start. */
   cacheError: string | undefined;
 
-  #sink: (text: string) => void = (text) => process.stdout.write(text);
-  #errorSink: (text: string) => void = (text) => process.stderr.write(text);
+  /**
+   * Where output actually lands when nothing has claimed it.
+   *
+   * Everything on top of this lives in {@link #frames}. See {@link redirect}.
+   */
+  #base: OutputFrame = {
+    out: (text) => process.stdout.write(text),
+    err: (text) => process.stderr.write(text),
+  };
+
+  /**
+   * Redirections, innermost last.
+   *
+   * A stack rather than a save-and-restore pair because these no longer nest neatly. They
+   * did when the only redirection was a command running inside the pane: one at a time, in
+   * and out again. Startup running in the background broke that — a step that mounts sample
+   * data can begin before the user types something and finish in the middle of it — and
+   * save-and-restore gets that case catastrophically wrong. The inner frame restores the
+   * sink it *saw* on the way in, which is the outer frame's sink, so the outer frame's own
+   * restore then reinstates something that has already been torn down and every subsequent
+   * write disappears into a discarded buffer.
+   *
+   * Removing by identity has no such failure mode: a frame that ends early is spliced out of
+   * the middle and whatever is still on top keeps receiving writes.
+   */
+  readonly #frames: OutputFrame[] = [];
 
   /**
    * Where command output goes.
    *
    * These are stable function identities for the life of the session — the notifier and the
-   * watcher capture them at construction — so redirection works by swapping the sink
+   * watcher capture them at construction — so redirection works by swapping what is
    * underneath rather than by reassigning the property. See {@link capture}.
    */
   readonly write: (text: string) => void = (text) => {
-    this.#sink(text);
+    (this.#frames.at(-1) ?? this.#base).out(text);
   };
   readonly writeError: (text: string) => void = (text) => {
-    this.#errorSink(text);
+    (this.#frames.at(-1) ?? this.#base).err(text);
   };
 
   /** Mounts that failed to start. Surfaced by `mounts` and `doctor` instead of at startup. */
   brokenMounts: readonly BuiltMount[] = [];
+
+  /**
+   * What startup is doing, for anything that wants to show it or wait for it.
+   *
+   * Public because both interfaces read it directly: the pane draws it on the status line,
+   * the shell prints one line when it settles, and `doctor` lists the whole thing.
+   */
+  readonly tasks = new StartupTasks();
+
+  /** The background startup pipeline; see {@link begin}. */
+  #startup: Promise<void> | undefined;
+  readonly #startAbort = new AbortController();
 
   /** Background startup warm-up; awaited only by {@link dispose}. */
   #warming: Promise<void> | undefined;
@@ -121,8 +184,8 @@ export class Session {
     this.registry = options.registry;
     this.logger = options.logger;
     this.paths = options.paths ?? resolveAppPaths();
-    if (options.write !== undefined) this.#sink = options.write;
-    if (options.writeError !== undefined) this.#errorSink = options.writeError;
+    if (options.write !== undefined) this.#base = { ...this.#base, out: options.write };
+    if (options.writeError !== undefined) this.#base = { ...this.#base, err: options.writeError };
 
     this.pageSize = options.config.ui.pageSize ?? 25;
 
@@ -175,11 +238,119 @@ export class Session {
     });
   }
 
-  /** Start mounts, then watches. Never throws for a single broken mount. */
-  async start(): Promise<void> {
-    await mkdir(this.paths.stateDir, { recursive: true }).catch(() => undefined);
-    await mkdir(this.paths.cacheDir, { recursive: true }).catch(() => undefined);
+  /**
+   * Kick off startup and return, without waiting for any of it.
+   *
+   * This is the whole point: it is synchronous, it does no I/O of its own, and by the time
+   * it returns the caller can draw a screen and accept keystrokes. Everything that used to
+   * happen in front of the user — connecting sources, opening the local cache, restarting
+   * watches — is queued behind {@link tasks}, which reports what each step is doing and
+   * when the session becomes usable.
+   *
+   * Nothing here can fail in a way that matters. Each step records its own outcome, and a
+   * step that throws is a task marked `failed` rather than a session that refuses to exist.
+   */
+  begin(): void {
+    if (this.#startup !== undefined) return;
 
+    // Declared up front, before any of them runs, so the first frame can already list what
+    // is being checked instead of showing an unexplained pause.
+    this.tasks.declare('workspace', 'Preparing the workspace');
+    this.tasks.declare('mounts', 'Connecting sources', { blocking: true });
+    if (this.config.cache.enabled === true) this.tasks.declare('cache', 'Opening the local cache');
+    if (this.config.watches.length > 0) this.tasks.declare('watches', 'Restarting watches');
+
+    this.#startup = this.#runStartup();
+  }
+
+  /**
+   * Resolve when commands can be answered — that is, when the mounts exist.
+   *
+   * The one thing that genuinely gates a command. The cache and the watches make a session
+   * faster and more useful, and waiting for either before honouring `ls` would put the
+   * whole point of an optimisation on the critical path.
+   */
+  async ready(): Promise<void> {
+    this.begin();
+    await this.tasks.whenReady();
+  }
+
+  /**
+   * Start everything and wait for it, as startup used to behave.
+   *
+   * Kept because a one-shot command has nobody to show progress to and nothing else to do
+   * while it waits, and because it is the honest shape for a test. Interactive callers want
+   * {@link begin} plus {@link ready} instead.
+   */
+  async start(): Promise<void> {
+    this.begin();
+    await this.#startup;
+  }
+
+  /**
+   * Add a caller's own step to the end of startup.
+   *
+   * `--demo` is why this exists. Mounting the sample data has to happen after the configured
+   * mounts — building on a half-finished tree is how the demo entries end up in a different
+   * order than the ones `demo` typed by hand produces — and the obvious way to express that
+   * is `await session.ready()` before mounting. That reintroduces the original bug one level
+   * up: the interface is constructed after the await, so the screen stays blank for exactly
+   * as long as connecting the sources takes, which is the thing this whole change is about.
+   *
+   * Appending to the chain says the same thing without the wait. The step is declared
+   * immediately, so it is in the list from the first frame and is named while it runs; it is
+   * sequenced after whatever is already queued, so the ordering constraint holds; and it can
+   * be `blocking`, which is the honest description of sample data — a command answered
+   * against a tree that is about to grow four more mounts has answered the wrong question.
+   */
+  enqueue(
+    id: string,
+    label: string,
+    body: () => Promise<TaskResult>,
+    options: { readonly blocking?: boolean } = {},
+  ): void {
+    this.begin();
+    this.tasks.declare(id, label, options);
+    const queued = this.#startup ?? Promise.resolve();
+    this.#startup = queued.then(async () => {
+      if (this.#startAbort.signal.aborted) return;
+      await this.tasks.run(id, label, body, options);
+    });
+  }
+
+  async #runStartup(): Promise<void> {
+    const signal = this.#startAbort.signal;
+
+    await this.tasks.run('workspace', 'Preparing the workspace', async () => {
+      await mkdir(this.paths.stateDir, { recursive: true }).catch(() => undefined);
+      await mkdir(this.paths.cacheDir, { recursive: true }).catch(() => undefined);
+    });
+    if (signal.aborted) return;
+
+    await this.tasks.run('mounts', 'Connecting sources', async () => this.#startMounts(), { blocking: true });
+    if (signal.aborted) return;
+
+    if (this.config.cache.enabled === true) {
+      await this.tasks.run('cache', 'Opening the local cache', async () => this.#startCache(signal));
+      if (signal.aborted) return;
+    }
+
+    if (this.config.watches.length > 0) {
+      await this.tasks.run('watches', 'Restarting watches', async () => this.#startWatches());
+      if (signal.aborted) return;
+    }
+
+    // Deliberately not awaited, and not a task: warming spawns MCP servers and speculatively
+    // lists mount roots, which takes seconds and finishes long after the session is usable.
+    // Reporting it as outstanding would mean "ready" never arrived while the tool was, in
+    // every sense the user cares about, ready.
+    this.#warming = this.vfs.warm({ signal: this.#warmAbort.signal }).catch((error: unknown) => {
+      this.logger.debug('warm-up did not finish', { message: String(error) });
+    });
+  }
+
+  /** Build the configured mounts, and land the user somewhere sensible. */
+  async #startMounts(): Promise<string> {
     const built = await buildMounts(this.config.mounts, {
       registry: this.registry,
       logger: this.logger,
@@ -201,15 +372,20 @@ export class Session {
     }
     this.brokenMounts = broken;
 
-    // Opened after the mounts, because a snapshot with nothing mounted has nothing to
-    // sync, and before the watches, so a watch's first poll can be served locally.
-    await this.#startCache();
-
     // The cwd defaults to the only mount when there is exactly one. Landing in a root
     // that contains a single directory and making the user `cd` into it is pure ceremony.
     const mounts = this.vfs.mounts;
     if (mounts.length === 1 && mounts[0] !== undefined) this.cwd = mounts[0].path;
 
+    const working = mounts.length;
+    const counted = working === 0 ? 'no sources' : `${String(working)} source${working === 1 ? '' : 's'}`;
+    return broken.length === 0
+      ? counted
+      : `${counted}, ${String(broken.length)} unavailable`;
+  }
+
+  async #startWatches(): Promise<string> {
+    let started = 0;
     for (const watch of this.config.watches) {
       try {
         await this.watcher.add({
@@ -220,6 +396,7 @@ export class Session {
           ...(watch.includeUpdates === undefined ? {} : { includeUpdates: watch.includeUpdates }),
           ...(watch.label === undefined ? {} : { label: watch.label }),
         });
+        started += 1;
       } catch (error) {
         this.logger.warn('watch could not start', {
           id: watch.id,
@@ -227,19 +404,19 @@ export class Session {
         });
       }
     }
-
-    // Deliberately not awaited. Warming spawns MCP servers and speculatively lists mount
-    // roots, which takes seconds — awaiting it here would move the delay from the user's
-    // first command to the banner, which is not an improvement. Started last so it competes
-    // with nothing that the session actually needs in order to be usable.
-    this.#warming = this.vfs.warm({ signal: this.#warmAbort.signal }).catch((error: unknown) => {
-      this.logger.debug('warm-up did not finish', { message: String(error) });
-    });
+    return `${String(started)} watch${started === 1 ? '' : 'es'}`;
   }
 
   async dispose(): Promise<void> {
     this.watcher.stop();
-    // Warm-up first, and awaited: it spawns MCP servers and writes listings through the
+    // Startup first: it is now running *behind* a live interface, so quitting can land in
+    // the middle of it. Aborting is what makes the wait short — the signal is checked
+    // between steps — and the wait is bounded on top of that, because the step in flight
+    // may be a provider's `connect` that observes no signal at all. Tearing down under one
+    // of those is the price of never making `q` wait for a machine that is not answering.
+    this.#startAbort.abort();
+    await settleWithin(this.#startup, ABANDON_STARTUP_MS);
+    // Warm-up next, and awaited: it spawns MCP servers and writes listings through the
     // snapshot, so tearing down underneath it would close a database it is still using.
     // The abort is what makes this quick — without it, quitting during startup would block
     // on a seven-second handshake nobody is waiting for any more.
@@ -272,10 +449,15 @@ export class Session {
    * open is a slower program, not a broken one, and refusing to start the shell because a
    * disk was full would turn an optimisation into a single point of failure. `cache status`
    * reports {@link cacheError} so the degradation is visible rather than mysterious.
+   *
+   * The abort checks are what make it safe to run this behind a live interface. Quitting
+   * mid-open used to be impossible — nothing was interactive until it had finished — and
+   * now it is ordinary, so a database that opens after teardown has begun is closed again
+   * rather than attached to a session that no longer exists.
    */
-  async #startCache(): Promise<void> {
+  async #startCache(signal: AbortSignal): Promise<TaskOutcome> {
     const cache = this.config.cache;
-    if (cache.enabled !== true) return;
+    if (cache.enabled !== true) return { state: 'skipped', detail: 'not enabled' };
 
     try {
       const embedder = cache.vectors === false ? undefined : hashEmbedder();
@@ -295,6 +477,11 @@ export class Session {
         ...(embedder === undefined ? {} : { embedder }),
         logger: this.logger.child('snapshot'),
       });
+
+      if (signal.aborted) {
+        await snapshot.close().catch(() => undefined);
+        return { state: 'skipped', detail: 'shutting down' };
+      }
 
       this.snapshot = snapshot;
       this.vfs.attachSnapshot(snapshot, {
@@ -316,6 +503,8 @@ export class Session {
         }
       }
 
+      if (signal.aborted) return { state: 'skipped', detail: 'shutting down' };
+
       this.sync = new BackgroundSync({
         host: this.vfs,
         snapshot,
@@ -327,9 +516,11 @@ export class Session {
         ...(audit === undefined ? {} : { audit }),
       });
       this.sync.start();
+      return { detail: 'local cache on' };
     } catch (error) {
       this.cacheError = error instanceof Error ? error.message : String(error);
       this.logger.warn('local cache could not start', { message: this.cacheError });
+      return { state: 'failed', detail: this.cacheError };
     }
   }
 
@@ -465,6 +656,29 @@ export class Session {
   }
 
   /**
+   * Send everything this session prints somewhere else, until the returned function is called.
+   *
+   * {@link capture} is for one operation whose output has a destination; this is for an
+   * interface that owns the terminal for its whole life. The full-screen view cannot let a
+   * single stray byte reach stdout — the alternate screen is drawn by absolute cursor
+   * positioning, so one unexpected newline scrolls the frame out from under itself and every
+   * subsequent paint lands in the wrong place.
+   *
+   * That used to be guaranteed by nothing except good luck: everything that printed did so
+   * from inside a command, and commands run inside `capture`. It stopped being true the
+   * moment startup moved into the background, because a step that mounts sample data or a
+   * watch that fires now happens on its own schedule rather than the user's. Rather than
+   * hunting down each writer, the interface states the invariant once.
+   *
+   * Removal is by identity rather than by restoring a saved value, so a redirection that
+   * outlives a `capture` started after it — which is exactly what background startup makes
+   * possible — is unwound correctly whichever of them finishes first.
+   */
+  redirect(sink: (text: string) => void): () => void {
+    return this.#push({ out: sink, err: sink });
+  }
+
+  /**
    * Run something with all output collected instead of printed.
    *
    * This exists so the full-screen view can run a real command and show its real output,
@@ -476,23 +690,19 @@ export class Session {
    * stdout and chrome on stderr; here there is no pipe, and a user who typed a command
    * wants to see the warning that came with the answer.
    *
-   * The sinks are restored in a `finally`, so a throwing command cannot leave a session
+   * The frame is removed in a `finally`, so a throwing command cannot leave a session
    * permanently writing into a discarded buffer.
    */
   async capture(fn: () => Promise<void>): Promise<string> {
     const chunks: string[] = [];
-    const previousSink = this.#sink;
-    const previousErrorSink = this.#errorSink;
     const collect = (text: string): void => {
       chunks.push(text);
     };
-    this.#sink = collect;
-    this.#errorSink = collect;
+    const pop = this.#push({ out: collect, err: collect });
     try {
       await fn();
     } finally {
-      this.#sink = previousSink;
-      this.#errorSink = previousErrorSink;
+      pop();
     }
     return chunks.join('');
   }
@@ -506,31 +716,60 @@ export class Session {
    * the scrollback. The only moment that works is the one just before the first write, and
    * only the sink knows when that is.
    *
-   * `before` is called at most once, and sinks are restored in a `finally` so a throwing
+   * `before` is called at most once, and the frame is removed in a `finally` so a throwing
    * command cannot leave the session writing through a filter that outlives it.
+   *
+   * What it delegates to is resolved per write rather than captured up front, because a
+   * background startup step can push a frame of its own on top of this one and pull it off
+   * again while the command is still running. Asking the stack each time is what makes the
+   * indicator survive that.
    */
   async beforeFirstWrite(before: () => void, fn: () => Promise<void>): Promise<void> {
-    const previousSink = this.#sink;
-    const previousErrorSink = this.#errorSink;
     let fired = false;
-    const wrap =
-      (inner: (text: string) => void) =>
-      (text: string): void => {
-        if (!fired) {
-          fired = true;
-          before();
-        }
-        inner(text);
-      };
-    this.#sink = wrap(previousSink);
-    this.#errorSink = wrap(previousErrorSink);
+    const frame: OutputFrame = {
+      out: (text) => {
+        announce();
+        this.#below(frame).out(text);
+      },
+      err: (text) => {
+        announce();
+        this.#below(frame).err(text);
+      },
+    };
+    const announce = (): void => {
+      if (fired) return;
+      fired = true;
+      before();
+    };
+
+    const pop = this.#push(frame);
     try {
       await fn();
     } finally {
-      this.#sink = previousSink;
-      this.#errorSink = previousErrorSink;
+      pop();
     }
   }
+
+  #push(frame: OutputFrame): () => void {
+    this.#frames.push(frame);
+    return () => {
+      const at = this.#frames.lastIndexOf(frame);
+      if (at !== -1) this.#frames.splice(at, 1);
+    };
+  }
+
+  /** Whatever `frame` sits on top of right now. */
+  #below(frame: OutputFrame): OutputFrame {
+    const at = this.#frames.lastIndexOf(frame);
+    if (at <= 0) return this.#base;
+    return this.#frames[at - 1] ?? this.#base;
+  }
+}
+
+/** One layer of output redirection. See {@link Session.redirect}. */
+interface OutputFrame {
+  readonly out: (text: string) => void;
+  readonly err: (text: string) => void;
 }
 
 // ---------------------------------------------------------------------------

@@ -97,9 +97,22 @@ export function render(state: TuiState, options: RenderOptions): string[] {
   }
 
   lines.push(rule(width, options));
-  lines.push(fit(state.status, width));
+  lines.push(fit(statusRow(state), width));
   lines.push(inputLine(state, width, options));
   return lines;
+}
+
+/**
+ * What the single status row says.
+ *
+ * Startup wins while it is running, and only then. The pane is drawn before the sources are
+ * connected — that is what makes it feel instant — so for the first moment of a session the
+ * most useful thing the row can hold is what is being waited for. The instant startup is
+ * done the row goes back to the user's own business, and anything they did in the meantime
+ * that produced a message is still there underneath, unclobbered.
+ */
+export function statusRow(state: TuiState): string {
+  return state.startup === '' ? state.status : state.startup;
 }
 
 /** True while the user is choosing, filling in, or confirming an action. */

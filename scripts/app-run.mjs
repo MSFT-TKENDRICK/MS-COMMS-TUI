@@ -14,8 +14,25 @@
  *    install, build, VFS, query engine, formatter — actually works.
  * 2. **The build may be missing or stale.** The Run button can be pressed on a workspace
  *    whose Setup script never ran, and it is pressed constantly on one whose sources have
- *    just been edited. Rather than failing with a stack trace about a missing module, or
- *    quietly running last week's code, this brings `dist/` up to date first.
+ *    just been edited.
+ *
+ * That second point used to be handled by compiling *before* handing over, and it was the
+ * single worst thing about starting this program. `tsc --build` on an already-current tree
+ * still costs the best part of ten seconds, every run, in front of a user looking at an
+ * empty terminal — a fixed tax on launching, paid whether or not anything had changed, to
+ * answer a question that is nearly always "no".
+ *
+ * So the order is inverted. A checkout that *can* run, runs immediately, and the rebuild
+ * happens behind the interface it just started. It is not fire-and-forget: the child is
+ * given an IPC channel and every check reports through it, so "checking dependencies" and
+ * "rebuilding" appear in the pane's own startup list next to connecting sources and opening
+ * the cache. One list, one place to look, whichever side of the process boundary the work
+ * is on. The one thing this cannot do is swap the code out from under a running process, so
+ * a rebuild that actually changed something says so and asks for a restart.
+ *
+ * A checkout that *cannot* run — no `node_modules`, no `dist/` — still installs and builds
+ * in the foreground, because there is nothing to launch and pretending otherwise would just
+ * be a crash with extra steps.
  *
  * In a real terminal — the app's Run panel is a genuine pty, as is any IDE or OS terminal —
  * this opens the **full-screen two-pane view**. That is the opposite of what the `mscomms`
@@ -53,19 +70,30 @@
  *
  * Overrides: MSCOMMS_RUN_INTERACTIVE=0/1 forces the terminal check, MSCOMMS_RUN_TUI=0 falls
  * back to the line shell, MSCOMMS_RUN_DEMO=1 mounts the sample data, MSCOMMS_RUN_SIGNIN=0
- * skips the sign-in step, MSCOMMS_RUN_BUILD=0 skips the rebuild, and MSCOMMS_RUN_SCRIPT
- * points at a file of commands to use instead of the built-in transcript.
+ * skips the sign-in step, MSCOMMS_RUN_BUILD=0 skips the rebuild, MSCOMMS_RUN_BUILD_WAIT=1
+ * puts the rebuild back in front of the launch for anyone who would rather wait than
+ * restart, and MSCOMMS_RUN_SCRIPT points at a file of commands to use instead of the
+ * built-in transcript.
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { build } from './lib/build.mjs';
 import { ROOT, flag } from './lib/npm.mjs';
 
 const BIN = join(ROOT, 'packages', 'cli', 'dist', 'bin.js');
-const CORE = join(ROOT, 'packages', 'core', 'dist', 'index.js');
+/**
+ * The config loader, imported from the module that defines it rather than the package
+ * barrel.
+ *
+ * Same rule, a tenth of the cost: `dist/index.js` pulls in the whole engine — the VFS, the
+ * query parser, the snapshot store — and on Windows that is most of a second of module
+ * loading, in the launcher, before the thing being launched has even started. The launcher
+ * needs two functions out of it.
+ */
+const CONFIG = join(ROOT, 'packages', 'core', 'dist', 'config.js');
 const GRAPH = join(ROOT, 'packages', 'provider-graph', 'dist', 'index.js');
 const SETUP = join(ROOT, 'scripts', 'app-setup.mjs');
 const MODULES = join(ROOT, 'node_modules');
@@ -102,7 +130,7 @@ function isInteractive() {
  */
 async function loadSources() {
   try {
-    const { resolveAppPaths, loadConfig } = await import(pathToFileURL(CORE).href);
+    const { resolveAppPaths, loadConfig } = await import(pathToFileURL(CONFIG).href);
     const paths = resolveAppPaths();
     const config = await loadConfig(paths.configFile, { required: false });
     return { paths, mounts: config.mounts };
@@ -219,12 +247,63 @@ function spawnNode(argv, { stdio, onSpawn }) {
 }
 
 /**
- * Make `dist/` match the sources, installing first if this checkout has never been set up.
+ * A progress reporter aimed at whatever is running, or at the terminal when nothing is.
  *
- * `tsc --build` is incremental, so the steady-state cost is a no-op compile — worth paying
- * to guarantee that pressing Run after an edit runs the edit.
+ * The launcher's checks have to be visible in both shapes this script takes. Once a child
+ * exists they belong *inside* it, in the same list as its own startup — a second progress
+ * display in the scrollback underneath a full-screen pane is a display nobody can see. Until
+ * then, and in the piped-transcript mode where there is no pane to put them in, the terminal
+ * is the only place they can go.
+ *
+ * `report` is deliberately tolerant: a child that has already exited, or one started without
+ * an IPC channel, must not turn a status update into a crash.
  */
-async function ensureBuilt() {
+function reporter() {
+  let child;
+  const pending = [];
+
+  const post = (task) => {
+    if (child?.connected !== true) return false;
+    try {
+      child.send({ type: 'mscomms:task', ...task });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  return {
+    attach(next) {
+      child = next;
+      for (const task of pending.splice(0)) post(task);
+    },
+    report(task) {
+      if (post(task)) return;
+      // Nothing to send to yet. Hold it for the child, and say it out loud only when it is
+      // worth interrupting for: a queued check nobody is waiting on is not.
+      pending.push(task);
+      if (task.state === 'failed') console.error(`${task.label}: ${task.detail ?? 'failed'}`);
+    },
+  };
+}
+
+/**
+ * Whether this checkout can run at all without help.
+ *
+ * The distinction that decides everything below: a missing `dist/` cannot be worked around
+ * by being clever about ordering, while a *stale* one can. Only the first justifies making
+ * someone wait.
+ */
+function needsSetup() {
+  return !existsSync(MODULES) || !existsSync(BIN);
+}
+
+/**
+ * Install and build, in the foreground, because there is nothing to launch yet.
+ *
+ * Only reached on a checkout that has never been set up or whose `dist/` has been removed.
+ */
+async function setUpFirst() {
   if (!existsSync(MODULES)) {
     console.log('This checkout has not been set up yet; running the setup script first.');
     const code = await spawnNode([SETUP], { stdio: 'inherit' });
@@ -237,18 +316,82 @@ async function ensureBuilt() {
   }
 
   if (!flag('MSCOMMS_RUN_BUILD', true)) {
-    if (existsSync(BIN)) return 0;
     console.error(`MSCOMMS_RUN_BUILD is off and there is nothing built at ${BIN}.`);
     console.error('  Run `npm run setup` first, or let this build by unsetting it.');
     return 1;
   }
 
+  console.log('Nothing is compiled yet; building before starting.');
   const code = await build({ silent: true });
   if (code !== 0) {
-    console.error('Build failed, so this would have run stale code. Fix the errors above,');
-    console.error('or set MSCOMMS_RUN_BUILD=0 to run the last successful build anyway.');
+    console.error('Build failed, so there is nothing to start. Fix the errors above.');
+    return code;
   }
-  return code;
+  if (!existsSync(BIN)) {
+    console.error(`The build succeeded but ${BIN} is still missing.`);
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Bring `dist/` up to date behind the running program, and report on it.
+ *
+ * `tsc --build` is incremental, so this is nearly always a no-op — and "nearly always a
+ * no-op" is exactly why it must not be waited for. The cost of being wrong is asymmetric:
+ * waiting charges every launch the full check, while not waiting charges one restart to the
+ * one person who just edited a source file, and only when the edit actually compiled into
+ * something different.
+ *
+ * Detecting *that* is what the timestamp is for. `tsc` rewrites the entry point only when
+ * its inputs changed, so a newer mtime is the difference between "your edit is live" and
+ * "your edit is compiled, but this process is still running the code from before it".
+ *
+ * Nothing here may write to the terminal: the pane owns the screen. Failed builds keep their
+ * output for {@link main} to print once the pane has closed and there is a scrollback to
+ * print into again.
+ */
+async function rebuildInBackground(report, signal) {
+  if (!flag('MSCOMMS_RUN_BUILD', true)) {
+    report({ id: 'build', label: 'Checking for source changes', state: 'skipped', detail: 'MSCOMMS_RUN_BUILD=0' });
+    return '';
+  }
+
+  report({ id: 'build', label: 'Checking for source changes', state: 'running' });
+  const before = mtimeOf(BIN);
+  let output = '';
+  const code = await build({ silent: true, signal, capture: (text) => (output += text) });
+
+  // Quitting cancels the compiler mid-run. That is not a broken build, and saying so to a
+  // pane that is already tearing down would be both wrong and unreadable.
+  if (signal.aborted) return '';
+
+  if (code !== 0) {
+    report({
+      id: 'build',
+      label: 'Checking for source changes',
+      state: 'failed',
+      detail: 'the sources no longer compile; still running the last build that did',
+    });
+    return output;
+  }
+
+  const changed = mtimeOf(BIN) !== before;
+  report({
+    id: 'build',
+    label: 'Checking for source changes',
+    state: changed ? 'warn' : 'ok',
+    detail: changed ? 'rebuilt — restart to run the new code' : 'up to date',
+  });
+  return '';
+}
+
+function mtimeOf(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
 }
 
 async function runTranscript(lines) {
@@ -291,13 +434,38 @@ function explainEmpty() {
   console.error('');
 }
 
+/**
+ * Compile before handing over, for the cases that cannot use a late answer.
+ */
+async function buildFirst() {
+  if (!flag('MSCOMMS_RUN_BUILD', true)) return 0;
+  const code = await build({ silent: true });
+  if (code !== 0) {
+    console.error('Build failed, so this would have run stale code. Fix the errors above,');
+    console.error('or set MSCOMMS_RUN_BUILD=0 to run the last successful build anyway.');
+  }
+  return code;
+}
+
 async function main() {
-  const built = await ensureBuilt();
-  if (built !== 0) return built;
+  if (needsSetup()) {
+    const code = await setUpFirst();
+    if (code !== 0) return code;
+  }
 
   const args = process.argv.slice(2);
-  // An explicit command is scriptable by definition: run it as given, whatever the streams
-  // look like, and with none of the choices below imposed on top of it.
+  const interactive = args.length === 0 && isInteractive();
+  const waitForBuild = flag('MSCOMMS_RUN_BUILD_WAIT', false);
+
+  // A one-shot command and a scripted transcript both print and exit, so a check that
+  // finishes after them is a check nobody reads — and `npm start -- doctor` right after an
+  // edit has to be testing the edit. Those keep the old order. Only the interactive launch,
+  // which has a place to report into and a person waiting in front of it, starts first.
+  if (!interactive || waitForBuild) {
+    const code = await buildFirst();
+    if (code !== 0) return code;
+  }
+
   if (args.length > 0) return spawnNode([BIN, ...args], { stdio: 'inherit' });
   if (!isInteractive()) return runTranscript(transcript());
 
@@ -315,7 +483,31 @@ async function main() {
     else await signInFirst(mounts, paths);
   }
 
-  return spawnNode([BIN, ...launch], { stdio: 'inherit' });
+  const progress = reporter();
+  const quit = new AbortController();
+  // Started before the child is awaited so the compiler and the interface come up together;
+  // the reporter holds anything it says until there is a channel to say it on.
+  const rebuild = waitForBuild ? Promise.resolve('') : rebuildInBackground(progress.report, quit.signal);
+
+  // The fourth stream is the whole point: it carries the launcher's checks into the same
+  // startup list the session keeps for its own, so there is one place to look rather than
+  // two, on either side of a process boundary the user did not ask to know about.
+  const code = await spawnNode([BIN, ...launch], {
+    stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    onSpawn: (child) => progress.attach(child),
+  });
+
+  // The pane is gone, which is both permission to give up on the rebuild and the first
+  // chance since it started to print anything it had to say.
+  quit.abort();
+  const failure = await rebuild;
+  if (failure !== '') {
+    console.error('The background rebuild failed while the pane was open:');
+    console.error('');
+    console.error(failure.trimEnd());
+    console.error('');
+  }
+  return code;
 }
 
 process.exitCode = await main();

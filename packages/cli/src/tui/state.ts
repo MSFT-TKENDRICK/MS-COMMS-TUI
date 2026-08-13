@@ -64,6 +64,16 @@ export interface TuiState {
   readonly previewOffset: number;
   readonly previewTitle: string;
   readonly status: string;
+  /**
+   * What startup is still doing, or `''` once it has finished.
+   *
+   * Separate from {@link status} rather than written into it, because the two have
+   * different owners and different lifetimes: `status` answers "what happened when you
+   * pressed that key" and must not be overwritten every time a background check ticks,
+   * while this answers "why is the tree still empty" and has to disappear on its own. The
+   * renderer decides which one the single status row shows; see `render.ts`.
+   */
+  readonly startup: string;
   readonly busy: boolean;
   /**
    * Frames elapsed since the current operation started. Drives the spinner.
@@ -191,6 +201,7 @@ export function initialState(cwd: string, rows = 20): TuiState {
     previewOffset: 0,
     previewTitle: '',
     status: 'Loading…',
+    startup: '',
     busy: true,
     tick: 0,
     busyMs: 0,
@@ -918,6 +929,18 @@ export function withActionResult(state: TuiState, result: ActionResult): TuiStat
  *  callers should say something worth hearing rather than restating what's already visible. */
 export function withStatus(state: TuiState, message: string): TuiState {
   return { ...settled(state), status: message };
+}
+
+/**
+ * Replace the startup line, which takes the status row while it is non-empty.
+ *
+ * Deliberately not routed through {@link withStatus}: startup progress is not an answer to
+ * anything the user did, so it must not clear the working indicator, and it must not
+ * destroy a message they are still reading. Passing `''` hands the row back.
+ */
+export function withStartup(state: TuiState, message: string): TuiState {
+  if (state.startup === message) return state;
+  return { ...state, startup: message };
 }
 
 /**

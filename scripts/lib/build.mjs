@@ -38,16 +38,21 @@ export function stalePackages() {
  * `silent` suppresses npm's own banner — `--silent` is consumed by npm rather than
  * forwarded — so an up-to-date build says nothing at all while a broken one still prints
  * tsc's errors through the inherited stdio.
+ *
+ * `capture` and `signal` are for building behind a running interface: the first keeps every
+ * line, including the notes below, away from a screen someone else is drawing on, and the
+ * second stops the compiler when whatever it was building for has gone.
  */
-export async function build({ silent = false } = {}) {
+export async function build({ silent = false, capture, signal } = {}) {
+  const say = capture ?? ((text) => console.log(text));
   const stale = stalePackages();
   if (stale.length > 0) {
-    console.log(`Compiled output is missing for ${stale.join(', ')} but the build cache still`);
-    console.log('claims it exists, so the cache is being cleared before building.');
-    const cleaned = await runNpm(['run', 'clean', '--silent'], { label: 'clean', echo: !silent });
-    if (cleaned !== 0) console.log('Clean did not succeed; attempting the build anyway.');
+    say(`Compiled output is missing for ${stale.join(', ')} but the build cache still`);
+    say('claims it exists, so the cache is being cleared before building.');
+    const cleaned = await runNpm(['run', 'clean', '--silent'], { label: 'clean', echo: !silent, capture, signal });
+    if (cleaned !== 0) say('Clean did not succeed; attempting the build anyway.');
   }
 
   const args = silent ? ['run', 'build', '--silent'] : ['run', 'build'];
-  return runNpm(args, { label: 'build', echo: !silent });
+  return runNpm(args, { label: 'build', echo: !silent, capture, signal });
 }
