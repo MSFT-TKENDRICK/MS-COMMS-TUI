@@ -55,7 +55,7 @@
  * points at a file of commands to use instead of the built-in transcript.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -93,18 +93,21 @@ function isInteractive() {
  *
  * Asks the program's own config loader rather than reimplementing the search: the path is
  * platform-specific and the file is JSONC, and a second copy of either rule here would be a
- * copy that eventually disagrees with the one users actually experience. Any failure counts
- * as "nothing configured", which is the safe direction — the worst case is a hint printed
- * for someone who did not need it.
+ * copy that eventually disagrees with the one users actually experience.
+ *
+ * A failure to load is reported as a failure and not as "nothing configured". Those two look
+ * identical from here and mean opposite things, and collapsing them produced the worst message
+ * this program has ever printed: a fully configured machine, with four mounts and every account
+ * signed in, being told it had no sources and offered instructions for signing in.
  */
 async function loadSources() {
   try {
     const { resolveAppPaths, loadConfig } = await import(pathToFileURL(CORE).href);
     const paths = resolveAppPaths();
     const config = await loadConfig(paths.configFile, { required: false });
-    return { paths, mounts: config.mounts };
-  } catch {
-    return { paths: undefined, mounts: [] };
+    return { paths, mounts: config.mounts, failure: undefined };
+  } catch (error) {
+    return { paths: undefined, mounts: [], failure: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -243,6 +246,11 @@ async function runTranscript(lines) {
  * would swallow anything on stdout the moment the pane opens, so a hint printed there would
  * exist for a few milliseconds and then be gone. On stderr it stays in the scrollback and is
  * still there after quitting, which is when someone actually goes looking for it.
+ *
+ * Every line here is checked before it is printed. Advice that does not apply is not a
+ * harmless extra: being told to run `gh auth login` when you are already signed in does not
+ * read as a generic hint, it reads as the program failing to see a sign-in that works, and
+ * the natural next move is to break something that was fine.
  */
 function explainEmpty() {
   console.error('No sources are configured, so the pane will be empty.');
@@ -250,10 +258,48 @@ function explainEmpty() {
   console.error('  npm start -- init          write a starter config, then uncomment a source');
   console.error('  npm start -- doctor        check the config and the connections');
   console.error('');
-  console.error('GitHub needs only GH_TOKEN or `gh auth login`; Outlook and Teams sign in');
-  console.error('interactively the first time you open them.');
+  if (!hasGitHubAuth()) {
+    console.error('GitHub needs only GH_TOKEN or `gh auth login`; Outlook and Teams sign in');
+    console.error('interactively the first time you open them.');
+  }
   console.error('Set MSCOMMS_RUN_DEMO=1 to browse sample data instead.');
   console.error('');
+}
+
+/**
+ * Explain that the config could not be read, which is not the same as it being empty.
+ *
+ * Kept apart from {@link explainEmpty} because the two need opposite advice. Someone with no
+ * config needs to be told how to write one; someone whose config failed to load needs to be
+ * told that, and nothing else — their sources are configured, so `init` would refuse to run
+ * and every word about signing in would be a distraction from the one line that matters.
+ */
+function explainUnreadable(failure) {
+  console.error('Your config could not be read, so the pane will be empty.');
+  console.error('');
+  console.error(`  ${failure}`);
+  console.error('');
+  console.error('  npm start -- doctor        check the config and the connections');
+  console.error('');
+}
+
+/**
+ * Whether GitHub already has credentials, by the same two routes the provider uses.
+ *
+ * `gh auth token` is asked rather than `gh auth status` because the token is the thing that
+ * actually gets used, and it is the check that stays true when the answer is "signed in but
+ * to the wrong host". Any failure means no, which is the safe direction here: the cost of a
+ * wrong no is one extra line of advice, and the cost of a wrong yes is withholding the only
+ * instruction that would have helped.
+ */
+function hasGitHubAuth() {
+  if ((process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '') !== '') return true;
+  try {
+    const probe = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', shell: process.platform === 'win32' });
+    return probe.status === 0 && (probe.stdout ?? '').trim() !== '';
+  } catch {
+    return false;
+  }
 }
 
 async function main() {
@@ -275,8 +321,9 @@ async function main() {
   if (flag('MSCOMMS_RUN_DEMO', false)) {
     launch.push('--demo');
   } else {
-    const { paths, mounts } = await loadSources();
-    if (mounts.length === 0) explainEmpty();
+    const { paths, mounts, failure } = await loadSources();
+    if (failure !== undefined) explainUnreadable(failure);
+    else if (mounts.length === 0) explainEmpty();
     else await signInFirst(mounts, paths);
   }
 

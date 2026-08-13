@@ -175,6 +175,13 @@ export const doctorCommand: Command = {
           : session.config.sourcePath,
     });
 
+    // Parts of the file that were ignored. Reported one at a time rather than as a count,
+    // because "1 setting ignored" tells you that something is wrong without telling you what,
+    // which is the position this command exists to get people out of.
+    for (const warning of session.config.warnings ?? []) {
+      checks.push({ name: 'config setting', status: 'warn', detail: warning });
+    }
+
     checks.push({
       name: 'sources',
       status: session.vfs.mounts.length === 0 ? 'warn' : 'ok',
@@ -183,6 +190,10 @@ export const doctorCommand: Command = {
           ? 'Nothing is mounted. Add a "mounts" entry to your config, or run `demo`.'
           : `${String(session.vfs.mounts.length)} mounted: ${session.vfs.mounts.map((mount) => mount.path).join(', ')}`,
     });
+
+    for (const warning of session.mountWarnings) {
+      checks.push({ name: 'mount option', status: 'warn', detail: warning });
+    }
 
     for (const broken of session.brokenMounts) {
       checks.push({

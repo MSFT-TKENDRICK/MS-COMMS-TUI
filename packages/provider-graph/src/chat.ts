@@ -38,7 +38,13 @@ import {
   type VNode,
 } from '@mscomms/core';
 import type { GraphClient, GraphPage } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import {
+  createClient,
+  GRAPH_SHARED_OPTION_KEYS,
+  htmlToText,
+  preview,
+  type GraphSharedOptions,
+} from './shared.js';
 
 export interface GraphChatOptions extends GraphSharedOptions {
   /** Skip the Teams/channels tree entirely; useful when the tenant blocks those scopes. */
@@ -539,6 +545,7 @@ export const graphChatPlugin: ProviderPlugin<GraphChatOptions> = {
   type: 'graph-chat',
   displayName: 'Teams and chats (Microsoft Graph)',
   description: 'Chats, teams, channels and threads as directories; messages as files.',
+  optionKeys: [...GRAPH_SHARED_OPTION_KEYS, 'chatsOnly', 'pageSize', 'maxReplies'],
   validateOptions(raw) {
     return (raw ?? {}) as GraphChatOptions;
   },

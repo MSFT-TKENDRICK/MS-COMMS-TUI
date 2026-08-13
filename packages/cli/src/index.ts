@@ -254,6 +254,10 @@ export async function main(options: CliOptions): Promise<number> {
     return 2;
   }
 
+  // Said once, before anything else runs, and on stderr so it survives the full-screen view.
+  // A warning nobody sees is exactly the silence this was meant to avoid.
+  for (const warning of config.warnings ?? []) writeError(`Warning: ${warning}\n`);
+
   const registry = builtinRegistry(logger);
   if (config.plugins.length > 0) {
     const { failed } = await registry.loadAll(config.plugins);
@@ -276,6 +280,11 @@ export async function main(options: CliOptions): Promise<number> {
 
   try {
     await session.start();
+
+    // Same reasoning as the config warnings above, one level down: a mount that came up but
+    // ignored part of what it was given is not broken enough to report as an error and not
+    // harmless enough to leave for whoever thinks to run `doctor`.
+    for (const warning of session.mountWarnings) writeError(`Warning: ${warning}\n`);
 
     // Mount the sample data before any interface exists.
     //

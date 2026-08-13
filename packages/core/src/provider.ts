@@ -493,6 +493,15 @@ export interface ProviderPlugin<TOptions = unknown> {
    * a precise startup message instead of a mysterious failure on first use.
    */
   validateOptions?(raw: unknown): TOptions;
+  /**
+   * Every option key this plugin reads. Optional, and only worth declaring for a provider
+   * with a closed set of options.
+   *
+   * Declaring it turns an option the provider does not understand into a visible warning
+   * instead of a silent no-op. Leave it undefined for a provider whose options are open-ended
+   * or pass-through; the check is skipped entirely rather than guessed at.
+   */
+  readonly optionKeys?: readonly string[];
   create(options: TOptions, context: ProviderContext): Provider | Promise<Provider>;
 }
 

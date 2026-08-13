@@ -131,6 +131,14 @@ export class Session {
   /** Mounts that failed to start. Surfaced by `mounts` and `doctor` instead of at startup. */
   brokenMounts: readonly BuiltMount[] = [];
 
+  /**
+   * Mount options that were configured but are read by nothing. Surfaced by `doctor`.
+   *
+   * A mount that starts fine but ignores part of its config is not broken enough to fail and
+   * not harmless enough to hide.
+   */
+  mountWarnings: readonly string[] = [];
+
   cwd = vpath.ROOT;
   lastListing: LastListing | undefined;
   /** Paths visited, most recent last. Powers `back` and history-aware completion. */
@@ -375,11 +383,18 @@ export class Session {
     });
 
     const broken: BuiltMount[] = [];
+    const ignored: string[] = [];
     for (const result of built) {
       if (result.mount !== undefined) this.vfs.mount(result.mount);
       else broken.push(result);
+      for (const option of result.ignoredOptions ?? []) {
+        ignored.push(
+          `Mount "${result.config.path}" (${result.config.type}) does not use the option "${option}", so it has no effect.`,
+        );
+      }
     }
     this.brokenMounts = broken;
+    this.mountWarnings = ignored;
 
     // The cwd defaults to the only mount when there is exactly one. Landing in a root
     // that contains a single directory and making the user `cd` into it is pure ceremony.

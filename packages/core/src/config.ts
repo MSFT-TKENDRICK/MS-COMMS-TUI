@@ -186,6 +186,14 @@ export interface AppConfig {
   readonly ttlMs?: number;
   /** Where this config was loaded from; undefined when defaults were used. */
   readonly sourcePath?: string;
+  /**
+   * Problems that were survivable, in the words the user should see.
+   *
+   * Present so that "we ignored part of your file" can never be silent. A config that loaded
+   * with warnings is still a working config, so these are not errors — but nothing about them
+   * is invisible either: the shell prints them at startup and `doctor` reports them.
+   */
+  readonly warnings?: readonly string[];
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -446,20 +454,29 @@ function validateConfigBody(raw: unknown, sourcePath?: string): AppConfig {
   }
   const root = raw as Record<string, unknown>;
 
-  // Reject unknown top-level keys rather than ignoring them.
+  // An unknown top-level key is reported and then ignored, rather than refusing the file.
   //
-  // Silently dropping a key the user believed in is the worst outcome available: someone
-  // who writes "savedQueries" instead of "queries" gets no error, no queries, and no way
-  // to tell the difference between "my config is wrong" and "this feature is broken". A
-  // near-miss suggestion costs one line and saves an afternoon.
+  // The original fear here was silence, and it was the right fear: someone who writes
+  // "savedQueries" instead of "queries" must not get no error, no queries, and no way to tell
+  // "my config is wrong" from "this feature is broken". But refusing the whole file is a much
+  // worse cure than the disease. One stale key — a setting that was removed, or one that was
+  // never real — took every mount with it, so a fully configured machine reported "no sources
+  // are configured" and offered to help sign in to accounts that were already signed in.
+  //
+  // Worse, it took the diagnosis with it. `doctor` exists to explain a bad config and it died
+  // on the same error, as did `help`, which is a dead end with no way out of it from inside
+  // the program.
+  //
+  // So: keep the whole complaint, drop the fatality. The key is named, the near-miss is still
+  // suggested, and everything else in the file still loads and works.
+  const warnings: string[] = [];
   for (const key of Object.keys(root)) {
     if (KNOWN_CONFIG_KEYS.has(key)) continue;
     const suggestion = nearestKey(key);
-    throw VfsError.config(
-      `Unknown setting "${key}"${where}.`,
+    warnings.push(
       suggestion === undefined
-        ? `Known settings are: ${[...KNOWN_CONFIG_KEYS].sort().join(', ')}.`
-        : `Did you mean "${suggestion}"?`,
+        ? `Ignoring unknown setting "${key}"${where}. Known settings are: ${[...KNOWN_CONFIG_KEYS].sort().join(', ')}.`
+        : `Ignoring unknown setting "${key}"${where}. Did you mean "${suggestion}"?`,
     );
   }
 
@@ -494,6 +511,7 @@ function validateConfigBody(raw: unknown, sourcePath?: string): AppConfig {
     keymap: asObject(root['keymap'], 'keymap') as Record<string, string>,
     ...(typeof root['ttlMs'] === 'number' ? { ttlMs: root['ttlMs'] } : {}),
     ...(sourcePath === undefined ? {} : { sourcePath }),
+    ...(warnings.length === 0 ? {} : { warnings }),
   };
 }
 

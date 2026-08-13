@@ -27,18 +27,44 @@ Cache, logs, notification history and OAuth tokens live in the data directory â€
 | `MSCOMMS_CONFIG_DIR` | The directory the config file is looked for in. |
 | `MSCOMMS_DATA_DIR` | Cache, log, notification history and token storage. |
 
-## Unknown keys are an error
+## Unknown keys are reported, not fatal
 
 A typo in a config file usually fails silently, and you find out weeks later when the thing
-you configured turns out never to have been configured. This program refuses to start and
+you configured turns out never to have been configured. This program says so at startup and
 names the nearest real key:
 
 ```
-Unknown config key "notification". Did you mean "notifications"?
+Warning: Ignoring unknown setting "notification" in C:\Users\you\AppData\Roaming\mscomms\config.jsonc. Did you mean "notifications"?
 ```
 
-That is deliberate and there is no lenient mode. The suggestion is distance-capped, so a
-genuinely unrelated key gets a plain "unknown key" rather than a misleading guess.
+The suggestion is distance-capped, so a genuinely unrelated key gets the list of real keys
+rather than a misleading guess.
+
+The rest of the file still loads. An earlier version treated this as fatal, on the theory
+that a silently dropped key is the worst outcome â€” which is true, and a warning already fixes
+it. Refusing to start does not just fail to add anything, it takes away the tools you would
+use to recover: one stray key meant `doctor`, `config show` and even `help` all died with the
+same message, `init` refused to overwrite the file, and the launcher reported a machine with
+four working mounts as having none. The warning goes to stderr, so it survives the
+full-screen view and is still in the scrollback afterwards.
+
+`doctor` reports the same thing as a check, so it is visible after the fact too:
+
+```
+2. check config setting, status WARN, detail Ignoring unknown setting "cache" in C:\Users\you\AppData\Roaming\mscomms\config.jsonc. Known settings are: $schema, comment, keymap, mounts, notifications, plugins, queries, ttlMs, ui, voice, watches.
+```
+
+A mount option that no provider reads is the same failure one level down: the file says one
+thing, the program does another, and nothing mentions it. Providers with a closed set of
+options declare them, so an option that will never be read is named rather than quietly
+discarded:
+
+```
+Warning: Mount "/mail" (graph-mail) does not use the option "transport", so it has no effect.
+```
+
+Providers whose options are open-ended do not declare a list and are not checked, because
+warning about config that works would be the same mistake in the other direction.
 
 ## Top-level keys
 

@@ -34,7 +34,13 @@ import {
   type VNode,
 } from '@mscomms/core';
 import type { GraphClient, GraphPage } from './client.js';
-import { createClient, htmlToText, preview, type GraphSharedOptions } from './shared.js';
+import {
+  createClient,
+  GRAPH_SHARED_OPTION_KEYS,
+  htmlToText,
+  preview,
+  type GraphSharedOptions,
+} from './shared.js';
 
 export interface GraphMailOptions extends GraphSharedOptions {
   /** Include folders Outlook hides by default (Conversation History, and similar). */
@@ -472,6 +478,7 @@ export const graphMailPlugin: ProviderPlugin<GraphMailOptions> = {
   type: 'graph-mail',
   displayName: 'Outlook mail (Microsoft Graph)',
   description: 'Mail folders as directories and messages as files, read-only by default.',
+  optionKeys: [...GRAPH_SHARED_OPTION_KEYS, 'includeHiddenFolders', 'pageSize'],
   validateOptions(raw) {
     return (raw ?? {}) as GraphMailOptions;
   },
