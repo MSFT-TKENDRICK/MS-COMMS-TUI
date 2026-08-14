@@ -47,7 +47,8 @@ and covered in [PLUGINS.md](PLUGINS.md#names-are-yours-to-choose-and-it-matters)
 
 **`provider.ts`** — the plugin contract. See below.
 
-**`vfs.ts`** — the engine: mount table, resolution, listing, reading, search fan-out.
+**`vfs.ts`** — the engine: mount table, resolution, listing, reading, search fan-out, and
+filling in unread counts where a provider reported none.
 
 **`query.ts`** — parse, evaluate, rank and re-serialise `from:dana is:unread after:7d`,
 including the Lucene modifiers (wildcards, fuzzy, proximity, ranges, boosts).
@@ -140,7 +141,7 @@ This is what makes arrow keys undoable. Pressing Enter on a folder does not assi
 field; it runs the same journaled navigation a typed `cd` does, which is why `u` in the pane
 and `undo` in the shell are the same operation.
 
-## Three decisions worth defending
+## Four decisions worth defending
 
 ### Providers never parse paths
 
@@ -195,6 +196,73 @@ This is also why the Lucene modifiers had to survive `stringifyQuery` round-trip
 A boost or a slop value that vanished on the way out would make two different queries
 render identically, and the engine would then trust a filter that was never applied.
 Every new AST field is therefore covered by a round-trip test.
+
+### The unread count belongs to the provider
+
+A folder's unread count decides where people go next, so it has to be a number they can act
+on without checking it. That makes it a trust question rather than a display one, and the
+answer is the same shape as the push-down boundary above: **the engine never adjusts a count
+a provider reported.** If a source says `9`, the row says `9`.
+
+The alternative — the engine totalling a folder's cached children and adding them on — was
+built, and it failed in the only test that counts. `demo-mail` read `21` at the root and `26`
+a moment later, because browsing into `Inbox` had filled the cache the total was derived
+from. A number that grows while you look at it is a number people stop reading, and it also
+double-counts the moment a provider starts totalling its own subtree, which is precisely what
+a provider whose children are all folders has to do.
+
+What the count *means* is therefore the provider's decision, and it differs by source for
+good reason. A mail folder reports its own level, because that is what Outlook and Gmail show
+and what users already expect. A chat roster reports its subtree, because the folder is only
+a container and a `0` on it would be a lie. Both are right; only the provider can tell which
+case it is in.
+
+The engine's remaining job is narrow: where a provider reported *nothing*, fill a number in
+from directories already listed and cached, so a parent is not blank while its children are
+visibly counted. That derivation never fetches — it runs with a user waiting on a listing,
+and turning one `ls` of eight mounts into eight round trips for a decoration is not a trade
+worth making — and it is bounded to a few levels because the people graph is genuinely
+cyclic.
+
+Where it has only seen part of a folder, it offers a floor rather than a total: `26+`, not
+`26`. The first rule written here was the opposite — a partly-paged directory contributed
+nothing, on the grounds that a floor presented as a total is worse than no total. That
+reasoning was right about the risk and wrong about the remedy, and the cost was severe. A
+mount root is handed over one page at a time and warmed one page deep, so on a real mailbox,
+a real Teams roster and a real people directory the root keeps a cursor for the entire
+session; under the old rule those rows were never going to show a number. Not slowly —
+never. Marking the floor keeps the honesty and drops the silence: `26+` says what is known
+and admits what is not. `unreadPartial` on the node carries it, the engine sets it and
+providers do not, and it clears itself when the rest of the listing arrives.
+
+Silence is preserved throughout. `undefined` means "nobody could count", `0` means "somebody
+counted and found nothing", and the engine will not convert the first into the second.
+GitHub is the case that forces this: its API has no notion of whether you have seen an issue,
+so those rows wear no counter rather than claiming everything is read. A floor of zero is not
+a floor either — an incomplete listing of a source with no read state stays silent.
+
+For the counter to be there on the *first* listing, the derivation needs warm prefetch work
+to survive navigation, which it now does — warm tasks are the lowest-ranked work in the
+queue, and a foreground request holds the queue for as long as it is outstanding, so keeping
+them costs nothing in contention.
+
+That still leaves a window, and it is the one the user is actually in. The synthetic root
+paints instantly; the sources behind it have not answered yet; a count derived from an empty
+cache is therefore correctly absent, and becomes correct a moment later. The missing half was
+that nothing told the screen. So when a listing lands, the engine walks up from it and
+announces any ancestor whose counters have moved, over the same `onListingChanged` the
+full-screen view was already subscribed to. Three details make it quiet rather than annoying:
+an ancestor is only eligible once somebody has actually listed it, so resolving a deep path
+does not announce directories nobody is looking at; the comparison is over the counts alone,
+not the whole listing, so a relative timestamp ticking over a minute boundary does not
+repaint a list somebody is reading; and the listing fingerprint had to start including
+`unreadCount`, or a corrected number was computed, compared, found "unchanged" and dropped.
+
+Where the derivation genuinely cannot be made correct, it defers. Adding up the top-level
+folders of a mount assumes they are disjoint, which is false for any source shaped like a
+graph — see the people directory below — so `Provider.unreadTotal()` lets a source state its
+own whole-mount figure, and the engine prefers it. It must answer without I/O, and must say
+`undefined` rather than `0` when it has no basis, which keeps both rules above intact.
 
 ## The local snapshot
 
@@ -288,6 +356,27 @@ Invalidation cancels in-flight work, so a refresh cannot be undone from behind b
 that started before it. And the model learns only from unfiltered navigation: a filtered
 `ls` is someone interrogating a folder, not moving to it, and counting it would poison the
 model with places nobody went.
+
+A fourth rule was missing, and it was the one people actually felt. Priority orders the
+queue; it does not make the queue get out of the way. Once a speculative fetch has been
+handed to a transport that serialises everything down a single pipe — which is what MCP is,
+and what `/mail`, `/teams` and `/people` all run over — the user's own request queues behind
+it, priority no longer applies because the work has already left, and cancelling does not
+help because a request that has been sent cannot be unsent. Navigating into a folder took
+2.6 seconds against a provider that answers in 0.9.
+
+So speculation yields twice. Every non-speculative `list` and `read` takes a
+`PrefetchQueue.hold()` for as long as it is outstanding, which stops anything new from
+starting; and speculation runs one request at a time, which bounds what can already be in
+flight. That second number is not a tuning constant — it *is* the foreground's worst-case
+wait, measured in whole provider round trips, and at two it was putting 1.6 seconds of
+guesswork in front of a keypress. Together they take the same navigation to 1.65 seconds, of
+which 0.9 is the request the user actually asked for. On a serialised transport that is the
+floor.
+
+Holds are reference-counted and speculative callers do not take one — a prefetch task runs
+*inside* the queue, so a hold taken from there would stop the queue from starting anything
+else until that task finished, quietly reducing concurrency to nothing.
 
 ### AgentFS, and why the gap was the driver
 
@@ -483,6 +572,23 @@ tracks the provider's own `id` — defined as identifying the item rather than t
 for both the results and the queue. Every provider gets the fix; only this one needed it. The
 same applies to `provider-memory`, whose fixtures can now be graphs (`refs`) rather than
 trees, so the offline demo models the real shape instead of a convenient approximation of it.
+
+**And it made the unread counter dedupe too, in two different places.** The number on a
+folder is derived by adding up what is beneath it, which is only valid if "beneath it" is a
+tree. Here the same person is under `Org`, `Recent`, `Colleagues` and the `Directory` they
+are defined in, and the demo org chart's six unread messages were being reported as
+thirty-three on the row standing for the whole mount. Inside a subtree the engine can fix
+this itself, and does: the walk in `#unreadBeneath` counts each `id` once however many routes
+reach it. There is a condition on that, and it is a condition on the provider rather than the
+engine: the walk stops at any node that states a count of its own, because that count is
+final, so it only dedupes over nodes it actually reaches. Sections that each state a total
+are summed as if disjoint. Putting the count on the person, under an id naming the person
+rather than the route to them, is what makes the walk work — which is what `graph-people`
+does. Between the top-level sections the engine cannot fix it at all — each has handed over
+an opaque total and nothing in it says which of them overlap — so `Provider.unreadTotal()`
+exists for a source to state its own, and the engine takes it in preference to its own
+arithmetic. Providers that do not implement it keep the derived number, which is every
+provider until one has a reason not to.
 
 ## Two ways into Microsoft 365
 

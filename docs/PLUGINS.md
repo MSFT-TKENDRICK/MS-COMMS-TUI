@@ -64,6 +64,93 @@ deliberately contains a message named `CON`, a 200-character subject, an emoji, 
 messages with identical subjects, because those are the four things that break naive
 implementations.
 
+### `unreadCount` is a promise about cost
+
+A directory that reports `unreadCount` gets a counter drawn on its own row, in `ls` and in
+the pane, and that row is how a user decides where to go. So it is worth filling in — and
+worth filling in under one constraint: **`list()` on the parent must not go to the network to
+compute it.** A listing of eight mailboxes that fans out into eight requests is a listing that
+is slow when it works and broken when it doesn't. Report the number if you already know it,
+from the same response that gave you the children, from a counts endpoint you were calling
+anyway, or from something you wrote down last time. Otherwise leave it `undefined`.
+
+`undefined` and `0` are different claims, and the shell prints neither, but it will not turn
+one into the other: a source that cannot count must not be made to look like one that counted
+and found nothing.
+
+**Your number is final.** The engine never adds to a count you reported, so report the number
+you want a person to read on that row and nothing else has to be arranged around it. What
+that number means is your decision: a mail folder that says `9` means nine messages in *that*
+folder, which is what every mail client does and what users already expect, while a folder
+whose children are all folders should count its whole subtree or it will read `0` while
+holding unread mail. Only you can tell those two cases apart, which is why the choice lives
+here.
+
+Where you report nothing, the engine may fill a number in from directories it has *already*
+listed and cached, purely so a parent isn't blank while its children are visibly counted. It
+never fetches to do this and it stops a few levels down. It also counts each `id` once
+however many folders lead to it, so a source whose tree is really a graph is not inflated by
+its own cross-references — which is worth knowing when you choose ids: an id that encodes the
+route taken to an item rather than the item itself will be counted once per route.
+
+When it has only seen part of a folder it reports a floor — `26+` — rather than a total, and
+sets `unreadPartial` on the node to say so. **That field is the engine's, not yours.** Do not
+set it; a count you report is taken as final and exact, and if it is really a floor the thing
+to do is leave `unreadCount` undefined and let the engine derive one, or report the number
+you are willing to stand behind.
+
+### `unreadTotal()` — for the row standing for your whole mount
+
+Optional, and only worth implementing if the engine would otherwise get it wrong.
+
+The row for `/mail` in `/` has no node of yours behind it, so its counter is obtained by
+adding up the counts of the folders you returned at the top level. For a mailbox that is
+correct. For anything shaped like a graph it is not: in a people directory the same person is
+under `Org`, under `Recent`, under `Colleagues` and in the `Directory` they are defined in,
+and the totals of those sections overlap in a way nothing outside your provider can see. The
+demo org chart's six unread messages were being reported as thirty-three.
+
+The engine's per-`id` deduplication does not rescue this, and the reason is worth stating
+because it also tells you where to put your counts. It only dedupes over nodes it actually
+visits, and it stops descending the moment a node reports a count of its own — that count is
+final, so there is nothing below it left to inspect. Sections that each state a total are
+therefore summed as if they were disjoint. Report the count on the *person* instead, with an
+id that identifies the person rather than the path to them, and the engine descends, sees the
+same id four times and counts it once. Where the shape makes that impossible, `unreadTotal()`
+is the way out.
+
+```ts
+unreadTotal(): number | undefined {
+  return this.#index === undefined ? undefined : this.#index.distinctUnread;
+}
+```
+
+Two obligations, both the same ones `unreadCount` carries. **No I/O** — this is called while
+a listing is being rendered, and a root that went to the network would make `ls /` fail
+offline for the sake of a badge. And **`undefined`, never `0`, when you have no basis**: a
+source that has fetched nothing yet, or has no concept of read state, has to stay silent.
+Returning `undefined` simply leaves the engine's own arithmetic in place, which is what every
+provider that does not implement this gets. If you throw, or answer with something that is
+not a whole number, the engine logs it, drops the badge and renders the listing anyway.
+
+This one is in-process only. It is synchronous by design — that is how "no I/O" is enforced
+rather than merely requested — and there is no way to make a synchronous call across the
+`exec` protocol's pipe. An `exec` plugin keeps the derived number, which for a tree-shaped
+source is the same answer.
+
+If the backend has no server-side notion of read — feeds mostly don't — you can keep the
+state yourself in `context.state`, which is exactly what `provider-rss` does; read it for the
+shape. Two rules there are easy to get backwards. **Listing a folder does not read it**, or
+the counter resets at the moment you look at the thing it is attached to and therefore counts
+nothing. And **the first sight of a source is silent**: a feed subscribed to this morning is
+not forty articles you have failed to read, and a counter whose first value is `40` is one the
+user learns to ignore on day one.
+
+Some sources have no read state to report. GitHub issues and pull requests are the clear
+case: nothing in the API says whether you have seen one, so those directories stay
+`undefined` and wear no counter. That is the honest answer, and it is better than a `0` that
+would quietly claim everything had been read.
+
 ## The `exec` protocol
 
 One JSON object per line on stdin, one per line on stdout.

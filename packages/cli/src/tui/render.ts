@@ -30,6 +30,7 @@
 
 import { displayWidth, formatDate, padTo, paint, sanitizeForDisplay, truncateWidth } from '../format.js';
 import type { FormatOptions } from '../format.js';
+import type { VNode } from '@mscomms/core';
 import { accelerators, currentParam, visibleEntries } from './state.js';
 import type { TuiState } from './state.js';
 
@@ -200,6 +201,9 @@ function titleLine(state: TuiState, width: number, options: RenderOptions): stri
   return paint(fit(state.cwd, leftWidth), 'bold', options.color) + paint(fit(right, rightWidth), 'dim', options.color);
 }
 
+/** Room a name needs before the pane starts giving up other columns to find it some. */
+const MIN_NAME_ROOM = 12;
+
 function renderList(state: TuiState, width: number, body: number, options: RenderOptions): string[] {
   const shown = visibleEntries(state);
   const rows: string[] = [];
@@ -210,28 +214,69 @@ function renderList(state: TuiState, width: number, body: number, options: Rende
     return rows;
   }
 
-  for (let i = state.offset; i < Math.min(shown.length, state.offset + body); i += 1) {
+  const last = Math.min(shown.length, state.offset + body);
+
+  // The unread counter is a reserved column rather than a suffix on the name, so it lands
+  // in the same place on every row and survives a folder name long enough to be truncated.
+  // Its width is measured over the rows actually on screen: one folder with 3629 unread
+  // must not cost four columns of name on a screenful that does not contain it.
+  let badgeWidth = 0;
+  for (let i = state.offset; i < last; i += 1) {
+    const node = shown[i];
+    if (node !== undefined) badgeWidth = Math.max(badgeWidth, displayWidth(unreadBadge(node)));
+  }
+  const badgeRoom = badgeWidth === 0 ? 0 : badgeWidth + 1;
+
+  for (let i = state.offset; i < last; i += 1) {
     const node = shown[i];
     if (node === undefined) continue;
 
     // The selection marker is drawn whichever pane has focus, so you never lose your place
     // while reading a message. Colour, the weaker signal, tracks focus instead.
     const marker = i === state.selected ? '> ' : '  ';
-    const unread = node.flags?.includes('unread') === true ? '*' : ' ';
+    const unread = node.flags?.includes('unread') === true || unreadOf(node) > 0 ? '*' : ' ';
     const focused = i === state.selected && state.pane === 'list';
 
     const date = formatDate(node.mtime, options.dateStyle);
-    const dateRoom = date === '' ? 0 : Math.min(displayWidth(date) + 1, Math.max(0, width - 12));
-    const nameRoom = Math.max(1, width - 3 - dateRoom);
+    let dateRoom = date === '' ? 0 : Math.min(displayWidth(date) + 1, Math.max(0, width - 12));
+    // The pane can be split narrow enough that the name, the counter and the date do not all
+    // fit. The date goes first: it is the one thing here that says nothing about whether
+    // there is anything new. Dropping it explicitly matters because the alternative is
+    // letting `fit` shear the row, which silently eats whichever column happens to be last.
+    if (width - 3 - badgeRoom - dateRoom < MIN_NAME_ROOM) dateRoom = 0;
+    const nameRoom = Math.max(1, width - 3 - badgeRoom - dateRoom);
 
     const name = fit(node.name + (node.kind === 'dir' ? '/' : ''), nameRoom);
+    const badge = badgeRoom === 0 ? '' : fit(` ${unreadBadge(node)}`, badgeRoom);
     const tail = dateRoom === 0 ? '' : fit(` ${date}`, dateRoom);
-    const line = fit(`${marker}${unread}${name}${tail}`, width);
+    const line = fit(`${marker}${unread}${name}${badge}${tail}`, width);
     rows.push(focused ? paint(line, 'cyan', options.color) : line);
   }
 
   while (rows.length < body) rows.push(' '.repeat(width));
   return rows;
+}
+
+/** Unread children a directory is reporting. Zero for anything that is not a directory. */
+function unreadOf(node: VNode): number {
+  return node.kind === 'dir' ? (node.unreadCount ?? 0) : 0;
+}
+
+/**
+ * A folder's unread counter, in the shortest form that is still a number.
+ *
+ * `ls` spells it `3 unread`; this pane is routinely 35 columns wide, where that would
+ * cost a quarter of the row. The word is not lost — `describeSelection` spells it out for
+ * the selected row, and that sentence is both what the status line shows and what the
+ * session prints to the scrollback on the way out.
+ */
+function unreadBadge(node: VNode): string {
+  const count = unreadOf(node);
+  if (count <= 0) return '';
+  // `+` means the engine could only see part of the folder — a mount root is warmed one
+  // page deep, so this is the common case, not the exotic one. `describeSelection` says
+  // "at least" in words for whoever is listening rather than looking.
+  return `(${String(count)}${node.unreadPartial === true ? '+' : ''})`;
 }
 
 function renderPreview(state: TuiState, width: number, body: number, options: RenderOptions): string[] {

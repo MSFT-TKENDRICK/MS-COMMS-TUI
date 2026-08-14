@@ -75,10 +75,15 @@ interface Chat {
   readonly chatType: string;
   readonly lastUpdatedDateTime: string | null;
   readonly members?: ReadonlyArray<{ displayName?: string }>;
+  /**
+   * Where you had read up to. This is the only read state Teams exposes — there is no unread
+   * count on a chat, and none on a channel at all — so it is the whole basis for the counter.
+   */
+  readonly viewpoint?: { readonly lastMessageReadDateTime?: string | null; readonly isHidden?: boolean } | null;
   readonly lastMessagePreview?: {
     readonly createdDateTime?: string | null;
     readonly body?: { readonly content?: string | null } | null;
-    readonly from?: { readonly user?: { readonly displayName?: string | null } | null } | null;
+    readonly from?: { readonly user?: { readonly displayName?: string | null; readonly id?: string | null } | null } | null;
   } | null;
 }
 
@@ -151,6 +156,7 @@ export class GraphChatProvider implements Provider {
     },
   ]);
   #client: GraphApi | undefined;
+  #me: Promise<string | undefined> | undefined;
 
   constructor(options: GraphChatOptions, context: ProviderContext, client?: GraphApi) {
     this.#options = options;
@@ -233,8 +239,9 @@ export class GraphChatProvider implements Provider {
         `/me/chats?$expand=members,lastMessagePreview&$top=${String(limit)}&$orderby=lastMessagePreview/createdDateTime desc`,
       options.signal === undefined ? {} : { signal: options.signal },
     );
+    const me = await this.#selfId(options.signal);
     return {
-      entries: page.value.map((chat) => chatNode(chat)),
+      entries: page.value.map((chat) => chatNode(chat, me)),
       ...(page.nextLink === undefined ? {} : { cursor: page.nextLink }),
     };
   }
@@ -288,10 +295,37 @@ export class GraphChatProvider implements Provider {
       options.cursor ?? `/me/chats/${encodeURIComponent(parent.id)}/messages?$top=${String(limit)}`,
       options.signal === undefined ? {} : { signal: options.signal },
     );
+    // The chat carried its own read watermark down from the listing, so the messages can be
+    // marked without asking Graph a second time.
+    const readUpTo = watermarkOf(parent);
+    const me = await this.#selfId(options.signal);
     return {
-      entries: page.value.filter(isVisible).map((message) => messageFileNode(message, { chatId: parent.id })),
+      entries: page.value
+        .filter(isVisible)
+        .map((message) => messageFileNode(message, { chatId: parent.id }, isUnread(message, readUpTo, me))),
       ...(page.nextLink === undefined ? {} : { cursor: page.nextLink }),
     };
+  }
+
+  /**
+   * The signed-in user's id, fetched once.
+   *
+   * Needed only to answer "did I write this", which is what stops your own messages counting
+   * as unread to you — Graph moves the read watermark lazily, so without this the last thing
+   * you said in a chat routinely reads back as something new. One `/me` per session, and a
+   * failure degrades to `undefined` rather than taking the listing down with it: the cost of
+   * being wrong here is one over-counted message, which is not worth a broken chat list.
+   */
+  async #selfId(signal?: AbortSignal): Promise<string | undefined> {
+    this.#me ??= this.#api
+      .get<{ id?: string }>('/me', signal === undefined ? {} : { signal })
+      .then((user) => user.id)
+      .catch((error: unknown) => {
+        this.#me = undefined;
+        this.#context.logger.debug('could not identify the signed-in user', { message: String(error) });
+        return undefined;
+      });
+    return this.#me;
   }
 
   /**
@@ -601,7 +635,7 @@ function authorOf(message: ChatMessage): string {
   );
 }
 
-function chatNode(chat: Chat): VNode {
+function chatNode(chat: Chat, meId: string | undefined): VNode {
   const names = (chat.members ?? [])
     .map((member) => member.displayName)
     .filter((name): name is string => name !== undefined && name !== '');
@@ -620,6 +654,21 @@ function chatNode(chat: Chat): VNode {
   const said = summaryOf(chat);
   const who = chat.lastMessagePreview?.from?.user?.displayName;
 
+  const readUpTo = parseWatermark(chat.viewpoint?.lastMessageReadDateTime);
+  // Flagged, but deliberately not counted. Teams will tell you *that* a chat has moved since
+  // you last read it and never *how far*, so the flag is the honest end of what one listing
+  // knows. The number arrives once the messages themselves have been listed, and the engine
+  // totals them onto this row — a claim of "1 unread" here would be a guess dressed as a
+  // count.
+  const unread = isUnread(
+    {
+      createdDateTime: spoke ?? '',
+      from: { user: { ...(chat.lastMessagePreview?.from?.user?.id == null ? {} : { id: chat.lastMessagePreview.from.user.id }) } },
+    },
+    readUpTo,
+    meId,
+  );
+
   return {
     name: label,
     kind: 'dir',
@@ -629,8 +678,44 @@ function chatNode(chat: Chat): VNode {
     ...(stamp === null || stamp === undefined ? {} : { mtime: new Date(stamp) }),
     ...(said === undefined ? {} : { summary: said }),
     ...(who === null || who === undefined || who === '' ? {} : { author: who }),
-    meta: { chatType: chat.chatType },
+    ...(unread ? { flags: ['unread'] } : {}),
+    meta: {
+      chatType: chat.chatType,
+      ...(readUpTo === undefined ? {} : { readUpTo: new Date(readUpTo).toISOString() }),
+    },
   };
+}
+
+/** The read watermark a chat directory carried down to its messages. */
+function watermarkOf(node: VNode): number | undefined {
+  const raw = node.meta?.['readUpTo'];
+  return typeof raw === 'string' ? parseWatermark(raw) : undefined;
+}
+
+function parseWatermark(raw: string | null | undefined): number | undefined {
+  if (raw === null || raw === undefined || raw === '') return undefined;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? at : undefined;
+}
+
+/**
+ * Whether a message arrived after you last read the chat.
+ *
+ * A missing watermark means Teams has no record of you reading this chat, which is treated
+ * as unread — it is the state a chat is in before you have ever opened it. Your own messages
+ * never count: Graph updates the watermark lazily, so the last thing you said would otherwise
+ * come back as something new every time.
+ */
+function isUnread(
+  message: { readonly createdDateTime: string; readonly from?: { user?: { id?: string } } },
+  readUpTo: number | undefined,
+  meId: string | undefined,
+): boolean {
+  const at = Date.parse(message.createdDateTime);
+  if (!Number.isFinite(at)) return false;
+  const from = message.from?.user?.id;
+  if (meId !== undefined && from !== undefined && from === meId) return false;
+  return readUpTo === undefined || at > readUpTo;
 }
 
 /** The last thing said in a chat, as one line, for the listing. */
@@ -678,6 +763,7 @@ function threadNode(message: ChatMessage, teamId: string, channelId: string): VN
 function messageFileNode(
   message: ChatMessage,
   scope: { chatId?: string; teamId?: string; channelId?: string; threadId?: string },
+  unread = false,
 ): VNode {
   const created = new Date(message.createdDateTime);
   const author = authorOf(message);
@@ -691,6 +777,7 @@ function messageFileNode(
       : preview(bodyText, 60);
 
   const flags: string[] = [];
+  if (unread) flags.push('unread');
   if ((message.mentions ?? []).length > 0) flags.push('mention');
   if ((message.attachments ?? []).length > 0) flags.push('attachment');
   if (message.importance === 'high' || message.importance === 'urgent') flags.push('important');

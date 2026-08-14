@@ -309,6 +309,133 @@ describe('PrefetchQueue: failure handling', () => {
   });
 });
 
+/**
+ * Yielding to the person at the keyboard.
+ *
+ * Priority orders the queue; it does not make the queue get out of the way. Once a warm task
+ * has been handed to a transport that serialises everything down one pipe — which is what
+ * MCP is — the user's own request queues up behind it and priority no longer applies,
+ * because the work has already left. Cancelling does not help either: a request that has
+ * been sent cannot be unsent.
+ *
+ * So the foreground takes a hold for as long as it is outstanding, and the worst case
+ * becomes "one task already in flight" instead of "everything the predictor guessed at".
+ * Navigating into a folder and back out took 2.6 seconds against a provider that answers in
+ * 0.9; that gap was entirely this.
+ */
+describe('PrefetchQueue: yielding to the foreground', () => {
+  it('starts nothing new while a hold is outstanding', async () => {
+    const log: string[] = [];
+    const queue = new PrefetchQueue({ concurrency: 2 });
+
+    const release = queue.hold();
+    queue.schedule(task('guess', PREFETCH_PRIORITY.nextPage, log));
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(log, [], 'the guess must wait; somebody is waiting on something real');
+
+    release();
+    await queue.idle();
+    assert.deepEqual(log, ['guess'], 'and runs once nobody is');
+  });
+
+  it('lets a task already in flight finish rather than stranding it', async () => {
+    const running = gate('inflight', PREFETCH_PRIORITY.nextPage);
+    const queue = new PrefetchQueue({ concurrency: 1 });
+
+    queue.schedule(running.task);
+    await running.started;
+
+    // Taking a hold now must not deadlock the queue on the task it already started.
+    const release = queue.hold();
+    running.release();
+    release();
+    await queue.idle();
+
+    assert.equal(queue.stats.completed, 1);
+  });
+
+  it('counts holds, so two overlapping requests do not release each other', async () => {
+    const log: string[] = [];
+    const queue = new PrefetchQueue({ concurrency: 1 });
+
+    const first = queue.hold();
+    const second = queue.hold();
+    queue.schedule(task('guess', PREFETCH_PRIORITY.nextPage, log));
+
+    first();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(log, [], 'one request finishing does not mean the other has');
+
+    second();
+    await queue.idle();
+    assert.deepEqual(log, ['guess']);
+  });
+
+  it('ignores a release called twice, which would otherwise let the count go negative', async () => {
+    const log: string[] = [];
+    const queue = new PrefetchQueue({ concurrency: 1 });
+
+    const first = queue.hold();
+    const second = queue.hold();
+    first();
+    first();
+    queue.schedule(task('guess', PREFETCH_PRIORITY.nextPage, log));
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(log, [], 'the second release was not a real one and must not count');
+
+    second();
+    await queue.idle();
+    assert.deepEqual(log, ['guess']);
+  });
+
+  it('does not report itself idle while it is holding work back', async () => {
+    // `idle()` means "nothing left to do", and a held queue with a full backlog has plenty.
+    // Getting this wrong would make every test that waits on the queue pass early.
+    const log: string[] = [];
+    const queue = new PrefetchQueue({ concurrency: 1 });
+
+    const release = queue.hold();
+    queue.schedule(task('guess', PREFETCH_PRIORITY.nextPage, log));
+
+    let settled = false;
+    const waiting = queue.idle().then(() => {
+      settled = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(settled, false, 'there is queued work, so this is not idle');
+
+    release();
+    await waiting;
+    assert.deepEqual(log, ['guess']);
+  });
+
+  it('speculates one request at a time by default', async () => {
+    // Not a tuning constant. Whatever is already in flight cannot be recalled, so this
+    // number *is* the foreground's worst-case wait, measured in whole provider round trips.
+    // At two, against a source answering in 900ms, a keypress cost 2.5 seconds — 1.6 of it
+    // spent waiting for guesses nobody had asked for.
+    const started: string[] = [];
+    const queue = new PrefetchQueue();
+    const first = gate('one', PREFETCH_PRIORITY.nextPage);
+    const second = gate('two', PREFETCH_PRIORITY.nextPage);
+
+    queue.schedule({ ...first.task, run: async (s) => { started.push('one'); await first.task.run(s); } });
+    queue.schedule({ ...second.task, run: async (s) => { started.push('two'); await second.task.run(s); } });
+
+    await first.started;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(started, ['one'], 'the second must not have been sent yet');
+
+    first.release();
+    second.release();
+    await queue.idle();
+    assert.deepEqual(started, ['one', 'two'], 'and follows once the first is done');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // NavigationPredictor
 // ---------------------------------------------------------------------------

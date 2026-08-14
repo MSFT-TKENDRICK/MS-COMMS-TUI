@@ -602,7 +602,7 @@ there. Everything below has a working default.
 | `bodies` | number | 0 | Message bodies to pre-download per folder per cycle. 0 disables. |
 | `vectors` | boolean | `true` | Build embeddings so `find` can match on meaning. |
 | `prefetch` | boolean | `true` | Fetch what you are about to open, before you open it. Applies whether or not `enabled` is set. |
-| `prefetchConcurrency` | number | 2 | Speculative fetches in flight at once. |
+| `prefetchConcurrency` | number | 1 | Speculative fetches in flight at once. Also the foreground's worst-case wait, in provider round trips — see below. |
 | `audit` | boolean | `false` | Record every provider fetch in an AgentFS `tool_calls` log. |
 
 `prefetch` is the one key here that is *not* conditional on `enabled`. It used to be, which
@@ -744,6 +744,18 @@ request already in flight rather than starting a second one — without that, ar
 the guess was still in the air was the *worst* case rather than the best, costing a
 duplicate round trip. Speculative work is cancelled when you navigate away, but never when
 a real request has joined it.
+
+**Speculation gets out of your way.** A request you made holds the speculative queue for as
+long as it is outstanding, so nothing new starts while you are waiting. That leaves whatever
+had already been handed to the provider, and on a transport that serialises everything down
+one pipe — MCP does, which is how the Microsoft Graph mounts are usually configured — you
+queue behind it. Priority cannot help: the work has already left. Cancelling cannot help
+either: a request that has been sent cannot be unsent. So `prefetchConcurrency` is not really
+a throughput knob, it is your worst-case wait expressed in provider round trips. At `2`,
+navigating into a folder against a provider answering in 0.9s took 2.6s, of which 1.6s was
+guesswork the user was paying for. It defaults to `1` for that reason. Raise it only if your
+providers genuinely answer in parallel and you would rather have the warm-up throughput than
+the responsiveness.
 
 **When something genuinely is slow, it says so.** Any command still working after a short
 grace period shows a progress indicator, so a slow network looks like a slow network rather

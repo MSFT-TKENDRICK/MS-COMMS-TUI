@@ -669,9 +669,29 @@ export const demoCommand: Command = {
       },
     );
 
+    const mounted: string[] = [];
     for (const result of built) {
-      if (result.mount !== undefined) session.vfs.mount(result.mount);
+      if (result.mount === undefined) continue;
+      session.vfs.mount(result.mount);
+      mounted.push(result.mount.path);
     }
+
+    // List each new mount before returning, so `ls /` has its counters the moment the prompt
+    // comes back. A mount that has never been listed contributes no unread total to the row
+    // standing for it, and `demo` then `ls` — the first two things anyone types — showed a
+    // root with no counters on it at all. The sample data is in memory, so these are four
+    // synchronous walks and no I/O; a failure is swallowed because this is a decoration on a
+    // listing, not the mounting itself.
+    await Promise.all(
+      mounted.map(async (path) => {
+        await session.vfs.list(path, { speculative: true }).catch(() => undefined);
+      }),
+    );
+
+    // And warm the level below in the background, which is what gives the folders *inside*
+    // each mount their counters. Startup warming already ran with none of these in the mount
+    // table, so it has to happen again here.
+    void session.warmMounts();
     // Confirmation, not data: `demo` produces no records, so this belongs on the same
     // stream as the hint that follows it.
     session.status('Mounted /demo-mail, /demo-chat, /demo-issues and /demo-people.');

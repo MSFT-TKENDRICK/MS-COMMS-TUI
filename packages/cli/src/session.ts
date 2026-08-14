@@ -562,9 +562,29 @@ export class Session {
     // lists mount roots, which takes seconds and finishes long after the session is usable.
     // Reporting it as outstanding would mean "ready" never arrived while the tool was, in
     // every sense the user cares about, ready.
-    this.#warming = this.vfs.warm({ signal: this.#warmAbort.signal }).catch((error: unknown) => {
-      this.logger.debug('warm-up did not finish', { message: String(error) });
-    });
+    this.warmMounts();
+  }
+
+  /**
+   * Warm every mount in the background.
+   *
+   * Called at startup, and again by anything that mounts a source afterwards — `demo` is the
+   * one in the box. A mount that has never been listed has nothing in the directory cache,
+   * and a mount with nothing in the cache cannot contribute an unread total to the row that
+   * stands for it, so skipping this leaves the root listing — the first thing anyone sees —
+   * as the one place with no counters on it.
+   *
+   * Safe to call repeatedly: the prefetch queue keys on the path, so a mount already warm is
+   * not fetched twice.
+   */
+  warmMounts(): Promise<void> {
+    const previous = this.#warming ?? Promise.resolve();
+    this.#warming = previous.then(() =>
+      this.vfs.warm({ signal: this.#warmAbort.signal }).catch((error: unknown) => {
+        this.logger.debug('warm-up did not finish', { message: String(error) });
+      }),
+    );
+    return this.#warming;
   }
 
   /** Build the configured mounts, and land the user somewhere sensible. */

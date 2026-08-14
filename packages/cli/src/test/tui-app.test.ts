@@ -120,9 +120,33 @@ async function harness(
      * ask what the user can do while it is there. The memory provider is instant, which is
      * exactly wrong for testing behaviour that only exists because real sources are not.
      */
-    readonly hold?: () => Promise<void>;
+    readonly hold?: (path: string) => Promise<void>;
     /** A different tree, for tests that need subtypes the action commands look for. */
     readonly items?: readonly MemoryItem[];
+    /**
+     * A second mount, which keeps the session at `/`. With one mount the session helpfully
+     * descends into it, so the synthetic root — the screen the user actually opens onto, and
+     * the one they reported as empty — is never on screen at all.
+     */
+    readonly second?: readonly MemoryItem[];
+    /**
+     * Strip the providers' ability to state a whole-mount total, which is what every real
+     * source is like. The fixture holds everything in memory and can total instantly; Graph
+     * and GitHub cannot say anything until they have fetched, so their mount rows are
+     * derived from the cache and only become right once it fills. Tests about *when* a
+     * number appears have to model the second kind or they test nothing.
+     */
+    readonly cannotTotal?: boolean;
+    /**
+     * Hand the mount root over one page at a time, which is what a real mailbox does and
+     * what the fixture, sized to fit in a single page, never did.
+     *
+     * This is the shape that produced no counters at all on a live tenant: warm fetches one
+     * page of the root and stops, so the root index keeps a cursor for the whole session and
+     * a rule of "only count a directory once it is complete" never fires. A test that pages
+     * is the only kind that can tell the difference.
+     */
+    readonly pageSize?: number;
   } = {},
 ): Promise<Harness> {
   const registry = new PluginRegistry(NULL_LOGGER);
@@ -138,8 +162,23 @@ async function harness(
               id: 'mail',
               path: '/mail',
               type: 'memory',
-              options: { items: options.items ?? TREE, displayName: 'Test mail', now: () => NOW },
+              options: {
+                items: options.items ?? TREE,
+                displayName: 'Test mail',
+                now: () => NOW,
+                ...(options.pageSize === undefined ? {} : { pageSize: options.pageSize }),
+              },
             },
+            ...(options.second === undefined
+              ? []
+              : [
+                  {
+                    id: 'chat',
+                    path: '/chat',
+                    type: 'memory',
+                    options: { items: options.second, displayName: 'Test chat', now: () => NOW },
+                  },
+                ]),
           ],
     ui: { ...DEFAULT_CONFIG.ui, color: 'never' },
   };
@@ -162,11 +201,17 @@ async function harness(
   });
   await session.start();
 
+  if (options.cannotTotal === true) {
+    for (const mount of session.vfs.mounts) {
+      (mount.provider as { unreadTotal?: (() => number | undefined) | undefined }).unreadTotal = undefined;
+    }
+  }
+
   if (options.hold !== undefined) {
     const { hold } = options;
     const real = session.vfs.list.bind(session.vfs);
     session.vfs.list = (async (target, listOptions) => {
-      await hold();
+      await hold(typeof target === 'string' ? target : String(target));
       return real(target, listOptions);
     }) as typeof session.vfs.list;
   }
@@ -906,3 +951,199 @@ describe('tui app: acting on the selection', () => {
     await h.done;
   });
 });
+
+/**
+ * The counter, in the pane people actually browse in.
+ *
+ * Reported as: "Github had 0 counters. Mail had 0 counters. Teams had 0 counters ... You
+ * aren't rendering the counters in the tree view." Rendering had in fact been built and
+ * unit-tested; what was missing was anything to render, because a folder whose children are
+ * folders counted only the messages loose inside it and found none. So the case worth
+ * holding onto is end-to-end and nested: a real session, a real provider, a folder of
+ * folders, and the number visible on the row you would be choosing from.
+ */
+const NESTED: readonly MemoryItem[] = [
+  {
+    id: 'chats',
+    title: 'Chats',
+    subtype: 'folder',
+    children: [
+      {
+        id: 'priya',
+        title: 'Priya Raman',
+        children: [
+          { id: 'c1', title: 'about the deploy', agoMinutes: 5, body: 'ping', flags: ['unread'] },
+          { id: 'c2', title: 'and one more thing', agoMinutes: 4, body: 'ping', flags: ['unread'] },
+        ],
+      },
+      { id: 'crew', title: 'Release crew', children: [{ id: 'c3', title: 'shipping', agoMinutes: 3, body: 'ping', flags: ['unread'] }] },
+    ],
+  },
+  { id: 'quiet', title: 'Archive', subtype: 'folder', children: [{ id: 'old', title: 'old thing', agoMinutes: 900, body: 'read' }] },
+];
+
+describe('tui app: the unread counter', () => {
+  it('shows a count on a folder whose unread all live further down', async () => {
+    const h = await harness({ items: NESTED });
+    await ready(h);
+
+    const frame = h.frame();
+    assert.match(frame, /Chats\/\s*\(3\)/, 'two conversations plus one, on the row you choose from');
+    await h.send('q');
+    await h.done;
+  });
+
+  it('leaves a folder with nothing new unmarked', async () => {
+    // The counter is only worth reading if its absence means something.
+    const h = await harness({ items: NESTED });
+    await ready(h);
+
+    const line = h
+      .frame()
+      .split('\n')
+      .find((row) => row.includes('Archive/'));
+    assert.ok(line !== undefined, 'expected an Archive row');
+    assert.doesNotMatch(line, /\(\d+\)/);
+    await h.send('q');
+    await h.done;
+  });
+
+  it('still counts after walking into the folder', async () => {
+    // Down one level the conversations carry their own numbers, and they add up to the one
+    // shown above them. A total that disagreed with its own breakdown would be worse than
+    // no total at all.
+    const h = await harness({ items: NESTED });
+    await ready(h);
+    await h.send('\u001B[B', 60);
+    await h.send('\r', 120);
+
+    const frame = h.frame();
+    assert.match(frame, /Priya Raman\/\s*\(2\)/);
+    assert.match(frame, /Release crew\/\s*\(1\)/);
+    await h.send('q');
+    await h.done;
+  });
+});
+
+/**
+ * The complaint that produced this round, reproduced.
+ *
+ * Reported as: "I'm running the cli and not at all seeing what you're seeing until I start
+ * navigating ... you aren't updating counts in realtime or on cli init."
+ *
+ * Every earlier test listed a directory whose contents were already cached and then asked
+ * what was on screen, so every one of them passed while the program was broken. The window
+ * the user lives in is the other one: the root is synthetic and paints instantly, the mounts
+ * behind it have not answered yet, and a count derived from a cache that is still empty is
+ * necessarily zero. The number is only correct a moment later — and the bug was that nothing
+ * told the screen when that moment came.
+ *
+ * So the shape of this test is the point. The mounts are held shut, the root is allowed
+ * through, the first frame is asserted to be countless, and then the gate opens and the
+ * assertion is that the number appears *with no key ever pressed*. Send a keystroke here and
+ * the test passes against the broken program, because navigating is what the user had to do.
+ */
+async function waitFor(h: Harness, matches: (frame: string) => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 300; i += 1) {
+    if (matches(h.frame())) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`waited for ${what} and it never came; on screen: ${JSON.stringify(h.frame().slice(0, 600))}`);
+}
+
+describe('tui app: the counter that arrives after the first frame', () => {
+  it('fills the root in on its own, with nobody touching the keyboard', async () => {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+
+    const h = await harness({
+      items: NESTED,
+      second: NESTED,
+      cannotTotal: true,
+      // The root is synthetic and instant in the real program; the sources behind it are
+      // neither. Holding only the mounts is what makes that ordering reproducible instead
+      // of a race the memory provider happens to win.
+      hold: async (path) => {
+        if (path !== '/') await gate;
+      },
+    });
+
+    await waitFor(h, (frame) => frame.includes('mail/'), 'the root listing');
+    assert.doesNotMatch(h.frame(), /\(\d+\)/, 'nothing has answered yet, so there is nothing to count');
+
+    open();
+
+    await waitFor(h, (frame) => /mail\/\s*\(3\)/.test(frame), 'the count to arrive by itself');
+    assert.match(h.frame(), /chat\/\s*\(3\)/, 'and the same for every other source, not just the first');
+
+    await h.send('q');
+    await h.done;
+  });
+
+  it('does not need the count to be right before it will draw the row', async () => {
+    // The other half of the same decision: the root is shown immediately and corrected,
+    // rather than withheld until it is correct. A shell that opens onto a blank screen for
+    // as long as the slowest source takes is a worse trade than a number that lands late.
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+
+    const h = await harness({
+      items: NESTED,
+      second: NESTED,
+      cannotTotal: true,
+      hold: async (path) => {
+        if (path !== '/') await gate;
+      },
+    });
+
+    await waitFor(h, (frame) => frame.includes('mail/') && frame.includes('chat/'), 'both sources listed');
+    open();
+    await waitFor(h, (frame) => /mail\/\s*\(3\)/.test(frame), 'the count');
+    await h.send('q');
+    await h.done;
+  });
+
+  /**
+   * The shape that had no counter at all on a live tenant.
+   *
+   * A real mailbox, a real Teams roster and a real people directory hold far more than one
+   * screen, and warm fetches a bounded prefix of each. The engine's rule was that a
+   * directory still holding a cursor could not be totalled, so those roots were never going
+   * to produce a number — not late, never.
+   *
+   * Note what it takes to reproduce: a fixture bigger than the prefix that gets fetched. A
+   * small one is drained on the first listing and comes back complete, which is why every
+   * fixture in this file — all of them a couple of items wide — said nothing about it.
+   */
+  it('puts a floor on a root the source is still handing over, without a keypress', async () => {
+    const wide: readonly MemoryItem[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `f${String(i)}`,
+      title: `Folder ${String(i).padStart(2, '0')}`,
+      subtype: 'folder',
+      children: [
+        { id: `f${String(i)}-m`, title: 'a message', agoMinutes: i + 1, body: 'ping', flags: ['unread'] },
+      ],
+    }));
+
+    const h = await harness({ items: wide, second: NESTED, cannotTotal: true, pageSize: 5 });
+
+    await waitFor(
+      h,
+      (frame) => /mail\/\s*\(\d+\+\)/.test(frame),
+      'a floor on a root that still has a cursor',
+    );
+
+    // The floor has to be a floor, not the whole truth dressed up as one.
+    const shown = /mail\/\s*\((\d+)\+\)/.exec(h.frame())?.[1];
+    assert.ok(shown !== undefined && Number(shown) > 0, `expected a positive floor, got ${String(shown)}`);
+    assert.ok(Number(shown) < 60, `a floor of ${String(shown)} is the whole total, so nothing was left out`);
+
+    await h.send('q');
+    await h.done;
+  });
+});
+

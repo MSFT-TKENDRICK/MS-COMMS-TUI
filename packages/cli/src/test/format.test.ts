@@ -18,6 +18,7 @@ import {
   formatBytes,
   formatDate,
   formatDocument,
+  formatListing,
   formatRows,
   padTo,
   relativeTime,
@@ -25,6 +26,7 @@ import {
   truncateWidth,
   wrapBody,
 } from '../format.js';
+import type { VNode } from '@mscomms/core';
 
 describe('sanitizeForDisplay', () => {
   it('leaves ordinary text alone', () => {
@@ -93,6 +95,85 @@ describe('displayWidth', () => {
     assert.equal(displayWidth('a\uFE0F'), 1);
     assert.equal(displayWidth('a\u200Db'), 2);
   });
+
+  /**
+   * Hand-checked against what a terminal actually draws.
+   *
+   * These are pinned as literal numbers rather than derived from the same table the code
+   * uses, because the bug being guarded against was in that table. Every one of these was
+   * reported as a single column, and every one of them turns up in a corporate subject
+   * line. The fixtures are pure ASCII, so a full suite passed while the real listing wrapped.
+   */
+  it('counts the emoji that actually appear in mail as two columns', () => {
+    const cases: readonly (readonly [string, string, number])[] = [
+      ['check', '\u2705', 2],
+      ['cross', '\u274C', 2],
+      ['rocket', '\u{1F680}', 2],
+      ['green circle', '\u{1F7E2}', 2],
+      ['red circle', '\u{1F534}', 2],
+      ['bandage', '\u{1FA79}', 2],
+      ['sparkles', '\u2728', 2],
+      ['hourglass', '\u231B', 2],
+      ['star', '\u2B50', 2],
+      ['high voltage', '\u26A1', 2],
+    ];
+    for (const [label, char, want] of cases) {
+      assert.equal(displayWidth(char), want, `${label} should be ${String(want)} columns`);
+    }
+  });
+
+  /**
+   * The warning sign is the awkward one, and the reason measuring cannot be done a
+   * codepoint at a time. U+26A0 alone is a narrow text glyph; followed by U+FE0F it is an
+   * emoji and takes two columns. Both forms are common — one comes from a human typing,
+   * the other from anything that emits emoji programmatically.
+   */
+  it('widens a text symbol when the emoji presentation selector follows it', () => {
+    assert.equal(displayWidth('\u26A0'), 1);
+    assert.equal(displayWidth('\u26A0\uFE0F'), 2);
+  });
+
+  it('counts a skin-tone modifier as part of the glyph before it', () => {
+    assert.equal(displayWidth('\u{1F44D}'), 2);
+    assert.equal(displayWidth('\u{1F44D}\u{1F3FD}'), 2);
+  });
+
+  it('measures a whole subject line the way it will be drawn', () => {
+    // 2 + 1 + 4 + 1 + 2 = 10.
+    assert.equal(displayWidth('\u2705 Done \u{1F680}'), 10);
+  });
+});
+
+/**
+ * Truncation has to agree with measurement, because the layout asks one for a budget and
+ * the other to fit it.
+ *
+ * They used to be written as separate loops — one over the whole string, one codepoint at a
+ * time — and they disagreed on exactly the characters that matter. Asking for the width of
+ * `\u26A0` and then of `\uFE0F` gives 1 + 0, while the string as a whole is 2. A row built
+ * on the smaller number runs one column past the edge and wraps.
+ */
+describe('truncateWidth: agreeing with displayWidth', () => {
+  const samples = [
+    '\u2705 Done: Q3 budget approved \u{1F680}',
+    '\u26A0\uFE0F Action required before Friday',
+    '\u{1F7E2} Build green \u2728 shipping now',
+    '\u{1F44D}\u{1F3FD} thanks!',
+    'plain ascii subject line',
+    '\u4E88\u7B97 review \u2705',
+  ];
+
+  for (const sample of samples) {
+    for (const max of [1, 2, 3, 5, 8, 13, 21]) {
+      it(`fits ${JSON.stringify(sample)} into ${String(max)}`, () => {
+        const out = truncateWidth(sample, max);
+        assert.ok(
+          displayWidth(out) <= max,
+          `truncated to ${String(displayWidth(out))} columns for a budget of ${String(max)}: ${JSON.stringify(out)}`,
+        );
+      });
+    }
+  }
 });
 
 describe('padTo and truncateWidth', () => {
@@ -324,4 +405,240 @@ describe('formatRows in announce mode', () => {
     assert.doesNotMatch(out, /Lunch\?\./);
   });
 });
+
+/**
+ * The unread counter on a directory row.
+ *
+ * A folder that maps to a mailbox, a channel or a feed is the one place a number is worth
+ * more than the listing beneath it — it is what decides whether you go in. These pin the
+ * three properties that make it usable: it is a word and not only a digit, it holds its
+ * column, and it never claims a count for a folder that never reported one.
+ */
+describe('formatListing: the unread counter', () => {
+  const opts = { ...DEFAULT_FORMAT, color: false, width: 80 };
+
+  function dir(name: string, extra: Partial<VNode> = {}): VNode {
+    return { name, kind: 'dir', title: name, id: `id-${name}`, ...extra };
+  }
+
+  it('counts unread children on a folder row in the default table', () => {
+    // The count used to require --long, which meant the default listing of a mailbox
+    // showed nothing at all about where the new mail was.
+    const out = formatListing([dir('Inbox', { unreadCount: 3, childCount: 40 })], opts);
+    assert.match(out, /Inbox\/ +3 unread/);
+  });
+
+  it('says "unread" rather than leaving a bare number to be guessed at', () => {
+    const out = formatListing([dir('Newsletters', { unreadCount: 12 })], opts);
+    assert.doesNotMatch(out, /\(12\)/);
+    assert.match(out, /12 unread/);
+  });
+
+  it('marks the folder in the same leading column an unread message uses', () => {
+    // "Is there anything new in here" is the same question one level up, so it gets the
+    // same answer in the same place rather than a second vocabulary.
+    const out = formatListing([dir('Inbox', { unreadCount: 1 })], opts);
+    assert.match(out, /^\s*1\.\s\*\sInbox\//);
+  });
+
+  it('says nothing for a folder with nothing unread', () => {
+    const out = formatListing([dir('Archive', { unreadCount: 0, childCount: 900 })], opts);
+    assert.doesNotMatch(out, /unread/);
+  });
+
+  it('says nothing for a folder whose source does not report the count', () => {
+    // Silence and zero are different claims. A provider that cannot count must not be
+    // made to look like one that counted and found nothing.
+    const out = formatListing([dir('Projects')], opts);
+    assert.doesNotMatch(out, /unread/);
+  });
+
+  it('keeps the counter in one column across rows that differ in magnitude', () => {
+    const out = formatListing(
+      [dir('Inbox', { unreadCount: 3629 }), dir('Junk', { unreadCount: 1 }), dir('Sent')],
+      opts,
+    );
+    const columns = out
+      .split('\n')
+      .filter((line) => line.includes('unread'))
+      .map((line) => line.indexOf('unread'));
+    assert.equal(new Set(columns).size, 1, `counter is ragged: ${out}`);
+  });
+
+  it('does not let the counter push a row past the terminal width', () => {
+    const out = formatListing(
+      [dir('A folder with a rather long and inconvenient name', { unreadCount: 3629, childCount: 4000 })],
+      { ...opts, width: 60, long: true },
+    );
+    for (const line of out.split('\n')) assert.ok(displayWidth(line) <= 60, `too wide: ${line}`);
+  });
+
+  it('spends --long on the total rather than repeating the count', () => {
+    const out = formatListing([dir('Inbox', { unreadCount: 3, childCount: 40 })], { ...opts, long: true });
+    assert.equal(out.match(/unread/g)?.length, 1);
+    assert.match(out, /40 items/);
+  });
+
+  it('carries the count into plain mode, which is what gets piped', () => {
+    const out = formatListing([dir('Inbox', { unreadCount: 3 })], { ...opts, mode: 'plain' });
+    assert.match(out, /Inbox\/\t3 unread/);
+  });
+
+  it('never puts a count on a file, however the provider fills the field in', () => {
+    const out = formatListing(
+      [{ name: 'note.eml', kind: 'file', title: 'note', id: '1', unreadCount: 500 }],
+      opts,
+    );
+    assert.doesNotMatch(out, /unread/);
+  });
+});
+
+
+/**
+ * A row must not be wider than the terminal.
+ *
+ * Reported as: "your right-alignment draws offscreen in different resolutions." The layout
+ * floored the name at 20 columns and let everything to its right run past the edge, which was
+ * survivable while the row was narrow and stopped being survivable the moment the counter
+ * added a column — at 40 columns a row came out 63 wide. A row wider than the terminal wraps,
+ * and a wrapped row turns a scannable list into a paragraph.
+ *
+ * These check the invariant at a spread of widths rather than one, because the failure was
+ * width-dependent and a single 80-column case is exactly what missed it.
+ */
+describe('formatListing: fitting the terminal', () => {
+  /**
+   * A second, deliberately independent ruler.
+   *
+   * The rows below are checked against this rather than against `displayWidth`, because
+   * `displayWidth` is what the layout used to allocate them: if its table undercounts a
+   * character, the row is built too wide *and* measured too narrow, the two errors cancel,
+   * and the assertion passes while the terminal wraps. That is not a hypothetical — it is
+   * how a width bug affecting nine common emoji sat behind a green suite.
+   *
+   * So this covers only the characters these fixtures actually use, and is written from
+   * what a terminal draws rather than from the production table. Two implementations that
+   * agree are evidence; one implementation checking itself is not.
+   */
+  const columnsOf = (text: string): number => {
+    const wide = new Set([0x2705, 0x274c, 0x26a1, 0x2728, 0x2b50, 0x231b, 0x1f680, 0x1f7e2, 0x1f534]);
+    const emojiCapable = new Set([0x26a0]);
+    const chars = [...text];
+    let width = 0;
+    for (let i = 0; i < chars.length; i += 1) {
+      const code = chars[i]?.codePointAt(0) ?? 0;
+      if (code === 0xfe0f || code === 0x200d) continue;
+      const next = chars[i + 1]?.codePointAt(0);
+      const cjk = (code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3040 && code <= 0x30ff);
+      if (wide.has(code) || cjk) width += 2;
+      else if (next === 0xfe0f && emojiCapable.has(code)) width += 2;
+      else width += 1;
+    }
+    return width;
+  };
+
+  const WIDE = new Date('2026-08-11T12:00:00Z');
+  const nodes: readonly VNode[] = [
+    { name: 'Chats', title: 'Chats', kind: 'dir', id: '1', path: '/x/Chats', unreadCount: 3, mtime: WIDE },
+    { name: 'Inbox', title: 'Inbox', kind: 'dir', id: '2', path: '/x/Inbox', unreadCount: 1247, mtime: WIDE },
+    {
+      name: 'A folder with a deliberately very long name that fits nowhere',
+      title: 'A folder with a deliberately very long name that fits nowhere',
+      kind: 'dir',
+      id: '3',
+      path: '/x/long',
+      unreadCount: 9,
+      mtime: WIDE,
+      author: 'Dana Whitfield',
+    },
+    {
+      name: '2026-08-11 FY26 budget review.eml',
+      title: 'FY26 budget review',
+      kind: 'file',
+      id: '4',
+      path: '/x/m.eml',
+      mtime: WIDE,
+      author: 'Tom Okafor',
+      flags: ['unread'],
+    },
+    // Non-ASCII, because every fixture above is ASCII and that is precisely how a width
+    // table that undercounted nine common emoji survived the whole suite. The subject on a
+    // real row is not drawn from the printable ASCII range.
+    {
+      name: '2026-08-11 \u2705 Done: Q3 budget approved \u{1F680}.eml',
+      title: '\u2705 Done: Q3 budget approved \u{1F680}',
+      kind: 'file',
+      id: '5',
+      path: '/x/e.eml',
+      mtime: WIDE,
+      author: 'Lena Bj\u00F6rk',
+      flags: ['unread'],
+    },
+    {
+      name: '\u26A0\uFE0F Escalations',
+      title: '\u26A0\uFE0F Escalations',
+      kind: 'dir',
+      id: '6',
+      path: '/x/esc',
+      unreadCount: 12,
+      mtime: WIDE,
+    },
+    {
+      name: '\u4E88\u7B97\u30EC\u30D3\u30E5\u30FC',
+      title: '\u4E88\u7B97\u30EC\u30D3\u30E5\u30FC',
+      kind: 'dir',
+      id: '7',
+      path: '/x/cjk',
+      unreadCount: 4,
+      mtime: WIDE,
+    },
+  ];
+
+  for (const width of [20, 30, 40, 50, 60, 72, 80, 100, 120]) {
+    it(`never exceeds ${String(width)} columns`, () => {
+      const out = formatListing(nodes, { width, color: false, dateStyle: 'relative', mode: 'table' });
+      for (const line of out.split('\n')) {
+        assert.ok(
+          columnsOf(line) <= width,
+          `row is ${String(columnsOf(line))} columns in a ${String(width)}-column terminal: ${JSON.stringify(line)}`,
+        );
+      }
+    });
+  }
+
+  it('measures rows the same way a terminal will', () => {
+    // The bridge between the two rulers. If they ever disagree the fitting checks above stop
+    // meaning anything, and this is what says so out loud rather than letting them pass.
+    const out = formatListing(nodes, { width: 100, color: false, dateStyle: 'relative', mode: 'table' });
+    for (const line of out.split('\n')) {
+      assert.equal(displayWidth(line), columnsOf(line), `disagreement on ${JSON.stringify(line)}`);
+    }
+  });
+
+  it('keeps the counter at a width where it has to drop the author and the date', () => {
+    // The counter is the last optional column to go, because it is the reason to look at the
+    // row. What gets given up first is the material that says nothing about what is new.
+    const out = formatListing(nodes, { width: 30, color: false, dateStyle: 'relative', mode: 'table' });
+    assert.match(out, /3 unread/);
+    assert.doesNotMatch(out, /Dana Whitfield/);
+  });
+
+  it('shortens the counter rather than dropping it when the room runs out', () => {
+    // `3 unread` becomes `(3)` — the same fact in a third of the room, and the form the pane
+    // already uses at every width, so it is not a new vocabulary either.
+    const narrow: readonly VNode[] = [
+      { name: 'Chats', title: 'Chats', kind: 'dir', id: '1', path: '/x/Chats', unreadCount: 3, mtime: WIDE },
+    ];
+    const out = formatListing(narrow, { width: 24, color: false, dateStyle: 'relative', mode: 'table' });
+    assert.ok(displayWidth(out) <= 24, out);
+    assert.match(out, /\(3\)/);
+  });
+
+  it('still spells the word out when there is room for it', () => {
+    const out = formatListing(nodes, { width: 100, color: false, dateStyle: 'relative', mode: 'table' });
+    assert.match(out, /3 unread/);
+    assert.doesNotMatch(out, /\(3\)/);
+  });
+});
+
 

@@ -15,10 +15,13 @@
 import {
   VfsError,
   timestampPrefix,
+  type ActionDescriptor,
+  type ActionResult,
   type Capability,
   type Document,
   type ListOptions,
   type ListPage,
+  type MetaValue,
   type PollResult,
   type Provider,
   type ProviderContext,
@@ -54,18 +57,51 @@ interface CachedFeed {
   readonly lastModified?: string;
 }
 
+/**
+ * What this mount remembers about a feed between sessions.
+ *
+ * `seen` is the read state, and it is a set of ids for the same reason the poll cursor is:
+ * a distressing number of feeds emit items with no date, with the fetch time as the date,
+ * or with dates that move backwards when an article is edited. Identity is the only field
+ * that behaves.
+ *
+ * `unread` and `total` are the last computed counts, carried so that listing the feeds
+ * themselves can put a number on each row without making N HTTP requests to do it.
+ */
+interface ReadState {
+  readonly seen: ReadonlySet<string>;
+  readonly unread: number;
+  readonly total: number;
+}
+
+/**
+ * How far back read state is tracked, in items.
+ *
+ * It bounds the stored id set, and it also decides the answer to "is this old thing
+ * unread?" — anything past the window counts as read. Both directions of the alternative
+ * are worse: an unbounded set grows forever, and a set truncated without also truncating
+ * the question would make every item that falls out of it unread again.
+ */
+const TRACKED_ITEMS = 500;
+
 const DEFAULT_TIMEOUT = 15_000;
 
 export class RssProvider implements Provider {
   readonly id: string;
   readonly displayName: string;
-  readonly capabilities: ReadonlySet<Capability> = new Set<Capability>(['list', 'read', 'poll']);
+  readonly capabilities: ReadonlySet<Capability> = new Set<Capability>(['list', 'read', 'poll', 'actions']);
 
   readonly #feeds: readonly RssFeedConfig[];
   readonly #single: boolean;
   readonly #options: RssProviderOptions;
   readonly #context: ProviderContext;
   readonly #cache = new Map<string, CachedFeed>();
+  /**
+   * Loaded read state, by feed url. A key present with an `undefined` value means "checked
+   * the store, this feed has never been seen" — which is a different thing from "not
+   * loaded yet", and the difference is what makes the cold start silent exactly once.
+   */
+  readonly #readState = new Map<string, ReadState | undefined>();
 
   constructor(options: RssProviderOptions, context: ProviderContext) {
     this.#options = options;
@@ -85,27 +121,34 @@ export class RssProvider implements Provider {
 
   async list(parent: VNode | null, options: ListOptions): Promise<ListPage> {
     if (parent === null && !this.#single) {
-      const entries: VNode[] = this.#feeds.map((feed) => ({
-        name: feed.name,
-        kind: 'dir' as const,
-        subtype: 'feed',
-        title: feed.name,
-        id: `feed:${feed.url}`,
-        ...(feed.description === undefined ? {} : { summary: feed.description }),
-        meta: { url: feed.url },
-      }));
+      const entries: VNode[] = await Promise.all(
+        this.#feeds.map(async (feed) => {
+          const counts = await this.#counts(feed);
+          return {
+            name: feed.name,
+            kind: 'dir' as const,
+            subtype: 'feed',
+            title: feed.name,
+            id: `feed:${feed.url}`,
+            ...(feed.description === undefined ? {} : { summary: feed.description }),
+            ...(counts === undefined ? {} : { childCount: counts.total, unreadCount: counts.unread }),
+            meta: { url: feed.url },
+          };
+        }),
+      );
       return { entries, total: entries.length };
     }
 
     const config = this.#feedFor(parent);
     const feed = await this.#fetch(config, options.signal);
+    const { unread } = await this.#reconcile(config, feed.items);
     const limit = Math.max(1, Math.min(options.limit ?? 50, 500));
     const offset = parseCursor(options.cursor);
     const items = feed.items.slice(0, this.#options.maxItems ?? 500);
     const slice = items.slice(offset, offset + limit);
 
     return {
-      entries: slice.map((item) => this.#toNode(item, config)),
+      entries: slice.map((item) => this.#toNode(item, config, unread)),
       ...(offset + slice.length < items.length ? { cursor: `rss:${String(offset + slice.length)}` } : {}),
       total: items.length,
     };
@@ -125,6 +168,10 @@ export class RssProvider implements Provider {
         'The feed no longer lists this entry. Feeds usually keep only the most recent items.',
       );
     }
+
+    // Opening an article is what makes it read. Listing a folder is not: a counter that
+    // resets the moment you look at the folder it is attached to counts nothing.
+    await this.#markRead(config, feed.items, [item.id]);
 
     const headers: Array<readonly [string, string]> = [];
     if (item.author !== undefined) headers.push(['Author', item.author]);
@@ -163,14 +210,17 @@ export class RssProvider implements Provider {
   async poll(parent: VNode | null, cursor: string | undefined, options: { signal?: AbortSignal }): Promise<PollResult> {
     const config = this.#feedFor(parent);
     const feed = await this.#fetch(config, options.signal, true);
+    // Polling is also what keeps the counter honest for a feed nobody has opened this
+    // session: `watch` refreshes the stored counts as a side effect of doing its own job.
+    const { unread } = await this.#reconcile(config, feed.items);
 
     const seen = new Set<string>(cursor === undefined ? [] : safeParseIds(cursor));
     const changes = feed.items
       .filter((item) => !seen.has(item.id))
       .map((item) => ({
         type: 'created' as const,
-        path: this.#toNode(item, config).name,
-        node: this.#toNode(item, config),
+        path: this.#toNode(item, config, unread).name,
+        node: this.#toNode(item, config, unread),
         at: item.published ?? new Date(),
       }));
 
@@ -180,9 +230,175 @@ export class RssProvider implements Provider {
     return { changes, cursor: JSON.stringify(ids) };
   }
 
+  /**
+   * The two verbs a feed has.
+   *
+   * Declared honestly, the way every other provider does it: an article you have read does
+   * not offer to mark it read, and a feed with nothing outstanding does not offer to clear
+   * it. Without these the counter would be a number you could only ever lower by opening
+   * every article one at a time.
+   */
+  async actions(node: VNode): Promise<readonly ActionDescriptor[]> {
+    if (node.kind === 'dir') {
+      const config = this.#feedOrUndefined(node);
+      if (config === undefined) return [];
+      const counts = await this.#counts(config);
+      return counts === undefined || counts.unread === 0
+        ? []
+        : [
+            {
+              name: 'mark-all-read',
+              label: `Mark all ${String(counts.unread)} read`,
+              description: 'Clear this feed\u2019s unread counter without opening every article.',
+              group: 'unread',
+              key: 'A',
+            },
+          ];
+    }
+
+    if (typeof node.meta?.['feedUrl'] !== 'string') return [];
+    return node.flags?.includes('unread') === true
+      ? [{ name: 'mark-read', label: 'Mark read', group: 'unread', key: 'm' }]
+      : [{ name: 'mark-unread', label: 'Mark unread', group: 'unread', key: 'm' }];
+  }
+
+  async invoke(action: string, node: VNode, _params: Readonly<Record<string, MetaValue>>): Promise<ActionResult> {
+    const config = this.#feedFor(node);
+    const feed = await this.#fetch(config, undefined);
+
+    switch (action) {
+      case 'mark-all-read': {
+        const { unread } = await this.#reconcile(config, feed.items);
+        const changed = await this.#markRead(config, feed.items, [...unread]);
+        return this.#marked(
+          changed === 0 ? `Nothing was unread in ${config.name}.` : `Marked ${String(changed)} read in ${config.name}.`,
+        );
+      }
+      case 'mark-read': {
+        const changed = await this.#markRead(config, feed.items, [node.id]);
+        return this.#marked(changed === 0 ? `${node.title} was already read.` : `Marked ${node.title} read.`);
+      }
+      case 'mark-unread': {
+        const changed = await this.#markUnread(config, feed.items, [node.id]);
+        return this.#marked(changed === 0 ? `${node.title} was already unread.` : `Marked ${node.title} unread.`);
+      }
+      default:
+        return { ok: false, message: `The feed provider has no "${action}" action.` };
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
+
+  /**
+   * The engine already invalidates the item and its parent, which is not quite enough here:
+   * the counter that just changed is painted one level further up, on the feed's own row.
+   */
+  #marked(message: string): ActionResult {
+    return { ok: true, message, invalidates: [this.#context.mountPath] };
+  }
+
+  /**
+   * What a feed's directory row says, without going near the network.
+   *
+   * `unreadCount` is documented as a hint for a backend that has the number cheaply, and
+   * listing the feeds is the one screen in this provider that costs nothing at all. Turning
+   * it into one HTTP request per feed to decorate the rows would trade the fastest thing
+   * here for a number that is stale five minutes later anyway — and it would mean `ls` of a
+   * feed list failed when the network did. So the count comes from the most recent fetch:
+   * live, if this session has the feed cached, and otherwise from what the last session
+   * wrote down. Opening a feed refreshes it, and so does `watch`.
+   */
+  async #counts(config: RssFeedConfig): Promise<{ readonly unread: number; readonly total: number } | undefined> {
+    const stored = await this.#loadState(config.url);
+    if (stored === undefined) return undefined;
+
+    const cached = this.#cache.get(config.url);
+    if (cached === undefined) return { unread: stored.unread, total: stored.total };
+
+    const tracked = cached.feed.items.slice(0, TRACKED_ITEMS);
+    return {
+      unread: tracked.reduce((count, item) => count + (stored.seen.has(item.id) ? 0 : 1), 0),
+      total: cached.feed.items.length,
+    };
+  }
+
+  /** Read state as stored, or `undefined` for a feed this mount has never fetched. */
+  async #loadState(url: string): Promise<ReadState | undefined> {
+    if (this.#readState.has(url)) return this.#readState.get(url);
+    const parsed = parseReadState(await this.#context.state.get(stateKey(url)));
+    this.#readState.set(url, parsed);
+    return parsed;
+  }
+
+  /**
+   * Reconcile the stored read state against what the feed currently carries.
+   *
+   * The first sight of a feed is recorded silently: a feed you subscribed to this morning
+   * is not forty articles you have failed to read, and the watcher already applies exactly
+   * this rule to its poll cursor for exactly this reason. Everything that arrives after
+   * that first fetch is new.
+   *
+   * Ids that have fallen off the end of the feed are dropped, which is what keeps the
+   * stored set bounded without a separate eviction rule: an item the feed no longer lists
+   * can never be listed again either.
+   */
+  async #reconcile(
+    config: RssFeedConfig,
+    items: readonly FeedItem[],
+  ): Promise<{ readonly state: ReadState; readonly unread: ReadonlySet<string> }> {
+    const ids = items.slice(0, TRACKED_ITEMS).map((item) => item.id);
+    const stored = await this.#loadState(config.url);
+
+    const seen = stored === undefined ? new Set(ids) : new Set(ids.filter((id) => stored.seen.has(id)));
+    const unread = new Set(ids.filter((id) => !seen.has(id)));
+    return { state: await this.#save(config.url, { seen, unread: unread.size, total: items.length }), unread };
+  }
+
+  async #markRead(config: RssFeedConfig, items: readonly FeedItem[], ids: readonly string[]): Promise<number> {
+    const { state, unread } = await this.#reconcile(config, items);
+    const marked = ids.filter((id) => unread.has(id));
+    if (marked.length === 0) return 0;
+
+    const seen = new Set(state.seen);
+    for (const id of marked) seen.add(id);
+    await this.#save(config.url, { seen, unread: unread.size - marked.length, total: state.total });
+    return marked.length;
+  }
+
+  async #markUnread(config: RssFeedConfig, items: readonly FeedItem[], ids: readonly string[]): Promise<number> {
+    const { state, unread } = await this.#reconcile(config, items);
+    const tracked = new Set(items.slice(0, TRACKED_ITEMS).map((item) => item.id));
+    const marked = ids.filter((id) => tracked.has(id) && !unread.has(id));
+    if (marked.length === 0) return 0;
+
+    const seen = new Set(state.seen);
+    for (const id of marked) seen.delete(id);
+    await this.#save(config.url, { seen, unread: unread.size + marked.length, total: state.total });
+    return marked.length;
+  }
+
+  /** Write read state through the in-memory copy, skipping the disk write when nothing moved. */
+  async #save(url: string, next: ReadState): Promise<ReadState> {
+    const previous = this.#readState.get(url);
+    this.#readState.set(url, next);
+    if (previous !== undefined && previous.unread === next.unread && previous.total === next.total && sameIds(previous.seen, next.seen)) {
+      return next;
+    }
+
+    try {
+      await this.#context.state.set(
+        stateKey(url),
+        JSON.stringify({ seen: [...next.seen], unread: next.unread, total: next.total }),
+      );
+    } catch (error) {
+      // Read state is a convenience, not the data. A store that will not write must not
+      // take a feed listing down with it.
+      this.#context.logger.warn('could not persist feed read state', { url, error: String(error) });
+    }
+    return next;
+  }
 
   #feedFor(parent: VNode | null): RssFeedConfig {
     if (parent === null) {
@@ -192,16 +408,25 @@ export class RssProvider implements Provider {
       }
       return first;
     }
-    const url = parent.meta?.['url'] ?? parent.meta?.['feedUrl'];
-    const found = typeof url === 'string' ? this.#feeds.find((f) => f.url === url) : undefined;
+    const found = this.#feedOrUndefined(parent);
     if (found !== undefined) return found;
-    if (typeof url === 'string') return { name: parent.title, url };
     throw VfsError.notDirectory(parent.path ?? parent.name);
   }
 
-  #toNode(item: FeedItem, config: RssFeedConfig): VNode {
+  /** The feed a node belongs to, whether it is the feed's own directory or an article in it. */
+  #feedOrUndefined(node: VNode): RssFeedConfig | undefined {
+    const url = node.meta?.['url'] ?? node.meta?.['feedUrl'];
+    if (typeof url !== 'string') return undefined;
+    return this.#feeds.find((feed) => feed.url === url) ?? { name: node.title, url };
+  }
+
+  #toNode(item: FeedItem, config: RssFeedConfig, unread: ReadonlySet<string>): VNode {
     const date = item.published;
     const prefix = date === undefined ? '' : `${timestampPrefix(date)} `;
+    const flags = [
+      ...(unread.has(item.id) ? ['unread'] : []),
+      ...(item.enclosures.length > 0 ? ['attachment'] : []),
+    ];
     return {
       name: `${prefix}${item.title}.txt`,
       kind: 'file',
@@ -212,7 +437,7 @@ export class RssProvider implements Provider {
       size: Buffer.byteLength(item.content, 'utf8'),
       ...(item.summary.length === 0 ? {} : { summary: item.summary }),
       ...(item.author === undefined ? {} : { author: item.author }),
-      ...(item.enclosures.length > 0 ? { flags: ['attachment'] } : {}),
+      ...(flags.length === 0 ? {} : { flags }),
       meta: {
         feedUrl: config.url,
         feed: config.name,
@@ -315,6 +540,40 @@ function safeParseIds(cursor: string): string[] {
   } catch {
     return [];
   }
+}
+
+function stateKey(url: string): string {
+  return `rss:read:${url}`;
+}
+
+/**
+ * Parse stored read state, treating anything unrecognizable as "never seen".
+ *
+ * The cost of getting this wrong in the lenient direction is one silent catch-up; the cost
+ * of throwing is a feed that cannot be listed because of a corrupt cache entry.
+ */
+function parseReadState(raw: string | undefined): ReadState | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const record = parsed as Record<string, unknown>;
+    if (!Array.isArray(record['seen'])) return undefined;
+    const seen = new Set(record['seen'].filter((id): id is string => typeof id === 'string'));
+    return {
+      seen,
+      unread: typeof record['unread'] === 'number' ? record['unread'] : 0,
+      total: typeof record['total'] === 'number' ? record['total'] : seen.size,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameIds(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const id of a) if (!b.has(id)) return false;
+  return true;
 }
 
 export const rssPlugin: ProviderPlugin<RssProviderOptions> = {
