@@ -174,7 +174,7 @@ asks once and records the answer.
 ```sh
 git clone https://github.com/MSFT-TKENDRICK/MS-COMMS-TUI
 cd MS-COMMS-TUI
-npm run setup   # npm install (devDependencies only: TypeScript) + npm run build
+npm run setup   # npm install + npm run build
 npm link        # optional: puts `mscomms` and `msh` on your PATH
 ```
 
@@ -387,6 +387,12 @@ touching the shell.
   by typing. Nothing irreversible happens without a confirmation you have to answer.
 - **Colour is never information.** Anything shown in colour is also stated in words.
 - **`--announce`** renders listings as spoken sentences instead of aligned columns.
+- **Speak to it, if you want.** `voice on` turns on speech control. It produces the same
+  command lines you would have typed — so everything it does lands in `history`, obeys the
+  same confirmations, and comes back with `undo`. See [docs/VOICE.md](docs/VOICE.md).
+- **Everything is undoable.** `undo` reverses your last change, whether it came from a typed
+  command, an arrow key or your voice. `history` shows what happened and which of those it
+  was. Undo stops at anything it cannot reverse and says so, rather than skipping past it.
 - **stdout is data, stderr is chrome.** Prompts, banners, status lines and paging footers
   go to stderr, so `mscomms find -q is:unread --json | jq` works.
 
@@ -461,6 +467,7 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every config key, every built-in provider's options |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | Writing a backend, in TypeScript or any other language |
 | [docs/PROJECTIONS.md](docs/PROJECTIONS.md) | Reorganizing your tree with a GraphQL query over every source |
+| [docs/VOICE.md](docs/VOICE.md) | Speaking to it, and why every interaction is undoable |
 | [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md) | The reasoning behind the interface decisions |
 | [docs/PRIOR-ART.md](docs/PRIOR-ART.md) | What twenty-odd earlier projects got right and wrong |
 
@@ -469,9 +476,9 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 Working and tested: the VFS engine, the query language (including Lucene syntax and
 relevance ranking), cross-source search, cache, the local Turso snapshot with background
 sync, predictive prefetching and vector search, notifications, the line shell, tab
-completion, the opt-in full-screen pane (`--tui`), the graph model, the mapping surface,
-GraphQL projections, and the memory, RSS, GitHub, Graph, Azure DevOps and exec providers.
-1607 tests.
+completion, the opt-in full-screen pane (`--tui`), the interaction journal and undo, voice
+control, the graph model, the mapping surface, GraphQL projections, and the memory, RSS,
+GitHub, Graph, Azure DevOps and exec providers. 1607 tests.
 
 Exercised end-to-end against live data: RSS (over HTTP), GitHub (against the public API),
 and the exec plugin protocol (against a Python plugin). The Graph providers have been
@@ -479,7 +486,10 @@ exercised against the API shape but not against every tenant configuration; if y
 blocks the default public client, set `clientId` in the mount options.
 
 Not done: offline-first sync. The full-screen pane has been tested against synthetic
-terminals rather than every real one.
+terminals rather than every real one. Voice has been exercised end to end through
+`voice say`, which covers everything except the microphone and the transcription service;
+the grammar, journal, confirmation and undo paths are all tested, but the hosted
+transcription endpoints have not been run against a live tenant.
 
 ## Licence
 

@@ -3,10 +3,10 @@
  *
  * Discussions and Projects v2 exist only on GitHub's GraphQL API — there is no REST
  * equivalent to fall back to — so these queries are load-bearing rather than an
- * optimization. They are written out as plain strings for the same reason the rest of this
- * repository has no runtime dependencies: a query builder would be a package, and a package
- * is a supply-chain risk taken on by a program that reads corporate mail. A string is a
- * string, and it is exactly as readable as the query it sends.
+ * optimization. They are written out as plain strings because a query builder would add a
+ * layer to read through without removing one: a string is exactly as readable as the query
+ * it sends, and it is what you paste into GitHub's GraphQL explorer when a result surprises
+ * you.
  *
  * Three things are deliberate and worth not "tidying up" later:
  *

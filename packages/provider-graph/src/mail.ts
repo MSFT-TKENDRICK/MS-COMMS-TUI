@@ -40,6 +40,7 @@ import {
 import type { GraphApi, GraphPage } from './client.js';
 import {
   createClient,
+  GRAPH_SHARED_OPTION_KEYS,
   htmlToText,
   preview,
   validateSharedOptions,
@@ -658,6 +659,7 @@ export const graphMailPlugin: ProviderPlugin<GraphMailOptions> = {
   type: 'graph-mail',
   displayName: 'Outlook mail (Microsoft Graph)',
   description: 'Mail folders as directories and messages as files, read-only by default.',
+  optionKeys: [...GRAPH_SHARED_OPTION_KEYS, 'includeHiddenFolders', 'pageSize'],
   validateOptions(raw) {
     validateSharedOptions(raw);
     return (raw ?? {}) as GraphMailOptions;

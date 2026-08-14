@@ -151,28 +151,42 @@ describe('validateConfig', () => {
     assert.deepEqual(config.mounts[0]?.options, options);
   });
 
-  it('rejects an unknown top-level setting instead of ignoring it', () => {
-    // The failure mode this prevents is silent: a user writes "savedQueries", gets no
-    // error and no saved queries, and cannot tell a typo from a broken feature.
-    assert.throws(
-      () => validateConfig({ ...minimal, savedQueries: [{ name: 'unread', query: 'is:unread' }] }),
-      (error: unknown) =>
-        error instanceof VfsError && error.code === 'ECONFIG' && /savedQueries/.test(error.message),
-    );
+  it('reports an unknown top-level setting without throwing the rest of the file away', () => {
+    // Two failure modes, and this has to avoid both. Silently dropping "savedQueries" leaves
+    // a user unable to tell a typo from a broken feature. But refusing the file outright is
+    // worse than it sounds: one stale key took every mount with it, so a machine with four
+    // working sources reported that it had none — and `doctor`, the command that exists to
+    // explain that, died on the same error.
+    const config = validateConfig({
+      ...minimal,
+      mounts: [{ path: '/f', type: 'rss', options: { url: 'https://example.com/feed.xml' } }],
+      savedQueries: [{ name: 'unread', query: 'is:unread' }],
+    });
+    assert.equal(config.mounts.length, 1, 'the rest of the config still loads');
+    assert.equal(config.warnings?.length, 1);
+    assert.match(config.warnings?.[0] ?? '', /savedQueries/);
   });
 
   it('suggests the right setting when the key is a near miss', () => {
-    assert.throws(
-      () => validateConfig({ mount: [] }),
-      (error: unknown) => error instanceof VfsError && /mounts/.test(error.hint ?? ''),
-    );
+    const config = validateConfig({ mount: [] });
+    assert.match(config.warnings?.[0] ?? '', /Did you mean "mounts"/);
   });
 
   it('lists the known settings when the key is not close to anything', () => {
-    assert.throws(
-      () => validateConfig({ enableTelemetryPlease: true }),
-      (error: unknown) => error instanceof VfsError && /mounts/.test(error.hint ?? ''),
-    );
+    const config = validateConfig({ enableTelemetryPlease: true });
+    assert.match(config.warnings?.[0] ?? '', /mounts/);
+  });
+
+  it('names every unknown setting, not just the first one', () => {
+    // A user who has two stale keys should learn that in one pass rather than one per run.
+    const config = validateConfig({ ...minimal, snapshot: {}, telemetry: true });
+    assert.equal(config.warnings?.length, 2);
+  });
+
+  it('says nothing when every setting is known', () => {
+    // The warning list has to stay empty in the ordinary case, or the startup line that
+    // prints it becomes noise everyone learns to scroll past.
+    assert.equal(validateConfig({ ...minimal }).warnings, undefined);
   });
 
   it('allows a $schema key so editors can offer completion', () => {
@@ -212,6 +226,40 @@ describe('validateConfig', () => {
     // A first run with an empty config should start and say so, not refuse to launch.
     const config = validateConfig({});
     assert.deepEqual(config.mounts, []);
+  });
+
+  it('accepts every voice engine the program offers, including the default', () => {
+    // This rejected "mai" while `starter-config.ts` recommended it and the docs named it as
+    // the default — so copying the program's own example into a config file made the program
+    // refuse to start. Enumerated here rather than spot-checked, because the failure was a
+    // list in one file drifting from a list in another.
+    for (const engine of ['mai', 'foundry', 'azure-speech', 'openai', 'xai', 'command']) {
+      assert.equal(validateConfig({ ...minimal, voice: { engine } }).voice.engine, engine);
+    }
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { engine: 'whisper' } }),
+      (error: unknown) => error instanceof VfsError && error.message.includes('whisper'),
+    );
+  });
+
+  it('refuses push-to-talk settings a config file cannot mean', () => {
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { pushToTalk: 'hodl' } }),
+      (error: unknown) => error instanceof VfsError && error.message.includes('hodl'),
+    );
+    // Negative is not a slower stop, it is a stop in the past.
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { releaseDelayMs: -1 } }),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+    assert.throws(
+      () => validateConfig({ ...minimal, voice: { releaseDelayMs: 'soon' } }),
+      (error: unknown) => error instanceof VfsError && error.code === 'ECONFIG',
+    );
+    assert.equal(validateConfig({ ...minimal, voice: { releaseDelayMs: 0 } }).voice.releaseDelayMs, 0);
+    for (const mode of ['auto', 'hold', 'toggle']) {
+      assert.equal(validateConfig({ ...minimal, voice: { pushToTalk: mode } }).voice.pushToTalk, mode);
+    }
   });
 });
 

@@ -200,6 +200,32 @@ export interface BuiltMount {
   readonly mount?: Mount;
   readonly config: MountConfig;
   readonly error?: VfsError;
+  /**
+   * Options this mount was given that its provider does not read.
+   *
+   * A mount that quietly ignores half its configuration is the most expensive kind of wrong,
+   * because the file says one thing and the program does another and neither ever mentions
+   * it. The option is reported, not rejected: it is not worth losing a working source over,
+   * and the person who wrote it is the one who can decide whether it was a typo or a
+   * leftover from a setting that has since been renamed.
+   */
+  readonly ignoredOptions?: readonly string[];
+}
+
+/**
+ * Which of a mount's options the provider will never look at.
+ *
+ * Opt-in on purpose. A plugin that has not declared `optionKeys` gets an empty answer rather
+ * than a guess, because plugins are allowed to take open-ended options — an RSS mount can
+ * carry arbitrary nested structure — and inventing complaints about valid config would be the
+ * same failure as staying silent about invalid config, just louder.
+ */
+function unreadOptions(plugin: ProviderPlugin<unknown>, raw: unknown): readonly string[] {
+  const declared = plugin.optionKeys;
+  if (declared === undefined) return [];
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return [];
+  const known = new Set<string>(declared);
+  return Object.keys(raw as Record<string, unknown>).filter((key) => !known.has(key));
 }
 
 /**
@@ -238,8 +264,11 @@ export async function buildMounts(
       const provider: Provider = await plugin.create(validated, context);
       if (provider.init !== undefined) await provider.init();
 
+      const ignoredOptions = unreadOptions(plugin, rawOptions);
+
       results.push({
         config,
+        ...(ignoredOptions.length === 0 ? {} : { ignoredOptions }),
         mount: {
           path: config.path,
           id: mountId,

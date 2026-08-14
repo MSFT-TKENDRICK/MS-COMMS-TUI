@@ -52,6 +52,24 @@ export interface GraphSharedOptions {
 const authenticators = new Map<string, DeviceCodeAuthenticator>();
 
 /**
+ * The shared option names, listed once so each plugin can declare what it actually reads.
+ *
+ * Kept beside the interface rather than derived from it because TypeScript interfaces do not
+ * survive to runtime, and a list that drifts from the type is worse than no list — it would
+ * warn about options that work.
+ */
+export const GRAPH_SHARED_OPTION_KEYS = [
+  'clientId',
+  'tenantId',
+  'authority',
+  'baseUrl',
+  'scopes',
+  'timeoutMs',
+  'transport',
+  'mcp',
+] as const;
+
+/**
  * Identity of a non-Graph resource reusing this sign-in flow.
  *
  * Kept out of `GraphSharedOptions` on purpose: these are properties of the *resource*, not

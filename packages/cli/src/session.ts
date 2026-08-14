@@ -17,7 +17,9 @@ import { dirname, join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import {
   BackgroundSync,
+  ChangeBus,
   FileStateStore,
+  Journal,
   Notifier,
   PluginRegistry,
   SnapshotStore,
@@ -28,20 +30,29 @@ import {
   openSqlDriver,
   parseQuery,
   resolveAppPaths,
+  reversalFor,
   stateFileFor,
   vpath,
   agentFsDatabase,
   loadAgentFs,
+  type ActionResult,
   type AppConfig,
   type AppPaths,
   type BuiltMount,
+  type JournalEntry,
+  type JournalTarget,
   type Logger,
+  type MetaValue,
+  type SessionEvent,
+  type SessionListener,
   type ToolCallsLike,
   type VNode,
   type VfsTarget,
+  type VoiceConfig,
 } from '@mscomms/core';
 import { closeAllMcpClients } from '@mscomms/provider-graph';
 import { DEFAULT_FORMAT, type FormatOptions, type OutputMode } from './format.js';
+import { DEFAULT_TALK_KEY, PLAIN_KEY_CONFLICT, describeTalkKey, parseTalkKey, talkKeyConflict } from './tui/keyboard.js';
 import { StartupTasks, type TaskOutcome, type TaskResult } from './startup.js';
 
 /**
@@ -95,6 +106,27 @@ export interface LastListing {
   readonly long?: boolean;
 }
 
+/**
+ * What the session needs to know about voice, and no more.
+ *
+ * A structural interface rather than an import of `VoiceService`, so the dependency runs one
+ * way only: voice knows about sessions, sessions do not know about microphones. It also keeps
+ * the one-shot CLI and the tests free of any of it.
+ */
+export interface VoiceLink {
+  readonly enabled: boolean;
+  readonly listening: boolean;
+  readonly continuous: boolean;
+  listenOnce(): Promise<unknown>;
+  listenContinuously(): Promise<void>;
+  stop(): void;
+  disable(): void;
+  describe(): string;
+}
+
+/** `VoiceConfig` with the readonly modifiers removed, for the session's live copy. */
+type MutableVoiceConfig = { -readonly [K in keyof VoiceConfig]: VoiceConfig[K] };
+
 export class Session {
   readonly config: AppConfig;
   readonly registry: PluginRegistry;
@@ -103,6 +135,16 @@ export class Session {
   readonly vfs: Vfs;
   readonly notifier: Notifier;
   readonly watcher: Watcher;
+  /**
+   * Every interaction, in order, with its inverse where it has one.
+   *
+   * Public because the journal is a feature, not bookkeeping: `history` prints it, `undo`
+   * walks it, and the voice layer reads the last entry back to the user to confirm what
+   * it heard.
+   */
+  readonly journal: Journal;
+  /** How the view learns that something changed. See {@link subscribe}. */
+  readonly #bus = new ChangeBus();
 
   /** The local snapshot, once opened. Undefined when caching is off or unavailable. */
   snapshot: SnapshotStore | undefined;
@@ -155,6 +197,14 @@ export class Session {
   brokenMounts: readonly BuiltMount[] = [];
 
   /**
+   * Mount options that were configured but are read by nothing. Surfaced by `doctor`.
+   *
+   * A mount that starts fine but ignores part of its config is not broken enough to fail and
+   * not harmless enough to hide.
+   */
+  mountWarnings: readonly string[] = [];
+
+  /**
    * What startup is doing, for anything that wants to show it or wait for it.
    *
    * Public because both interfaces read it directly: the pane draws it on the status line,
@@ -179,11 +229,179 @@ export class Session {
   /** Set by `quit`; the REPL checks it after each command. */
   exiting = false;
 
+  /**
+   * Where an interaction is arriving from.
+   *
+   * Set by whichever interface is driving — the pane sets `tui`, the voice controller sets
+   * `voice` — so a journal entry records how it happened as well as what happened. That
+   * matters for one specific question a user will ask after a surprise: "did I type that,
+   * or did it mishear me?"
+   */
+  source: JournalEntry['source'] = 'shell';
+
+  /**
+   * Voice input, once somebody has turned it on.
+   *
+   * Attached rather than constructed, because a session is also what the one-shot CLI and
+   * the tests use, and neither should carry a microphone around. `voice on` puts it here;
+   * everything else just checks whether it is present.
+   */
+  voice: VoiceLink | undefined;
+
+  /**
+   * The voice settings in force, seeded from the config file and changeable during the run.
+   *
+   * The session owns these rather than the voice service, for two reasons. `set voice.x`
+   * has to work before anything has turned a microphone on — otherwise the advice in the
+   * confirmation error ("set voice.autoRun to true") would only be usable after the point
+   * where you needed it. And the controller holds this same object and re-reads it for each
+   * utterance, so a change takes effect on the next thing said rather than requiring the
+   * microphone to be torn down and rebuilt mid-sentence.
+   */
+  readonly voiceSettings: MutableVoiceConfig;
+
+  /**
+   * Change one voice setting for the rest of this session.
+   *
+   * Returns the sentence to show. Throws, with the reason, for a name or value it cannot
+   * take — including `apiKey`, which is refused on purpose: a key typed at a prompt lands
+   * in scrollback and shell history, which is the whole reason config holds a
+   * `${env:NAME}` reference instead of a key.
+   */
+  setVoiceOption(name: string, value: string): string {
+    const key = name.trim();
+    const settings = this.voiceSettings;
+
+    switch (key) {
+      case 'apiKey':
+        throw new Error(
+          'voice.apiKey cannot be set here — a key typed at a prompt ends up in scrollback and shell history. Put "apiKey": "${env:NAME}" in the config file and export the variable it names.',
+        );
+
+      case 'autoRun':
+      case 'speak':
+      case 'phraseBias':
+      case 'enabled': {
+        const parsed = parseOnOff(value);
+        if (parsed === undefined) throw new Error(`voice.${key} is on or off, not "${value}".`);
+        settings[key] = parsed;
+        return `voice.${key} is ${parsed ? 'on' : 'off'} for this session.`;
+      }
+
+      case 'maxSeconds': {
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds) || seconds <= 0) {
+          throw new Error('voice.maxSeconds is a number of seconds greater than zero.');
+        }
+        settings.maxSeconds = seconds;
+        return `voice.maxSeconds is ${String(seconds)} for this session.`;
+      }
+
+      case 'mode': {
+        if (value !== 'push' && value !== 'continuous') throw new Error('voice.mode is "push" or "continuous".');
+        if (value === 'continuous' && settings.wakeWord === undefined) {
+          throw new Error('Continuous listening needs a wake word first: `set voice.wakeWord <word>`.');
+        }
+        settings.mode = value;
+        return `voice.mode is ${value} for this session.`;
+      }
+
+      case 'engine': {
+        const engines = ['mai', 'foundry', 'azure-speech', 'openai', 'xai', 'command'] as const;
+        if (!engines.includes(value as (typeof engines)[number])) {
+          throw new Error(`voice.engine is one of: ${engines.join(', ')}.`);
+        }
+        settings.engine = value as (typeof engines)[number];
+        return `voice.engine is ${value} for this session.`;
+      }
+
+      case 'pushToTalk': {
+        const modes = ['auto', 'hold', 'toggle'] as const;
+        if (!modes.includes(value as (typeof modes)[number])) {
+          throw new Error('voice.pushToTalk is "auto", "hold" or "toggle".');
+        }
+        settings.pushToTalk = value as (typeof modes)[number];
+        return `voice.pushToTalk is ${value} for this session.`;
+      }
+
+      case 'releaseDelayMs': {
+        const ms = Number(value);
+        if (!Number.isFinite(ms) || ms < 0) {
+          throw new Error('voice.releaseDelayMs is a number of milliseconds, zero or more.');
+        }
+        settings.releaseDelayMs = ms;
+        return `voice.releaseDelayMs is ${String(ms)} for this session.`;
+      }
+
+      case 'talkKey': {
+        // Validated here rather than at first press, because a key that cannot be parsed
+        // fails by doing nothing at all — the worst way for a settings mistake to show up.
+        if (value === '') {
+          delete settings.talkKey;
+          return `voice.talkKey is back to ${describeTalkKey(DEFAULT_TALK_KEY)} for this session.`;
+        }
+        const spec = parseTalkKey(value);
+        if (spec === undefined) {
+          const conflict = talkKeyConflict(value);
+          if (conflict !== undefined) {
+            // Two different mistakes, two different fixes. Telling someone who typed `t` to
+            // pick another key sends them to `v`, then `b`, each failing identically.
+            const advice =
+              conflict === PLAIN_KEY_CONFLICT
+                ? `Add a modifier — ${value} on its own is fine as ctrl+${value} or alt+${value}.`
+                : 'Pick another key.';
+            throw new Error(
+              `${value} cannot be the talk key: a terminal sends it as ${conflict}, so the two cannot be told apart. ${advice}`,
+            );
+          }
+          throw new Error(
+            `I cannot read "${value}" as a key. Write it like ctrl+space, ctrl+t or alt+v — one modifier and one key.`,
+          );
+        }
+        settings.talkKey = value;
+        return `voice.talkKey is ${describeTalkKey(spec)} for this session. It applies to the next pane you open.`;
+      }
+
+      case 'recorder':
+      case 'device':
+      case 'wakeWord':
+      case 'language':
+      case 'endpoint':
+      case 'model':
+      case 'command':
+        // Clearing matters as much as setting: `set voice.device ""` is how somebody undoes
+        // a guess that stopped the microphone working, without restarting the program.
+        if (value === '') {
+          delete settings[key];
+          return `voice.${key} is back to its default for this session.`;
+        }
+        settings[key] = value;
+        return `voice.${key} is "${value}" for this session.`;
+
+      default:
+        throw new Error(
+          `There is no voice setting called "${key}". Try autoRun, speak, phraseBias, recorder, device, wakeWord, mode, language, maxSeconds, engine, endpoint, model, pushToTalk, talkKey or releaseDelayMs.`,
+        );
+    }
+  }
+
+  /**
+   * Ask the user a yes/no question.
+   *
+   * Replaced by whichever interface is driving: the REPL asks at the prompt, the pane draws
+   * a confirmation line. The default refuses, which is the correct answer for a script — a
+   * non-interactive run that silently answers "yes" on the user's behalf is how an unattended
+   * job deletes mail.
+   */
+  confirm: (question: string) => Promise<boolean> = () => Promise.resolve(false);
+
   constructor(options: SessionOptions) {
     this.config = options.config;
     this.registry = options.registry;
     this.logger = options.logger;
     this.paths = options.paths ?? resolveAppPaths();
+    this.journal = new Journal();
+    this.voiceSettings = { ...options.config.voice };
     if (options.write !== undefined) this.#base = { ...this.#base, out: options.write };
     if (options.writeError !== undefined) this.#base = { ...this.#base, err: options.writeError };
 
@@ -386,11 +604,18 @@ export class Session {
     });
 
     const broken: BuiltMount[] = [];
+    const ignored: string[] = [];
     for (const result of built) {
       if (result.mount !== undefined) this.vfs.mount(result.mount);
       else broken.push(result);
+      for (const option of result.ignoredOptions ?? []) {
+        ignored.push(
+          `Mount "${result.config.path}" (${result.config.type}) does not use the option "${option}", so it has no effect.`,
+        );
+      }
     }
     this.brokenMounts = broken;
+    this.mountWarnings = ignored;
 
     // The cwd defaults to the only mount when there is exactly one. Landing in a root
     // that contains a single directory and making the user `cd` into it is pure ceremony.
@@ -399,9 +624,15 @@ export class Session {
 
     const working = mounts.length;
     const counted = working === 0 ? 'no sources' : `${String(working)} source${working === 1 ? '' : 's'}`;
-    return broken.length === 0
-      ? counted
-      : `${counted}, ${String(broken.length)} unavailable`;
+    const parts = [counted];
+    if (broken.length > 0) parts.push(`${String(broken.length)} unavailable`);
+    // Counted here rather than written out. Startup no longer has a place to print in front
+    // of the user, and a setting that does nothing is a `doctor` question anyway: the count
+    // is what says "go look", and `doctor` names each one.
+    if (ignored.length > 0) {
+      parts.push(`${String(ignored.length)} setting${ignored.length === 1 ? '' : 's'} ignored`);
+    }
+    return parts.join(', ');
   }
 
   async #startWatches(): Promise<string> {
@@ -627,6 +858,11 @@ export class Session {
 
   setListing(listing: LastListing): void {
     this.lastListing = listing;
+    // The numbering is shared state between the shell, the completer and the pane, so a
+    // change to it is a change the view has to know about: the pane's selection is an
+    // index into this, and an index into a listing that has been replaced underneath is
+    // how `cat 3` opens the wrong message.
+    this.emit({ kind: 'listing', path: listing.path });
   }
 
   /** Resolve positional argument `index` as a path, defaulting to the cwd. */
@@ -654,6 +890,220 @@ export class Session {
     // something from a directory the user has left, which is the kind of bug that erodes
     // trust in the whole numbering scheme.
     this.lastListing = undefined;
+  }
+
+  // -------------------------------------------------------------------------
+  // Interactions
+  //
+  // Everything below is the funnel. A VFS interaction that does not pass through one of
+  // these methods is invisible to `history`, impossible to `undo`, and silent to the
+  // pane — which is to say it is a bug, not a shortcut. See core/journal.ts.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Subscribe to state changes.
+   *
+   * The pane uses this to stay in step with the shell. Before it existed, the two halves
+   * of the interface each kept their own idea of the current folder and reconciled them
+   * by hand in exactly the places somebody remembered to — so `:cd` moved both, an action
+   * invoked from `:do` moved neither, and the list kept showing a message that had just
+   * been archived. Pushing the change out from the one place that makes it removes the
+   * opportunity to forget.
+   */
+  subscribe(listener: SessionListener): () => void {
+    return this.#bus.subscribe(listener);
+  }
+
+  emit(event: SessionEvent): void {
+    this.#bus.emit(event);
+  }
+
+  /**
+   * Move to a folder, and record it.
+   *
+   * `command` is the line that would repeat the move. It is a parameter rather than
+   * something derived from the path because the honest answer differs by route: the pane's
+   * arrow key really is `cd Inbox`, but `back` is `back`, and a journal that rewrote every
+   * move as an absolute `cd` would be a log of somewhere the user never typed.
+   */
+  navigate(path: string, options: { readonly command?: string; readonly reason?: string } = {}): void {
+    const from = this.cwd;
+    if (from === path) return;
+    this.setCwd(path);
+
+    this.journal.record({
+      kind: 'navigate',
+      command: options.command ?? `cd ${quoteIfNeeded(path)}`,
+      summary: `Moved to ${path}`,
+      source: this.source,
+      target: { path },
+      // Navigation is always reversible, and its inverse is the only one in the system the
+      // engine can compute for itself: go back to where we were.
+      reversal: { kind: 'navigate', path: from },
+    });
+
+    this.#bus.emit({ kind: 'cwd', path, reason: options.reason ?? 'navigate' });
+    this.#bus.emit({ kind: 'journal', summary: `Moved to ${path}` });
+  }
+
+  /**
+   * Move back along the visited trail, without extending it.
+   *
+   * `back` differs from `cd` in exactly one way, and it is the way that matters: it must
+   * not push the folder it is leaving onto the trail it is walking. Sharing `navigate`
+   * here made `back` oscillate between two folders forever rather than retracing the
+   * route, which is the sort of thing that looks like a working feature until somebody
+   * presses it three times.
+   */
+  stepBackTo(path: string): void {
+    const from = this.cwd;
+    this.cwd = path;
+    this.lastListing = undefined;
+
+    this.journal.record({
+      kind: 'navigate',
+      command: 'back',
+      summary: `Went back to ${path}`,
+      source: this.source,
+      target: { path },
+      reversal: { kind: 'navigate', path: from },
+    });
+
+    this.emit({ kind: 'cwd', path, reason: 'back' });
+    this.emit({ kind: 'journal', summary: `Went back to ${path}` });
+  }
+
+  /**
+   * Run a provider action, record it with the inverse the provider named, and tell the
+   * view what went stale.
+   *
+   * The three happen together on purpose. An action that mutates without recording cannot
+   * be undone; one that records without emitting leaves the pane showing the old state;
+   * one that emits without recording produces a screen the user cannot explain. They are
+   * one operation, so they live in one method.
+   */
+  async runAction(
+    action: string,
+    target: VfsTarget,
+    params: Readonly<Record<string, MetaValue>> = {},
+    options: { readonly command?: string } = {},
+  ): Promise<ActionResult> {
+    const path = Session.pathOf(target);
+    const node = typeof target === 'string' ? undefined : target;
+    const journalTarget: JournalTarget = {
+      path,
+      ...(node?.id === undefined ? {} : { id: node.id }),
+      ...(node?.name === undefined ? {} : { name: node.name }),
+    };
+
+    const result = await this.vfs.invoke(action, target, params);
+
+    const reversal = reversalFor(journalTarget, result.undo);
+    this.journal.record({
+      kind: 'mutate',
+      command: options.command ?? `do ${action} ${quoteIfNeeded(path)}`,
+      summary: result.message,
+      source: this.source,
+      target: journalTarget,
+      ...(reversal === undefined ? {} : { reversal }),
+      ...(reversal === undefined
+        ? {
+            irreversible: `"${result.message}" cannot be undone: ${node?.name ?? path} did not report a way back.`,
+          }
+        : {}),
+    });
+
+    const stale = [path, vpath.dirname(path), ...(result.invalidates ?? [])].filter((entry) => entry !== '');
+    this.#bus.emit({ kind: 'mutated', paths: stale, message: result.message });
+    this.#bus.emit({ kind: 'journal', summary: result.message });
+    return result;
+  }
+
+  /**
+   * Record a read-only interaction.
+   *
+   * Nothing to reverse, so nothing goes on the undo stack — but it is still logged,
+   * because "what did I just do?" is a question a screen reader user cannot answer by
+   * glancing back up the screen, and `history` is the answer.
+   */
+  noteRead(command: string, summary: string, target?: JournalTarget): void {
+    this.journal.record({
+      kind: 'read',
+      command,
+      summary,
+      source: this.source,
+      ...(target === undefined ? {} : { target }),
+    });
+  }
+
+  /**
+   * Undo the most recent reversible interaction.
+   *
+   * Performs the reversal itself rather than handing it back, because only the session
+   * holds both halves — the VFS to invoke against and the journal to commit to — and
+   * splitting them across a caller is how a reversal ends up recorded but not performed.
+   */
+  async undo(options: { readonly skipIrreversible?: boolean } = {}): Promise<string> {
+    const plan = this.journal.planUndo(
+      options.skipIrreversible === undefined ? {} : { skipIrreversible: options.skipIrreversible },
+    );
+    if (!plan.ok) {
+      throw new Error(
+        plan.blockedBy === undefined
+          ? plan.reason
+          : `${plan.reason} Run \`undo --skip\` to step past it, or \`history\` to see what happened.`,
+      );
+    }
+
+    const previousSource = this.source;
+    this.source = 'undo';
+    try {
+      if (plan.reversal.kind === 'navigate') {
+        const to = plan.reversal.path;
+        this.cwd = to;
+        this.lastListing = undefined;
+        this.journal.commitUndo(plan.entry);
+        this.#bus.emit({ kind: 'cwd', path: to, reason: 'undo' });
+        this.#bus.emit({ kind: 'journal', summary: `Undid: ${plan.entry.summary}` });
+        return `Undone: ${plan.entry.summary}. You are back in ${to}.`;
+      }
+
+      const { action, target, params } = plan.reversal;
+      const result = await this.vfs.invoke(action, target.path, params ?? {});
+      // Committed only now. A reversal that threw — an archive that failed on the way
+      // back — must leave the entry on the stack, because the world still contains it.
+      this.journal.commitUndo(plan.entry);
+
+      const stale = [target.path, vpath.dirname(target.path), ...(result.invalidates ?? [])].filter((p) => p !== '');
+      this.#bus.emit({ kind: 'mutated', paths: stale, message: result.message });
+      this.#bus.emit({ kind: 'journal', summary: `Undid: ${plan.entry.summary}` });
+      return `Undone: ${plan.entry.summary} — ${result.message}`;
+    } finally {
+      this.source = previousSource;
+    }
+  }
+
+  /**
+   * Re-run the most recently undone interaction.
+   *
+   * Redo replays the entry's own command line rather than inverting the inverse, which is
+   * why every journal entry carries one. Inverting an inverse works for a toggle and
+   * quietly fails for everything else — `untag followup` reversed is not "tag followup"
+   * unless the tag was absent to begin with, and by redo time nobody knows whether it was.
+   *
+   * The line is handed back to the caller because only the caller owns a dispatcher; the
+   * session deliberately knows nothing about the command table.
+   */
+  planRedo(): { readonly entry: JournalEntry; readonly command: string } {
+    const plan = this.journal.planRedo();
+    if (!plan.ok) throw new Error(plan.reason);
+    return { entry: plan.entry, command: plan.command };
+  }
+
+  /** Called once a redone command line has actually run. */
+  commitRedo(entry: JournalEntry): void {
+    this.journal.commitRedo(entry);
+    this.#bus.emit({ kind: 'journal', summary: `Redid: ${entry.summary}` });
   }
 
   // -------------------------------------------------------------------------
@@ -797,6 +1247,18 @@ interface OutputFrame {
 // ---------------------------------------------------------------------------
 
 /**
+ * Quote a path for a command line that will be re-parsed.
+ *
+ * Journal entries have to survive a round trip through `tokenize`, and message subjects
+ * are mostly spaces. An entry recorded as `cd /mail/FY26 budget review` is not a record of
+ * what happened, it is a record of something that would fail if replayed — which makes
+ * `redo` a liar.
+ */
+function quoteIfNeeded(value: string): string {
+  return /[\s"']/.test(value) ? `"${value.replace(/"/g, '')}"` : value;
+}
+
+/**
  * Choose an output mode.
  *
  * `plain` is chosen aggressively. A pipe, `TERM=dumb`, or a terminal narrower than 60
@@ -804,6 +1266,20 @@ interface OutputFrame {
  * plain costs a sighted user some prettiness; guessing wrong toward table costs a screen
  * reader user their ability to read the output at all.
  */
+/**
+ * Read an on/off value.
+ *
+ * Returns undefined rather than false for anything unrecognized, so `set voice.autoRun
+ * maybe` is refused instead of quietly meaning "off". The setting that governs whether
+ * spoken changes are confirmed is the last place to resolve ambiguity by guessing.
+ */
+function parseOnOff(value: string): boolean | undefined {
+  const word = value.trim().toLowerCase();
+  if (['on', 'true', 'yes', '1'].includes(word)) return true;
+  if (['off', 'false', 'no', '0'].includes(word)) return false;
+  return undefined;
+}
+
 function detectMode(config: AppConfig): OutputMode {
   if (config.ui.plain === true) return 'plain';
   if (process.env['MSCOMMS_ANNOUNCE'] === '1') return 'announce';

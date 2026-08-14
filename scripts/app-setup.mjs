@@ -46,10 +46,10 @@ function checkNode() {
 }
 
 async function install() {
-  // `npm ci` is the reproducible one, and cheap here: the only devDependencies are
-  // TypeScript and its Node types. It refuses to run when the lockfile has drifted from
-  // package.json, which is a real state to be in during dependency work and not a reason to
-  // leave the workspace unusable — so fall back rather than stopping.
+  // `npm ci` is the reproducible one: it installs exactly what the lockfile pins. It
+  // refuses to run when the lockfile has drifted from package.json, which is a real state
+  // to be in during dependency work and not a reason to leave the workspace unusable — so
+  // fall back rather than stopping.
   if (existsSync(join(ROOT, 'package-lock.json'))) {
     const code = await runNpm(['ci'], { label: 'install' });
     if (code === 0) return 0;

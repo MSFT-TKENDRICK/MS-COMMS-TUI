@@ -16,7 +16,8 @@
     "packages/provider-github",
     "packages/provider-graph",
     "packages/provider-ado",
-    "packages/provider-exec"
+    "packages/provider-exec",
+    "packages/voice"
   ],
   "scripts": {
     "setup": "node scripts/app-setup.mjs",

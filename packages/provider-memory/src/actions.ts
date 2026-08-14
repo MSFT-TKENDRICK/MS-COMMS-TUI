@@ -33,6 +33,7 @@ import {
   type ActionCommand,
   type ActionResult,
   type MetaValue,
+  type UndoSpec,
   type VNode,
 } from '@mscomms/core';
 import type { MemoryItem } from './types.js';
@@ -105,6 +106,20 @@ function conversationOf(node: VNode, host: MemoryActionHost): string {
   return parent;
 }
 
+/**
+ * Flags that belong to the model rather than to the user's tagging.
+ *
+ * `untag` refuses to touch these: removing `unread` through the tag mechanism would leave
+ * the item in a state `read`/`unread` never produced, and the undo recorded for it would
+ * name a verb that cannot restore it.
+ */
+const RESERVED_FLAGS = new Set(['unread', 'flagged', 'attachment', 'draft', 'sent']);
+
+/** The tags a user actually added, which are the only ones `untag` will remove. */
+function removableTags(node: VNode, host: MemoryActionHost): string[] {
+  return [...host.flagsOf(node.id)].filter((flag) => !RESERVED_FLAGS.has(flag)).sort();
+}
+
 let counter = 0;
 function nextId(prefix: string): string {
   counter += 1;
@@ -120,7 +135,13 @@ const markRead: Command = {
   applies: (node, host) => host.flagsOf(node.id).has('unread'),
   async run({ node, context }) {
     context.setFlag(node.id, 'unread', false);
-    return done(`Marked "${label(node, context)}" as read.`, node);
+    // `applies` already established that the item was unread, and the registry refuses a
+    // verb that does not apply — so unlike a free-standing toggle this inverse needs no
+    // "did anything actually change" guard. The precondition is the gate.
+    return done(`Marked "${label(node, context)}" as read.`, node, [], {
+      action: 'unread',
+      label: 'mark it unread again',
+    });
   },
 };
 
@@ -129,7 +150,10 @@ const markUnread: Command = {
   applies: (node, host) => !host.flagsOf(node.id).has('unread'),
   async run({ node, context }) {
     context.setFlag(node.id, 'unread', true);
-    return done(`Marked "${label(node, context)}" as unread.`, node);
+    return done(`Marked "${label(node, context)}" as unread.`, node, [], {
+      action: 'read',
+      label: 'mark it read again',
+    });
   },
 };
 
@@ -138,7 +162,10 @@ const flag: Command = {
   applies: (node, host) => !host.flagsOf(node.id).has('flagged'),
   async run({ node, context }) {
     context.setFlag(node.id, 'flagged', true);
-    return done(`Flagged "${label(node, context)}".`, node);
+    return done(`Flagged "${label(node, context)}".`, node, [], {
+      action: 'unflag',
+      label: 'remove the flag again',
+    });
   },
 };
 
@@ -147,7 +174,10 @@ const unflag: Command = {
   applies: (node, host) => host.flagsOf(node.id).has('flagged'),
   async run({ node, context }) {
     context.setFlag(node.id, 'flagged', false);
-    return done(`Removed the flag from "${label(node, context)}".`, node);
+    return done(`Removed the flag from "${label(node, context)}".`, node, [], {
+      action: 'flag',
+      label: 'put the flag back',
+    });
   },
 };
 
@@ -161,8 +191,56 @@ const tag: Command = {
   },
   async run({ node, params, context }) {
     const value = requiredText(params, 'tag');
+    // `tag` is the one state verb with no `applies` gate, because it applies to anything.
+    // So it can be asked to add a tag that is already there, which changes nothing, and an
+    // undo for that would remove a tag the user never added.
+    const alreadyThere = context.flagsOf(node.id).has(value);
     context.setFlag(node.id, value, true);
-    return done(`Tagged "${label(node, context)}" with ${value}.`, node);
+    return done(
+      `Tagged "${label(node, context)}" with ${value}.`,
+      node,
+      [],
+      alreadyThere ? undefined : { action: 'untag', params: { tag: value }, label: `remove the ${value} tag` },
+    );
+  },
+};
+
+/**
+ * Offered only when there is something to remove, and it exists mainly so `tag` has a real
+ * inverse to name. An undo that can only be expressed as a verb the provider does not
+ * actually offer is an undo nobody can invoke by hand, which would make the undo stack the
+ * only route to it: exactly the sort of capability asymmetry this project refuses.
+ */
+const untag: Command = {
+  descriptor: {
+    name: 'untag',
+    label: 'Remove a tag',
+    description: 'Remove a tag that was added with `tag`.',
+    group: 'state',
+    params: [{ name: 'tag', type: 'string', label: 'Tag name', required: true }],
+  },
+  applies: (node, host) => removableTags(node, host).length > 0,
+  async run({ node, params, context }) {
+    const value = requiredText(params, 'tag');
+    if (RESERVED_FLAGS.has(value)) {
+      throw VfsError.invalid(
+        `"${value}" is a built-in marker, not a tag.`,
+        `Use \`do ${value === 'unread' ? 'read' : value === 'flagged' ? 'unflag' : value} …\` instead.`,
+      );
+    }
+    const removable = removableTags(node, context);
+    if (!removable.includes(value)) {
+      throw VfsError.invalid(
+        `"${label(node, context)}" is not tagged ${value}.`,
+        removable.length === 0 ? 'It has no tags to remove.' : `Tagged: ${removable.join(', ')}.`,
+      );
+    }
+    context.setFlag(node.id, value, false);
+    return done(`Removed the ${value} tag from "${label(node, context)}".`, node, [], {
+      action: 'tag',
+      params: { tag: value },
+      label: `put the ${value} tag back`,
+    });
   },
 };
 
@@ -594,6 +672,7 @@ export const MEMORY_ACTIONS = new ActionRegistry<MemoryActionHost>([
   assign,
   addLabel,
   tag,
+  untag,
   archive,
   reopen,
   mailPerson,
@@ -608,7 +687,12 @@ export const MEMORY_ACTIONS = new ActionRegistry<MemoryActionHost>([
 // Helpers
 // ---------------------------------------------------------------------------
 
-function done(message: string, node: VNode, details: readonly string[] = []): ActionResult {
+function done(
+  message: string,
+  node: VNode,
+  details: readonly string[] = [],
+  undo?: UndoSpec,
+): ActionResult {
   return {
     ok: true,
     message,
@@ -616,6 +700,9 @@ function done(message: string, node: VNode, details: readonly string[] = []): Ac
     // message and the listing it lives in.
     invalidates: [node.path ?? ''],
     ...(details.length === 0 ? {} : { details }),
+    // Omitted rather than sent as undefined, so a verb with no inverse reads as a hard stop
+    // to the journal instead of an undo that resolves to nothing.
+    ...(undo === undefined ? {} : { undo }),
   };
 }
 

@@ -22,7 +22,7 @@ import { memoryPlugin, type MemoryItem } from '@mscomms/provider-memory';
 
 import { Session } from '../session.js';
 import { Tui } from '../tui/app.js';
-import { CommandTable } from '../commands/types.js';
+import { CommandTable, type Command } from '../commands/types.js';
 import { navigationCommands } from '../commands/navigate.js';
 import { readCommands } from '../commands/read.js';
 import { searchCommands } from '../commands/search.js';
@@ -113,6 +113,8 @@ async function harness(
     readonly announce?: boolean;
     readonly isTty?: boolean;
     readonly mounts?: boolean;
+    /** Extra commands, for driving the pane into a state a real command would take too long to reach. */
+    readonly extra?: readonly Command[];
     /**
      * Held in front of every listing, so a test can hold the pane in its loading state and
      * ask what the user can do while it is there. The memory provider is instant, which is
@@ -236,9 +238,11 @@ async function harness(
     return true;
   }) as typeof stdout.write;
 
+  const table = buildTable();
+  table.registerAll(options.extra ?? []);
   const tui = new Tui({
     session,
-    table: buildTable(),
+    table,
     stdin: stdin as unknown as NodeJS.ReadStream,
     stdout: stdout as unknown as NodeJS.WriteStream,
   });
@@ -527,6 +531,79 @@ describe('tui app: the command escape hatch', () => {
     await h.send('\r');
     assert.equal(await h.done, 0);
     assert.deepEqual(h.rawModeHistory, [true, false]);
+  });
+});
+
+describe('tui app: the microphone indicator', () => {
+  /**
+   * The indicator has to be lit *while* the microphone is open, which is the one moment it
+   * is hardest to paint.
+   *
+   * Every other kind of session event is queued until the running effect finishes, because
+   * an event can ask for a re-list and re-entering the effect runner from inside itself
+   * would interleave two listings. But the effect that opens a microphone is the effect that
+   * holds that queue shut, and it does not return until the recording is over. A queued
+   * "the microphone is open" is therefore applied at the exact moment it stops being true.
+   *
+   * The symptom is not a subtly wrong indicator, it is an indicator that is dark for the
+   * entire recording — nothing on the first press, and a stale `[MIC READY]` on every one
+   * after that, while the microphone is in fact live. For a feature whose entire purpose is
+   * telling the user the microphone is on, that is worse than not having it.
+   *
+   * So this drives a real command that does not return, and asserts the pane repaints
+   * anyway. `blocks` stands in for a recording; nothing here needs a real microphone.
+   */
+  function blockingCommand(gate: Promise<void>): Command {
+    return {
+      name: 'blocks',
+      summary: 'Blocks until the test lets go.',
+      usage: 'blocks',
+      group: 'system',
+      run: async () => {
+        await gate;
+      },
+    };
+  }
+
+  it('lights up while a recording is still running, not after it ends', async () => {
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = await harness({ extra: [blockingCommand(gate)] });
+    await ready(h);
+
+    await h.send(':');
+    await h.send('blocks');
+    await h.send('\r');
+
+    // The command is now in flight and the pane is busy. This is the state the microphone is
+    // in for the whole of a recording.
+    h.session.emit({ kind: 'voice', phase: 'listening' });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.match(h.text(), /\[MIC LIVE\]/, 'the indicator must be lit while the mic is open');
+
+    // And it keeps up: transcribing is a second phase change during the same busy stretch.
+    h.session.emit({ kind: 'voice', phase: 'transcribing' });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.match(h.text(), /\[MIC WORKING\]/);
+
+    release();
+    // Let the command actually finish before quitting: keys are dropped while an effect is in
+    // flight, so a `q` sent in the same turn as the release would be swallowed.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await h.send('q');
+    await h.done;
+  });
+
+  it('shows nothing at all until voice has been used', async () => {
+    // A permanent `[MIC OFF]` on a machine with no microphone configured is noise in the one
+    // line the user reads most.
+    const h = await harness();
+    await ready(h);
+    assert.ok(!h.text().includes('[MIC'), `expected no chip, saw: ${JSON.stringify(h.text().slice(0, 200))}`);
+    await h.send('q');
+    await h.done;
   });
 });
 

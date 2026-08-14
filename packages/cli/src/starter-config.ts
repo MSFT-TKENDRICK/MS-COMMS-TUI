@@ -285,6 +285,84 @@ export const STARTER_CONFIG = `// MS-COMMS-TUI configuration.
   },
 
   // ---------------------------------------------------------------------------
+  // Voice control. Off unless you configure it.
+  //
+  // Speaking produces the same command line you would have typed, so anything
+  // said obeys the same confirmations, lands in \`history\`, and comes back with
+  // \`undo\`. Try it without a microphone or an API key first:
+  //
+  //   demo
+  //   voice say "mark three as read"
+  //   undo
+  //
+  // "apiKey" holds a \`\${env:NAME}\` reference, never the key itself — this file
+  // ends up in dotfile repos and screen shares. See docs/VOICE.md.
+  // ---------------------------------------------------------------------------
+  "voice": {
+    // "mai"          Foundry's LLM Speech API, running MAI-Transcribe-1.5. The
+    //                default, and the only engine that accepts a phrase list.
+    // "foundry"      The same resource's OpenAI-compatible surface, for a
+    //                Whisper or gpt-4o-transcribe deployment. Needs "model".
+    // "azure-speech" The classic Azure AI Speech REST endpoint.
+    // "openai"       Whisper, or any OpenAI-compatible host.
+    // "xai"          Grok.
+    // "command"      A local binary, so no audio leaves this machine.
+    // "engine": "mai",
+    // "endpoint": "https://my-resource.cognitiveservices.azure.com",
+    // "apiKey": "\${env:FOUNDRY_API_KEY}",
+    // "language": "en-US",
+
+    // Keeping speech recognition local instead:
+    // "engine": "command",
+    // "command": "whisper-cli",
+    // "commandArgs": ["--model", "base.en", "--output-txt", "-"],
+
+    // The names on screen are sent to the recognizer as hints, because almost
+    // everything you say to this program is a proper noun no model has a prior
+    // for. They are already on your screen and go to the same endpoint that is
+    // about to hear you read them aloud, so this discloses nothing new — but
+    // turn it off to send audio and nothing else.
+    // "phraseBias": false,
+
+    // "push" captures one utterance when you ask for it, which is the default
+    // because a microphone left listening in an open-plan office, in a program
+    // that has your mail open, is a privacy incident waiting for a quiet
+    // afternoon. "continuous" needs a wake word before it will obey anything.
+    // "mode": "continuous",
+    // "wakeWord": "computer",
+
+    // Push-to-talk in the --tui pane, the way it works in Discord: hold the key
+    // and speak, let go and it stops. Holding needs a terminal that reports key
+    // releases (kitty, foot, WezTerm, Ghostty, rio, Alacritty, Windows Terminal
+    // 1.25+); anywhere else the same key presses to start and presses again to
+    // stop, which "auto" falls back to on its own. Force it with "hold" or
+    // "toggle" if you would rather it never changed under you.
+    // "pushToTalk": "auto",
+    // One modifier and one key — the modifier is not optional, because a terminal
+    // sends an unmodified key as ordinary typed text and cannot report it being
+    // held. A few Ctrl combinations are refused too, because the terminal sends
+    // them as another key entirely — ctrl+m is Enter, ctrl+i is Tab, ctrl+h is
+    // Backspace — and ctrl+c and ctrl+[ are the ways out of the pane. Setting one
+    // of those tells you which key is in the way.
+    // "talkKey": "ctrl+space",
+
+    // Keep recording for this long after the key comes up. Discord uses about
+    // 20ms; this defaults to 250 because letting go on the last word of "archive
+    // this" gives a recognizer "archive thi", and the command is then correctly
+    // refused for a reason that looks like a broken microphone.
+    // "releaseDelayMs": 250,
+
+    // Read results back through the operating system's own synthesizer. Never a
+    // cloud voice: subject lines have no business on a network, and a screen
+    // reader user already has a voice they have configured.
+    // "speak": true,
+
+    // Run recognized commands that change something without confirming first.
+    // Only turn this on if you also trust the recognizer with "archive it".
+    // "autoRun": false,
+  },
+
+  // ---------------------------------------------------------------------------
   // Extra plugins, loaded by module specifier. These are imported at startup,
   // so only add ones you trust.
   // ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ import { dirname, join } from 'node:path';
 import { vpath } from '@mscomms/core';
 import { Completer } from './completion.js';
 import { Dispatcher } from './dispatch.js';
-import { relativeTime, sanitizeForDisplay } from './format.js';
+import { relativeTime, paint, sanitizeForDisplay } from './format.js';
 import { Progress, progressLabel } from './progress.js';
 import { externalTasks, isSettled, ownTasks, readySummary } from './startup.js';
 import type { Session } from './session.js';
@@ -58,6 +58,15 @@ export class Shell {
   readonly #dispatcher: Dispatcher;
   readonly #historyFile: string;
   #rl: Interface | undefined;
+  /**
+   * Whether the microphone is open right now.
+   *
+   * Held here so the prompt can say so. The prompt is this interface's input bar — it is the
+   * row the cursor is sitting on — and "am I being recorded?" is a question that has to be
+   * answerable without running a command to ask.
+   */
+  #voicePhase: 'off' | 'listening' | 'transcribing' = 'off';
+
   /** Redraws the prompt in place; set while the REPL is running. */
   #promptAgain: ((preserveCursor?: boolean) => void) | undefined;
   /** Undefined when output is piped or announced — see the constructor. */
@@ -150,6 +159,7 @@ export class Shell {
     // the whole batch dies at the first command that awaits anything slow, and the
     // remaining lines are silently lost.
     let closed = false;
+    let pendingConfirm: ((answer: boolean) => void) | undefined;
     rl.on('close', () => {
       closed = true;
     });
@@ -164,8 +174,43 @@ export class Shell {
     // session — and its numbering — for what is usually a typo.
     rl.on('SIGINT', () => {
       session.write('\n');
+      // A Ctrl+C while a confirmation is pending is a "no". Leaving the promise unresolved
+      // would wedge the command that is waiting on it, with no way out but killing the shell.
+      if (pendingConfirm !== undefined) {
+        const resolve = pendingConfirm;
+        pendingConfirm = undefined;
+        resolve(false);
+      }
+      session.voice?.stop();
       promptAgain();
     });
+
+    // Ask a yes/no question at the prompt.
+    //
+    // The answer is intercepted by the `line` handler below rather than read with
+    // `rl.question`, which cannot be used here: readline routes questions through the same
+    // machinery the main loop is already sitting in, and the two deadlock. Routing every
+    // line through one handler and deciding there what it is for is both simpler and the
+    // reason a confirmation can be answered while a command is still running.
+    session.confirm = (question: string): Promise<boolean> => {
+      // A question nobody can answer is a "no". Saying so matters: a script that pipes
+      // commands in gets "Cancelled" for a reason that has nothing to do with what it asked,
+      // and without this it has no way to find that out.
+      if (closed || !isTty) {
+        session.status(
+          `${question} — but input is not interactive, so I cannot ask. Add \`--yes\` to the command, or run \`set voice.autoRun on\` first to let spoken changes run unconfirmed.`,
+        );
+        return Promise.resolve(false);
+      }
+      // Two questions at once cannot both own the next line. The second is refused rather
+      // than queued, because a queued confirmation would be answered by a keystroke the
+      // user aimed at the first one.
+      if (pendingConfirm !== undefined) return Promise.resolve(false);
+      session.status(`${question} [y/N]`);
+      return new Promise<boolean>((resolve) => {
+        pendingConfirm = resolve;
+      });
+    };
 
     // A live announcement of anything that arrives while the user is at the prompt. It is
     // written above the prompt line so the line being typed is never disturbed.
@@ -174,9 +219,72 @@ export class Shell {
       promptAgain(true);
     });
 
+    // The microphone indicator on the prompt. Redrawn with the cursor preserved, so the
+    // indicator can appear and disappear underneath a half-typed line without eating it.
+    //
+    // Only a change is redrawn. Voice emits a run of events per utterance, and repainting
+    // the prompt for each one would make a screen reader read the line again every time,
+    // which is precisely the announcement storm the line shell exists to avoid.
+    const unsubscribeVoice = session.subscribe((event) => {
+      if (event.kind !== 'voice') return;
+      const phase =
+        event.phase === 'listening' ? 'listening' : event.phase === 'transcribing' ? 'transcribing' : 'off';
+      if (phase === this.#voicePhase) return;
+      this.#voicePhase = phase;
+      promptAgain(true);
+    });
+
     promptAgain();
 
-    for await (const line of rl) {
+    /**
+     * Lines, buffered, in arrival order.
+     *
+     * The loop used to be `for await (const line of rl)`, which reads one line only while
+     * nothing else is running. That is fine until something running needs to ask a question:
+     * the answer arrives on the same stream the loop is no longer reading, and the two wait
+     * for each other forever. Draining `line` events into a queue instead means input is
+     * always accepted, whoever happens to be waiting for it — and it also stops fast piped
+     * input from being dropped while a slow command finishes.
+     */
+    const queue: string[] = [];
+    let waiting: ((line: string | undefined) => void) | undefined;
+
+    rl.on('line', (line: string) => {
+      // A pending confirmation gets first refusal on the next line.
+      if (pendingConfirm !== undefined) {
+        const resolve = pendingConfirm;
+        pendingConfirm = undefined;
+        resolve(/^\s*(?:y|yes|yeah|yep|ok|okay)\s*$/i.test(line));
+        return;
+      }
+      if (waiting !== undefined) {
+        const resume = waiting;
+        waiting = undefined;
+        resume(line);
+        return;
+      }
+      queue.push(line);
+    });
+
+    rl.on('close', () => {
+      pendingConfirm?.(false);
+      pendingConfirm = undefined;
+      waiting?.(undefined);
+      waiting = undefined;
+    });
+
+    const nextLine = (): Promise<string | undefined> => {
+      const queued = queue.shift();
+      if (queued !== undefined) return Promise.resolve(queued);
+      if (closed) return Promise.resolve(undefined);
+      return new Promise<string | undefined>((resolve) => {
+        waiting = resolve;
+      });
+    };
+
+    for (;;) {
+      const line = await nextLine();
+      if (line === undefined) break;
       const trimmed = line.trim();
       if (trimmed !== '') {
         await this.#execute(trimmed);
@@ -187,6 +295,8 @@ export class Shell {
     }
 
     unsubscribe();
+    unsubscribeVoice();
+    session.voice?.stop();
     stopWatching();
     this.#promptAgain = undefined;
     rl.close();
@@ -232,13 +342,25 @@ export class Shell {
    * screen reader on every keystroke in some configurations, so the current folder is
    * abbreviated to its last component rather than shown in full — `pwd` gives the full
    * path on demand.
+   *
+   * The one thing allowed to make it longer is a live microphone. That earns its place
+   * because it is not decoration: it is the difference between a program that is listening
+   * and one that is not, on the row the user is already looking at. It appears only while
+   * the microphone is actually open, so a user who never speaks to this program never pays
+   * for it — and the same rule means a screen reader only reads the extra words during the
+   * seconds when they are the most important thing on the line.
    */
   #prompt(): string {
     const session = this.#session;
     const configured = session.config.ui.prompt;
-    if (configured !== undefined) return configured;
     const where = session.cwd === vpath.ROOT ? '/' : vpath.basename(session.cwd);
-    return `${where}> `;
+    const base = configured ?? `${where}> `;
+    if (this.#voicePhase === 'off') return base;
+    // Words, not a coloured dot, and painted only if colour is on — the distinction has to
+    // survive a monochrome terminal and a screen reader, both of which see none of the paint.
+    const chip = this.#voicePhase === 'listening' ? '[MIC LIVE]' : '[MIC WORKING]';
+    const color = this.#voicePhase === 'listening' ? 'red' : 'dim';
+    return `${paint(chip, color, session.format.color)} ${base}`;
   }
 
   #banner(): void {
