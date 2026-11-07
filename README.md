@@ -470,6 +470,7 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 | [docs/VOICE.md](docs/VOICE.md) | Speaking to it, and why every interaction is undoable |
 | [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md) | The reasoning behind the interface decisions |
 | [docs/PRIOR-ART.md](docs/PRIOR-ART.md) | What twenty-odd earlier projects got right and wrong |
+| [skills/ms-comms-tui/SKILL.md](skills/ms-comms-tui/SKILL.md) | Agent skill: driving the CLI safely from automation (cache-only search, no sign-in prompts) |
 
 ## Status
 
