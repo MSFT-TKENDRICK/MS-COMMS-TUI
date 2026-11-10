@@ -15,12 +15,15 @@ One-shot commands still await session startup, which connects every configured m
 
 Agent procedure:
 
-1. Read the config (`MSCOMMS_CONFIG`, else `%APPDATA%\mscomms\config.jsonc`) and look for
-   `graph-*`/`ado-boards` mounts without `"transport": "mcp"` or a resolvable MCP server.
+1. Read the config (`MSCOMMS_CONFIG`; otherwise `%APPDATA%\mscomms\config.jsonc` on Windows,
+   or `$XDG_CONFIG_HOME/mscomms/config.jsonc`, falling back to `~/.config/mscomms/config.jsonc`,
+   on Linux and macOS) and look for `graph-*`/`ado-boards` mounts without a non-interactive
+   auth path. Do not expose configuration secrets.
    `doctor` prints the same summary ("N of M Microsoft 365 source(s) will ask you to sign in
    with a device code"), but like every command it starts the session first.
-2. If any mount would use device code, **do not continue**; ask the user to configure an MCP
-   server or remove the mount. Never complete a device-code flow on the user's behalf.
+2. If any mount would use device code, or its auth path cannot be established, **do not
+   continue**; ask the user to configure a non-interactive auth path or remove the mount.
+   Never complete a device-code flow on the user's behalf.
 3. Never echo, log or pass tokens into model context. Strip secret-looking env vars
    (`*TOKEN*`, `*SECRET*`, `*KEY*`, …) when spawning the CLI from another tool unless that
    mount explicitly needs them.
@@ -48,9 +51,11 @@ Spawn without a shell, with a timeout, kill on cancel, bound stdout size, and pa
 
 ```js
 spawn(process.execPath,
-  ["packages/cli/dist/bin.js", "find", "--local", "-a", "-q", query, "--json"],
-  { cwd: repo, shell: false, env: sanitizedEnv, stdio: ["ignore", "pipe", "pipe"] });
+  [absoluteCliEntry, "find", "--local", "-a", "-q", query, "--json"],
+  { cwd: checkoutRoot, shell: false, env: sanitizedEnv, stdio: ["ignore", "pipe", "pipe"] });
 ```
 
+`absoluteCliEntry` and `checkoutRoot` refer to the user's existing built checkout, not the
+plugin installation. Resolve them before spawning and perform the auth preflight above first.
 Treat non-zero exit, non-JSON stdout or a missing `dist/bin.js` as "disconnected" rather than
 as an empty result.

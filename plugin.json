@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ms-comms-tui",
+  "version": "0.1.0",
+  "description": "Use the MS-COMMS-TUI CLI safely from an agent.",
+  "repository": "https://github.com/MSFT-TKENDRICK/MS-COMMS-TUI",
+  "license": "MIT"
+}

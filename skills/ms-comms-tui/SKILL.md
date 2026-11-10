@@ -6,13 +6,17 @@ description: Navigate and search Microsoft communications (Outlook mail, Teams c
 # MS-COMMS-TUI
 
 The CLI mounts comms sources as paths (`/mail/Inbox`, `/chats`, `/people`, …) and exposes
-shell-like commands. Run it one-shot from the repo root:
+shell-like commands. The plugin supplies this skill, not the CLI or its credentials. Locate an
+already-installed `mscomms` executable on `PATH` without running it, then use one-shot commands:
 
 ```powershell
-node packages/cli/dist/bin.js <command> [args] --json
+mscomms <command> [args] --json
 ```
 
-Build once with `npm run setup` if `packages/cli/dist/bin.js` is missing.
+Alternatively, if the user identifies an existing built checkout, run `node` with the absolute
+path to that checkout's `packages/cli/dist/bin.js`. Do not assume the plugin directory or current
+working directory is the checkout. If neither is available, report that the CLI is unavailable;
+do not install, build, configure, or sign in automatically.
 
 ## Rules for agents
 
@@ -22,7 +26,7 @@ Build once with `npm run setup` if `packages/cli/dist/bin.js` is missing.
 3. **Default to cache-only search** — it never contacts a mail/Teams source:
 
    ```powershell
-   node packages/cli/dist/bin.js find --local -a -q "<query>" --json
+   mscomms find --local -a -q "<query>" --json
    ```
 
    It needs `"cache": { "enabled": true }` in config; otherwise it exits with
@@ -30,9 +34,10 @@ Build once with `npm run setup` if `packages/cli/dist/bin.js` is missing.
 4. **Never trigger sign-in.** Startup connects configured mounts. A Microsoft mount without an
    M365 MCP server or `MSCOMMS_GRAPH_TOKEN` falls back to the **OAuth device-code flow**, which
    prompts. Before the first run, check the config for `graph-*`/`ado-boards` mounts without an
-   MCP transport; `doctor` also reports "N of M Microsoft 365 source(s) will ask you to sign in
-   with a device code". If so, stop and ask the user to configure MCP access. Do not set or
-   print tokens.
+   MCP transport. `doctor` also reports "N of M Microsoft 365 source(s) will ask you to sign in
+   with a device code", but starts the session itself: run it only after the config preflight.
+   If a mount may prompt, or its auth path cannot be established, stop and ask the user to
+   configure MCP access. Do not set or print tokens.
 5. **Read-only by default.** `do`, `save`, `set`, `watch`/`unwatch`, `notifications --clear`
    and `--read`, `undo`/`redo`, `cache clear|sync` change state — run them only on explicit
    user request (destructive `do` actions additionally need `--yes`).

@@ -1,0 +1,18 @@
+{
+  "name": "ms-comms",
+  "owner": {
+    "name": "MSFT-TKENDRICK"
+  },
+  "metadata": {
+    "description": "Agent skills for the MS-COMMS-TUI CLI.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "ms-comms-tui",
+      "description": "Navigate Microsoft communications with the existing mscomms CLI.",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}

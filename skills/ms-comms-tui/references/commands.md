@@ -1,7 +1,9 @@
 # Command reference
 
-Invoke as `node packages/cli/dist/bin.js <command> [args] [global flags]`. Paths are
-mount-relative (`/mail/Inbox`, `/chats/...`, `/people/...`).
+Invoke an existing `mscomms <command> [args] [global flags]` on `PATH`, or use `node` and the
+absolute `packages/cli/dist/bin.js` path of the user's existing built checkout. Do not assume
+the current directory is that checkout. Paths are mount-relative (`/mail/Inbox`, `/chats/...`,
+`/people/...`).
 
 Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no such path,
 `77` permission denied, `127` unknown command.
@@ -68,7 +70,7 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 | Command | Notes |
 |---|---|
 | `help [command]` | Usage. |
-| `doctor` | Checks config, cache and each mount's auth path. Run first. |
+| `doctor` | Checks config, cache and each mount's auth path. Run only after the config preflight; startup can prompt. |
 | `plugins`, `config` | Inspect plugins / effective config. |
 | `set [name] [value]` | **Writes** settings. |
 | `refresh [path]` | Re-fetch from the source. |
