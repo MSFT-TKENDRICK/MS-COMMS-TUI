@@ -182,6 +182,25 @@ npm link        # optional: puts `mscomms` and `msh` on your PATH
 `npm run build` — wrapped so that every entry point into this repo agrees on what "set up"
 means. Run them by hand if you prefer.
 
+### Agent plugin
+
+The root `plugin.json` and `skills/ms-comms-tui` form an
+[Agent Plugins](https://agent-plugins.org/) 1.0 plugin. After this work reaches the default
+branch, add the GitHub Copilot marketplace and install the skill with:
+
+```sh
+copilot plugin marketplace add MSFT-TKENDRICK/MS-COMMS-TUI
+copilot plugin install ms-comms-tui@ms-comms
+```
+
+For a branch preview, append `#feat/agent-skill` to the marketplace source. The plugin
+provides instructions only: it does not install or configure the `mscomms` CLI or sign in.
+An agent must use an existing executable on `PATH` or an existing built checkout, and check
+the configured mount authentication paths before running even a read-only command.
+
+Validate the plugin without building the CLI with `npm run test:plugin` and
+`python -m skills_ref.cli validate skills/ms-comms-tui`.
+
 ### From the GitHub Copilot desktop app
 
 [`.github/github-app.yml`](.github/github-app.yml) wires the app's **Setup** and **Run**
@@ -470,6 +489,7 @@ Exit codes: `0` success, `1` command failed, `2` bad usage or bad config, `4` no
 | [docs/VOICE.md](docs/VOICE.md) | Speaking to it, and why every interaction is undoable |
 | [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md) | The reasoning behind the interface decisions |
 | [docs/PRIOR-ART.md](docs/PRIOR-ART.md) | What twenty-odd earlier projects got right and wrong |
+| [skills/ms-comms-tui/SKILL.md](skills/ms-comms-tui/SKILL.md) | Agent skill: driving the CLI safely from automation (cache-only search, no sign-in prompts) |
 
 ## Status
 

@@ -1,0 +1,38 @@
+name: Validate agent plugin
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install jsonschema skills-ref
+      - run: npm run test:plugin
+      - run: python -m skills_ref.cli validate skills/ms-comms-tui
+      - name: Validate the Agent Plugins schema
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          import jsonschema
+          schema_url = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+          with open("plugin.json", encoding="utf-8") as f:
+              manifest = json.load(f)
+          if manifest.get("$schema") != schema_url:
+              raise ValueError("Unexpected Agent Plugins schema")
+          with urllib.request.urlopen(schema_url, timeout=20) as response:
+              schema = json.load(response)
+          jsonschema.Draft202012Validator.check_schema(schema)
+          jsonschema.validate(manifest, schema)
+          PY
